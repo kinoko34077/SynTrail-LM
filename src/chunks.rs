@@ -2,53 +2,57 @@ use std::collections::HashMap;
 use crate::units::{ChunkId, UnitId};
 use crate::tier::Tier;
 
-/// Decay factor for strength update: new = DECAY * old + reward  (§B §5)
+/// Decay factor for usage_strength update: new = DECAY * old + reward  (§B §5)
 pub const STRENGTH_DECAY: f64 = 0.99;
-/// Reward for a successful prediction/use.
+/// Reward for an exposure event.
 pub const STRENGTH_REWARD: f64 = 1.0;
 
 /// A Chunk is a binary composition of two Units.
 /// Once created, left/right are immutable; other fields evolve.
+///
+/// v0.2: separated usage (exposure) from evaluation (feedback).
+/// - `use_count` / `usage_strength`: incremented on every segmentation hit
+/// - `feedback_value` / `feedback_count`: updated only by external ±1 feedback
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub id: ChunkId,
     pub left: UnitId,
     pub right: UnitId,
     pub tier: Tier,
-    pub success_count: u32,
-    pub total_count: u32,
-    pub strength: f64,
+    /// Times this chunk appeared in a segmented sequence (usage / exposure).
+    pub use_count: u32,
+    /// Decaying sum of usage events: new = DECAY * old + reward
+    pub usage_strength: f64,
     /// Logical clock tick of last use (set by caller).
     pub last_used: u64,
     /// Number of Primitives when fully expanded (cached).
     pub expanded_length: u32,
+    /// Accumulated feedback signal: V_new = decay * V_old + r
+    pub feedback_value: f64,
+    /// Number of feedback events applied.
+    pub feedback_count: u32,
 }
 
 impl Chunk {
-    /// Record a successful use: increment counts, update strength, evaluate tier.
-    pub fn record_success(&mut self, tick: u64) {
-        self.success_count += 1;
-        self.total_count += 1;
-        self.strength = STRENGTH_DECAY * self.strength + STRENGTH_REWARD;
+    /// Record one usage (exposure) of this chunk.
+    /// Updates use_count, usage_strength, and tier.
+    pub fn record_usage(&mut self, tick: u64) {
+        self.use_count += 1;
+        self.usage_strength = STRENGTH_DECAY * self.usage_strength + STRENGTH_REWARD;
         self.last_used = tick;
-        self.tier = self.tier.maybe_promote(self.success_count, self.total_count);
+        self.tier = self.tier.maybe_promote(self.use_count, self.use_count);
     }
 
-    /// Record a failed use: increment total only, update strength with 0 reward,
-    /// evaluate tier demotion.
-    pub fn record_failure(&mut self, tick: u64) {
-        self.total_count += 1;
-        self.strength = STRENGTH_DECAY * self.strength;
-        self.last_used = tick;
-        self.tier = self.tier.maybe_demote(self.success_count, self.total_count);
+    /// Apply one feedback credit r to this chunk.
+    /// V_new = decay * V_old + r
+    pub fn apply_feedback(&mut self, r: f64, decay: f64) {
+        self.feedback_value = decay * self.feedback_value + r;
+        self.feedback_count += 1;
     }
 
-    pub fn accuracy(&self) -> f64 {
-        if self.total_count == 0 {
-            0.0
-        } else {
-            self.success_count as f64 / self.total_count as f64
-        }
+    /// Binary confidence: 1.0 if chunk has been used at all, else 0.0.
+    pub fn confidence(&self) -> f64 {
+        if self.use_count > 0 { 1.0 } else { 0.0 }
     }
 }
 
@@ -85,11 +89,12 @@ impl ChunkRegistry {
             left,
             right,
             tier: Tier::T0,
-            success_count: 0,
-            total_count: 0,
-            strength: 0.0,
+            use_count: 0,
+            usage_strength: 0.0,
             last_used: 0,
             expanded_length,
+            feedback_value: 0.0,
+            feedback_count: 0,
         };
         self.pair_to_id.insert((left, right), id);
         self.chunks.push(chunk);
@@ -163,42 +168,27 @@ mod tests {
     }
 
     #[test]
-    fn test_record_success_promotes() {
+    fn test_record_usage_promotes() {
         let mut reg = ChunkRegistry::new();
         let id = reg.get_or_create(prim(1), prim(2), 2);
         let chunk = reg.get_mut(id).unwrap();
         for tick in 0..16 {
-            chunk.record_success(tick);
+            chunk.record_usage(tick);
         }
         assert_eq!(chunk.tier, Tier::T1);
-        assert_eq!(chunk.success_count, 16);
-        assert_eq!(chunk.total_count, 16);
+        assert_eq!(chunk.use_count, 16);
     }
 
     #[test]
-    fn test_strength_increases_on_success() {
+    fn test_usage_strength_increases() {
         let mut reg = ChunkRegistry::new();
         let id = reg.get_or_create(prim(1), prim(2), 2);
         let chunk = reg.get_mut(id).unwrap();
-        chunk.record_success(0);
-        assert!(chunk.strength > 0.0);
-        let s1 = chunk.strength;
-        chunk.record_success(1);
-        assert!(chunk.strength > s1);
-    }
-
-    #[test]
-    fn test_strength_decays_on_failure() {
-        let mut reg = ChunkRegistry::new();
-        let id = reg.get_or_create(prim(1), prim(2), 2);
-        let chunk = reg.get_mut(id).unwrap();
-        // build up some strength first
-        for tick in 0..10 {
-            chunk.record_success(tick);
-        }
-        let s_before = chunk.strength;
-        chunk.record_failure(10);
-        assert!(chunk.strength < s_before);
+        chunk.record_usage(0);
+        assert!(chunk.usage_strength > 0.0);
+        let s1 = chunk.usage_strength;
+        chunk.record_usage(1);
+        assert!(chunk.usage_strength > s1);
     }
 
     #[test]
@@ -206,11 +196,11 @@ mod tests {
         let mut reg = ChunkRegistry::new();
         let id = reg.get_or_create(prim(3), prim(4), 2);
         let chunk = reg.get_mut(id).unwrap();
-        // T0 → T1: need 16 successes at ≥90%
-        for tick in 0..16 { chunk.record_success(tick); }
+        // T0 → T1: need 16 uses
+        for tick in 0..16 { chunk.record_usage(tick); }
         assert_eq!(chunk.tier, Tier::T1);
-        // T1 → T2: need 64 successes total at ≥98% (already 16; need 48 more)
-        for tick in 16..64 { chunk.record_success(tick); }
+        // T1 → T2: need 64 uses total
+        for tick in 16..64 { chunk.record_usage(tick); }
         assert_eq!(chunk.tier, Tier::T2);
     }
 
@@ -227,5 +217,28 @@ mod tests {
         let id = reg.get_or_create(prim(7), prim(8), 2);
         assert_eq!(reg.find_by_pair(prim(7), prim(8)), Some(id));
         assert_eq!(reg.find_by_pair(prim(8), prim(7)), None);
+    }
+
+    #[test]
+    fn test_apply_feedback_accumulates() {
+        let mut reg = ChunkRegistry::new();
+        let id = reg.get_or_create(prim(1), prim(2), 2);
+        let chunk = reg.get_mut(id).unwrap();
+        chunk.apply_feedback(1.0, 0.99);
+        assert!((chunk.feedback_value - 1.0).abs() < 1e-9);
+        chunk.apply_feedback(-0.5, 0.99);
+        let expected = 0.99 * 1.0 + (-0.5);
+        assert!((chunk.feedback_value - expected).abs() < 1e-9);
+        assert_eq!(chunk.feedback_count, 2);
+    }
+
+    #[test]
+    fn test_confidence_binary() {
+        let mut reg = ChunkRegistry::new();
+        let id = reg.get_or_create(prim(1), prim(2), 2);
+        let chunk = reg.get_mut(id).unwrap();
+        assert_eq!(chunk.confidence(), 0.0, "no uses yet");
+        chunk.record_usage(0);
+        assert_eq!(chunk.confidence(), 1.0, "after first use");
     }
 }

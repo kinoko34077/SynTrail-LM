@@ -1,8 +1,13 @@
 pub mod chunks;
+pub mod config;
+pub mod db;
+pub mod feedback;
 pub mod model;
 pub mod persistence;
 pub mod prediction;
 pub mod primitives;
 pub mod segmentation;
+pub mod session;
 pub mod tier;
+pub mod trace;
 pub mod units;

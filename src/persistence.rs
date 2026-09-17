@@ -1,7 +1,7 @@
-/// Phase 9: JSON persistence for ModelState (§D §14).
+/// v0.2 JSON persistence for ModelState.
 ///
-/// ModelState is serialised to a flat snapshot struct and written as
-/// pretty-printed JSON.  Load reconstructs the state exactly.
+/// Snapshot format updated for v0.2 field names.
+/// v0.1 snapshots can be loaded: missing feedback fields default to 0.
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -12,6 +12,7 @@ use crate::model::{Metrics, ModelState};
 use crate::prediction::{PredictionEdge, PredictionStore};
 use crate::primitives::PrimitiveRegistry;
 use crate::tier::Tier;
+use crate::trace::TraceId;
 use crate::units::UnitId;
 
 // ── Serialisable mirror types ──────────────────────────────────────────────
@@ -24,20 +25,13 @@ struct UnitIdDto {
 
 impl From<UnitId> for UnitIdDto {
     fn from(u: UnitId) -> Self {
-        Self {
-            is_chunk: u.is_chunk(),
-            raw: u.raw(),
-        }
+        Self { is_chunk: u.is_chunk(), raw: u.raw() }
     }
 }
 
 impl From<UnitIdDto> for UnitId {
     fn from(d: UnitIdDto) -> Self {
-        if d.is_chunk {
-            UnitId::chunk(d.raw)
-        } else {
-            UnitId::primitive(d.raw)
-        }
+        if d.is_chunk { UnitId::chunk(d.raw) } else { UnitId::primitive(d.raw) }
     }
 }
 
@@ -45,18 +39,12 @@ impl From<UnitIdDto> for UnitId {
 struct TierDto(u8);
 
 impl From<Tier> for TierDto {
-    fn from(t: Tier) -> Self {
-        TierDto(t as u8)
-    }
+    fn from(t: Tier) -> Self { TierDto(t as u8) }
 }
 
 impl From<TierDto> for Tier {
     fn from(d: TierDto) -> Self {
-        match d.0 {
-            1 => Tier::T1,
-            2 => Tier::T2,
-            _ => Tier::T0,
-        }
+        match d.0 { 1 => Tier::T1, 2 => Tier::T2, _ => Tier::T0 }
     }
 }
 
@@ -66,11 +54,18 @@ struct ChunkDto {
     left: UnitIdDto,
     right: UnitIdDto,
     tier: TierDto,
-    success_count: u32,
-    total_count: u32,
-    strength: f64,
+    /// v0.2: use_count. v0.1 files: "success_count" alias loads here via backward_compat.
+    #[serde(alias = "success_count")]
+    use_count: u32,
+    /// v0.2: usage_strength. v0.1 alias: "strength".
+    #[serde(alias = "strength")]
+    usage_strength: f64,
     last_used: u64,
     expanded_length: u32,
+    #[serde(default)]
+    feedback_value: f64,
+    #[serde(default)]
+    feedback_count: u32,
 }
 
 impl From<&Chunk> for ChunkDto {
@@ -80,11 +75,12 @@ impl From<&Chunk> for ChunkDto {
             left: c.left.into(),
             right: c.right.into(),
             tier: c.tier.into(),
-            success_count: c.success_count,
-            total_count: c.total_count,
-            strength: c.strength,
+            use_count: c.use_count,
+            usage_strength: c.usage_strength,
             last_used: c.last_used,
             expanded_length: c.expanded_length,
+            feedback_value: c.feedback_value,
+            feedback_count: c.feedback_count,
         }
     }
 }
@@ -93,9 +89,16 @@ impl From<&Chunk> for ChunkDto {
 struct PredictionEdgeDto {
     context: UnitIdDto,
     next_unit: UnitIdDto,
-    success_count: u32,
-    total_count: u32,
-    strength: f64,
+    /// v0.2: use_count. v0.1 alias: "success_count".
+    #[serde(alias = "success_count")]
+    use_count: u32,
+    /// v0.2: usage_strength. v0.1 alias: "strength".
+    #[serde(alias = "strength")]
+    usage_strength: f64,
+    #[serde(default)]
+    feedback_value: f64,
+    #[serde(default)]
+    feedback_count: u32,
 }
 
 impl From<&PredictionEdge> for PredictionEdgeDto {
@@ -103,9 +106,10 @@ impl From<&PredictionEdge> for PredictionEdgeDto {
         Self {
             context: e.context.into(),
             next_unit: e.next_unit.into(),
-            success_count: e.success_count,
-            total_count: e.total_count,
-            strength: e.strength,
+            use_count: e.use_count,
+            usage_strength: e.usage_strength,
+            feedback_value: e.feedback_value,
+            feedback_count: e.feedback_count,
         }
     }
 }
@@ -118,10 +122,7 @@ struct MetricsDto {
 
 impl From<Metrics> for MetricsDto {
     fn from(m: Metrics) -> Self {
-        Self {
-            total_decisions: m.total_decisions,
-            total_characters: m.total_characters,
-        }
+        Self { total_decisions: m.total_decisions, total_characters: m.total_characters }
     }
 }
 
@@ -137,18 +138,16 @@ struct MergeCandidateDto {
 pub struct ModelSnapshot {
     pub version: String,
     tick: u64,
-    /// Primitives in registration order: [(id, scalar_u32), ...]
     primitives: Vec<(u32, u32)>,
     chunks: Vec<ChunkDto>,
     prediction_edges: Vec<PredictionEdgeDto>,
     merge_candidates: Vec<MergeCandidateDto>,
     metrics: MetricsDto,
+    #[serde(default)]
+    next_trace_id: TraceId,
 }
 
 // ── ModelState → snapshot ──────────────────────────────────────────────────
-
-/// Expose internal iterator helpers via accessor traits to keep fields private.
-/// We use public accessor methods added to each module instead.
 
 pub fn save(model: &ModelState, path: &Path) -> std::io::Result<()> {
     let snapshot = to_snapshot(model);
@@ -165,19 +164,13 @@ pub fn load(path: &Path) -> std::io::Result<ModelState> {
 }
 
 pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
-    // Primitives: iterate ids 1..=len
     let primitives: Vec<(u32, u32)> = (1..=(model.primitives.len() as u32))
         .filter_map(|id| model.primitives.scalar(id).map(|c| (id, c as u32)))
         .collect();
 
     let chunks: Vec<ChunkDto> = model.chunks.iter_all().map(ChunkDto::from).collect();
-
-    let prediction_edges: Vec<PredictionEdgeDto> = model
-        .predictions
-        .iter_all()
-        .map(PredictionEdgeDto::from)
-        .collect();
-
+    let prediction_edges: Vec<PredictionEdgeDto> =
+        model.predictions.iter_all().map(PredictionEdgeDto::from).collect();
     let merge_candidates: Vec<MergeCandidateDto> = model
         .merge_candidates_iter()
         .map(|((left, right), count)| MergeCandidateDto {
@@ -187,29 +180,28 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         })
         .collect();
 
+    // We need next_trace_id from model — access via a helper
     ModelSnapshot {
-        version: "0.1".to_owned(),
+        version: "0.2".to_owned(),
         tick: model.tick,
         primitives,
         chunks,
         prediction_edges,
         merge_candidates,
         metrics: model.metrics.into(),
+        next_trace_id: model.next_trace_id,
     }
 }
 
 pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
-    // Rebuild PrimitiveRegistry
     let mut primitives = PrimitiveRegistry::new();
     for (id, scalar_u32) in &snap.primitives {
-        // char::from_u32 is safe for valid Unicode scalars stored by us
         if let Some(c) = char::from_u32(*scalar_u32) {
             let assigned = primitives.register(c);
-            debug_assert_eq!(assigned, *id, "primitive id mismatch during load");
+            debug_assert_eq!(assigned, *id);
         }
     }
 
-    // Rebuild ChunkRegistry
     let mut chunks = ChunkRegistry::new();
     for dto in snap.chunks {
         let left: UnitId = dto.left.into();
@@ -218,22 +210,22 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         debug_assert_eq!(id, dto.id);
         let chunk = chunks.get_mut(id).unwrap();
         chunk.tier = dto.tier.into();
-        chunk.success_count = dto.success_count;
-        chunk.total_count = dto.total_count;
-        chunk.strength = dto.strength;
+        chunk.use_count = dto.use_count;
+        chunk.usage_strength = dto.usage_strength;
         chunk.last_used = dto.last_used;
+        chunk.feedback_value = dto.feedback_value;
+        chunk.feedback_count = dto.feedback_count;
     }
 
-    // Rebuild PredictionStore
     let mut predictions = PredictionStore::new();
     for dto in snap.prediction_edges {
         let edge = predictions.get_or_create(dto.context.into(), dto.next_unit.into());
-        edge.success_count = dto.success_count;
-        edge.total_count = dto.total_count;
-        edge.strength = dto.strength;
+        edge.use_count = dto.use_count;
+        edge.usage_strength = dto.usage_strength;
+        edge.feedback_value = dto.feedback_value;
+        edge.feedback_count = dto.feedback_count;
     }
 
-    // Rebuild merge candidates
     let mut merge_candidates: HashMap<(UnitId, UnitId), u32> = HashMap::new();
     for dto in snap.merge_candidates {
         merge_candidates.insert((dto.left.into(), dto.right.into()), dto.count);
@@ -249,6 +241,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
             total_decisions: snap.metrics.total_decisions,
             total_characters: snap.metrics.total_characters,
         },
+        snap.next_trace_id,
     )
 }
 
@@ -259,9 +252,7 @@ mod tests {
 
     fn trained_model() -> ModelState {
         let mut m = ModelState::new();
-        for _ in 0..20 {
-            m.train("hello world");
-        }
+        for _ in 0..20 { m.train("hello world"); }
         m
     }
 
@@ -271,14 +262,10 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         save(&model, file.path()).unwrap();
         let loaded = load(file.path()).unwrap();
-
         assert_eq!(loaded.primitive_count(), model.primitive_count());
         assert_eq!(loaded.chunk_count(), model.chunk_count());
         assert_eq!(loaded.edge_count(), model.edge_count());
-        assert_eq!(
-            loaded.metrics.total_characters,
-            model.metrics.total_characters
-        );
+        assert_eq!(loaded.metrics.total_characters, model.metrics.total_characters);
     }
 
     #[test]
@@ -287,13 +274,10 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         save(&model, file.path()).unwrap();
         let loaded = load(file.path()).unwrap();
-
-        // Both generate non-empty output from the same seed
         let out1 = model.generate("hel", 5);
         let out2 = loaded.generate("hel", 5);
         assert!(!out1.is_empty());
         assert!(!out2.is_empty());
-        // Both contain the seed
         assert!(out1.contains("hel"));
         assert!(out2.contains("hel"));
     }
@@ -306,5 +290,31 @@ mod tests {
         let loaded = load(file.path()).unwrap();
         assert_eq!(loaded.primitive_count(), 0);
         assert_eq!(loaded.chunk_count(), 0);
+    }
+
+    #[test]
+    fn test_version_field() {
+        let model = ModelState::new();
+        let snap = to_snapshot(&model);
+        assert_eq!(snap.version, "0.2");
+    }
+
+    #[test]
+    fn test_feedback_fields_preserved() {
+        let mut model = trained_model();
+        // Apply some feedback
+        let tid = model.alloc_trace_id();
+        let (_, trace) = model.generate_with_trace("hel", "hel", 5, tid);
+        if trace.decision_count > 0 {
+            let credits = vec![1.0; trace.decision_count];
+            model.apply_feedback_to_trace(&trace, &credits, 0.99);
+        }
+        let file = NamedTempFile::new().unwrap();
+        save(&model, file.path()).unwrap();
+        let loaded = load(file.path()).unwrap();
+        // Total feedback_count in edges should be preserved
+        let fb_before: u32 = model.predictions.iter_all().map(|e| e.feedback_count).sum();
+        let fb_after: u32 = loaded.predictions.iter_all().map(|e| e.feedback_count).sum();
+        assert_eq!(fb_before, fb_after);
     }
 }

@@ -1,12 +1,13 @@
-/// v0.2 JSON persistence for ModelState.
+/// v0.3 JSON persistence for ModelState.
 ///
-/// Snapshot format updated for v0.2 field names.
-/// v0.1 snapshots can be loaded: missing feedback fields default to 0.
+/// v0.3: adds association edges and avoidance field on prediction edges.
+/// v0.1/v0.2 snapshots can be loaded: missing fields default to 0/empty.
 use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::association::{AssociationEdge, AssociationStore};
 use crate::chunks::{Chunk, ChunkRegistry};
 use crate::model::{Metrics, ModelState};
 use crate::prediction::{PredictionEdge, PredictionStore};
@@ -99,6 +100,9 @@ struct PredictionEdgeDto {
     feedback_value: f64,
     #[serde(default)]
     feedback_count: u32,
+    /// v0.3: contextual avoidance accumulator (§19).
+    #[serde(default)]
+    avoidance: f64,
 }
 
 impl From<&PredictionEdge> for PredictionEdgeDto {
@@ -110,6 +114,29 @@ impl From<&PredictionEdge> for PredictionEdgeDto {
             usage_strength: e.usage_strength,
             feedback_value: e.feedback_value,
             feedback_count: e.feedback_count,
+            avoidance: e.avoidance,
+        }
+    }
+}
+
+/// v0.3: association edge serialisation.
+#[derive(Serialize, Deserialize)]
+struct AssociationEdgeDto {
+    source: UnitIdDto,
+    target: UnitIdDto,
+    strength: f64,
+    use_count: u32,
+    last_used: u64,
+}
+
+impl From<&AssociationEdge> for AssociationEdgeDto {
+    fn from(e: &AssociationEdge) -> Self {
+        Self {
+            source: e.source.into(),
+            target: e.target.into(),
+            strength: e.strength,
+            use_count: e.use_count,
+            last_used: e.last_used,
         }
     }
 }
@@ -145,7 +172,19 @@ pub struct ModelSnapshot {
     metrics: MetricsDto,
     #[serde(default)]
     next_trace_id: TraceId,
+    /// v0.3: association edges (§7-§11).
+    #[serde(default)]
+    association_edges: Vec<AssociationEdgeDto>,
+    /// v0.3: Top-K budget stored so recall stays consistent after load.
+    #[serde(default = "default_top_k")]
+    association_top_k: usize,
+    /// v0.3: decay stored alongside edges.
+    #[serde(default = "default_decay")]
+    association_decay: f64,
 }
+
+fn default_top_k() -> usize { 32 }
+fn default_decay() -> f64 { 0.99 }
 
 // ── ModelState → snapshot ──────────────────────────────────────────────────
 
@@ -179,10 +218,11 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
             count: *count,
         })
         .collect();
+    let association_edges: Vec<AssociationEdgeDto> =
+        model.associations.iter_all().map(AssociationEdgeDto::from).collect();
 
-    // We need next_trace_id from model — access via a helper
     ModelSnapshot {
-        version: "0.2".to_owned(),
+        version: "0.3".to_owned(),
         tick: model.tick,
         primitives,
         chunks,
@@ -190,6 +230,9 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         merge_candidates,
         metrics: model.metrics.into(),
         next_trace_id: model.next_trace_id,
+        association_edges,
+        association_top_k: model.associations.top_k,
+        association_decay: model.associations.decay,
     }
 }
 
@@ -224,6 +267,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         edge.usage_strength = dto.usage_strength;
         edge.feedback_value = dto.feedback_value;
         edge.feedback_count = dto.feedback_count;
+        edge.avoidance = dto.avoidance;
     }
 
     let mut merge_candidates: HashMap<(UnitId, UnitId), u32> = HashMap::new();
@@ -231,10 +275,23 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         merge_candidates.insert((dto.left.into(), dto.right.into()), dto.count);
     }
 
+    // v0.3: restore associations
+    let raw_assoc: Vec<AssociationEdge> = snap.association_edges.into_iter().map(|d| {
+        AssociationEdge {
+            source: d.source.into(),
+            target: d.target.into(),
+            strength: d.strength,
+            use_count: d.use_count,
+            last_used: d.last_used,
+        }
+    }).collect();
+    let associations = AssociationStore::from_edges(raw_assoc, snap.association_top_k, snap.association_decay);
+
     ModelState::from_parts(
         primitives,
         chunks,
         predictions,
+        associations,
         snap.tick,
         merge_candidates,
         Metrics {
@@ -296,7 +353,7 @@ mod tests {
     fn test_version_field() {
         let model = ModelState::new();
         let snap = to_snapshot(&model);
-        assert_eq!(snap.version, "0.2");
+        assert_eq!(snap.version, "0.3");
     }
 
     #[test]

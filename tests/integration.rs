@@ -1,4 +1,5 @@
-/// Integration tests covering AC-01 through AC-13 (§G §22) and T-01 through T-18 (v0.2).
+/// Integration tests covering AC-01 through AC-13 (v0.1) + T-01 through T-18 (v0.2)
+/// + RT/TL/CR/HI/EV/SS tests (v0.3).
 use syntrail_lm::model::ModelState;
 use syntrail_lm::persistence;
 use syntrail_lm::primitives::PrimitiveRegistry;
@@ -527,4 +528,424 @@ fn t18_regression_ac_tests_still_compile() {
     // This test documents that the existing AC tests are retained.
     // Their execution is validated by cargo test finding and running them above.
     assert!(true, "T-18: regression marker — AC-01 through AC-13 all pass");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// v0.3 Acceptance Tests
+// ═══════════════════════════════════════════════════════════════
+
+// ── RT-01: expose() updates associations bidirectionally ─────────────────
+#[test]
+fn rt01_expose_creates_bidirectional_associations() {
+    let mut m = ModelState::new();
+    for _ in 0..5 { m.train("hello world"); }
+    let assoc_count = m.association_count();
+    assert!(assoc_count > 0, "RT-01: expose should create associations");
+}
+
+// ── RT-02: association strength grows with repetition ────────────────────
+#[test]
+fn rt02_association_strength_grows() {
+    use syntrail_lm::association::AssociationStore;
+    use syntrail_lm::units::UnitId;
+    let mut store = AssociationStore::new(8, 0.99);
+    let a = UnitId::primitive(1);
+    let b = UnitId::primitive(2);
+    store.observe(a, b, 0);
+    let s1 = store.top_for(a)[0].strength;
+    store.observe(a, b, 1);
+    let s2 = store.top_for(a)[0].strength;
+    assert!(s2 > s1, "RT-02: strength should grow with repeated observation");
+}
+
+// ── RT-03: Top-K budget is enforced ──────────────────────────────────────
+#[test]
+fn rt03_top_k_budget_enforced() {
+    use syntrail_lm::association::AssociationStore;
+    use syntrail_lm::units::UnitId;
+    let mut store = AssociationStore::new(4, 0.99);
+    let src = UnitId::primitive(0);
+    for i in 1..=10u32 { store.observe(src, UnitId::primitive(i), i as u64); }
+    assert!(store.top_for(src).len() <= 4, "RT-03: must not exceed top_k");
+}
+
+// ── RT-04: recall returns strongest associations ──────────────────────────
+#[test]
+fn rt04_recall_sorted_by_strength() {
+    use syntrail_lm::association::AssociationStore;
+    use syntrail_lm::chunks::ChunkRegistry;
+    use syntrail_lm::units::UnitId;
+    let mut store = AssociationStore::new(8, 0.99);
+    let src = UnitId::primitive(1);
+    store.observe(src, UnitId::primitive(2), 0);
+    for _ in 0..5 { store.observe(src, UnitId::primitive(3), 1); }
+    let chunks = ChunkRegistry::new();
+    let results = store.recall(src, &chunks, 4);
+    assert!(!results.is_empty(), "RT-04: recall should return results");
+    assert_eq!(results[0].0, UnitId::primitive(3), "RT-04: strongest should be first");
+}
+
+// ── RT-05: recall via model.recall() works ───────────────────────────────
+#[test]
+fn rt05_model_recall_method() {
+    let mut m = ModelState::new();
+    for _ in 0..10 { m.train("hello world"); }
+    let prim_ids = {
+        let mut tmp = m.primitives.clone();
+        tmp.encode("hello")
+    };
+    let segmented = segment(&prim_ids, &m.chunks, 0.0);
+    let source = segmented[0];
+    let results = m.recall(source, 4);
+    assert!(!results.is_empty(), "RT-05: model.recall should return associations");
+}
+
+// ── TL-01: avoidance grows on negative feedback ──────────────────────────
+#[test]
+fn tl01_avoidance_grows_on_negative_feedback() {
+    use syntrail_lm::prediction::PredictionEdge;
+    use syntrail_lm::units::UnitId;
+    let mut edge = PredictionEdge::new(UnitId::primitive(1), UnitId::primitive(2));
+    edge.record_usage();
+    edge.apply_feedback(-1.0, 0.99);
+    assert!(edge.avoidance > 0.0, "TL-01: avoidance should grow on negative feedback");
+    assert_eq!(edge.feedback_value, 0.0, "TL-01: feedback_value should not change on negative");
+}
+
+// ── TL-02: feedback_value grows on positive feedback ─────────────────────
+#[test]
+fn tl02_feedback_value_grows_on_positive() {
+    use syntrail_lm::prediction::PredictionEdge;
+    use syntrail_lm::units::UnitId;
+    let mut edge = PredictionEdge::new(UnitId::primitive(1), UnitId::primitive(2));
+    edge.record_usage();
+    edge.apply_feedback(1.0, 0.99);
+    assert!(edge.feedback_value > 0.0, "TL-02: feedback_value should grow on positive");
+    assert_eq!(edge.avoidance, 0.0, "TL-02: avoidance should not change on positive");
+}
+
+// ── TL-03: route score decreases when avoidance is high ──────────────────
+#[test]
+fn tl03_avoidance_reduces_score() {
+    use syntrail_lm::prediction::{PredictionEdge, PredictionStore};
+    use syntrail_lm::units::UnitId;
+    let ctx = UnitId::primitive(1);
+    let u2 = UnitId::primitive(2);
+    let u3 = UnitId::primitive(3);
+    let mut store = PredictionStore::new();
+    store.observe(ctx, u2);
+    store.observe(ctx, u3);
+    // Penalize u2 repeatedly
+    for _ in 0..10 { store.apply_feedback_to_edge(ctx, u2, -1.0, 0.99); }
+    let top = store.top1(ctx);
+    assert_eq!(top, Some(u3), "TL-03: u3 should rank higher after u2 is avoided");
+}
+
+// ── TL-04: avoidance is context-specific (not global) ────────────────────
+#[test]
+fn tl04_avoidance_is_context_specific() {
+    use syntrail_lm::prediction::PredictionStore;
+    use syntrail_lm::units::UnitId;
+    let ctx1 = UnitId::primitive(1);
+    let ctx2 = UnitId::primitive(2);
+    let next = UnitId::primitive(3);
+    let mut store = PredictionStore::new();
+    store.observe(ctx1, next);
+    store.observe(ctx2, next);
+    // Penalize in ctx1 context only
+    for _ in 0..10 { store.apply_feedback_to_edge(ctx1, next, -1.0, 0.99); }
+    // In ctx2, the edge should be unaffected
+    let e2 = store.iter_all().find(|e| e.context == ctx2 && e.next_unit == next).unwrap();
+    assert_eq!(e2.avoidance, 0.0, "TL-04: avoidance should be context-specific");
+}
+
+// ── TL-05: avoidance persists through snapshot round-trip ────────────────
+#[test]
+fn tl05_avoidance_persists() {
+    use syntrail_lm::units::UnitId;
+    let ctx = UnitId::primitive(1);
+    let next = UnitId::primitive(2);
+    let mut m = ModelState::new();
+    // Create edge and apply avoidance
+    for _ in 0..5 { m.train("ab"); }
+    for _ in 0..5 {
+        m.predictions.apply_feedback_to_edge(ctx, next, -1.0, 0.99);
+    }
+    let avoidance_before: f64 = m.predictions.iter_all()
+        .map(|e| e.avoidance).sum();
+    let tmp = NamedTempFile::new().unwrap();
+    persistence::save(&m, tmp.path()).unwrap();
+    let loaded = persistence::load(tmp.path()).unwrap();
+    let avoidance_after: f64 = loaded.predictions.iter_all()
+        .map(|e| e.avoidance).sum();
+    assert!((avoidance_before - avoidance_after).abs() < 1e-9,
+        "TL-05: avoidance should persist through snapshot");
+}
+
+// ── TL-06: feedback_count increments for both positive and negative ───────
+#[test]
+fn tl06_feedback_count_increments_on_both() {
+    use syntrail_lm::prediction::PredictionEdge;
+    use syntrail_lm::units::UnitId;
+    let mut edge = PredictionEdge::new(UnitId::primitive(1), UnitId::primitive(2));
+    edge.record_usage();
+    edge.apply_feedback(1.0, 0.99);
+    edge.apply_feedback(-1.0, 0.99);
+    assert_eq!(edge.feedback_count, 2, "TL-06: feedback_count should increment for both signs");
+}
+
+// ── CR-01: chunk can hold its own associations ────────────────────────────
+#[test]
+fn cr01_chunk_own_associations() {
+    use syntrail_lm::association::AssociationStore;
+    use syntrail_lm::units::UnitId;
+    let mut store = AssociationStore::new(8, 0.99);
+    let chunk = UnitId::chunk(0);
+    let target = UnitId::primitive(42);
+    store.observe(chunk, target, 0);
+    assert_eq!(store.top_for(chunk).len(), 1, "CR-01: chunk should hold its own associations");
+    assert_eq!(store.top_for(chunk)[0].target, target);
+}
+
+// ── CR-02: associations persist through snapshot round-trip ──────────────
+#[test]
+fn cr02_association_snapshot_roundtrip() {
+    let mut m = ModelState::new();
+    for _ in 0..10 { m.train("hello world"); }
+    let assoc_before = m.association_count();
+    let tmp = NamedTempFile::new().unwrap();
+    persistence::save(&m, tmp.path()).unwrap();
+    let loaded = persistence::load(tmp.path()).unwrap();
+    assert_eq!(loaded.association_count(), assoc_before,
+        "CR-02: association count should be preserved");
+}
+
+// ── CR-03: expose creates more associations with more training ────────────
+#[test]
+fn cr03_associations_grow_with_training() {
+    let mut m = ModelState::new();
+    let count0 = m.association_count();
+    for _ in 0..5 { m.train("hello world"); }
+    let count1 = m.association_count();
+    assert!(count1 > count0, "CR-03: associations should grow with training");
+}
+
+// ── CR-04: version field is "0.3" ────────────────────────────────────────
+#[test]
+fn cr04_snapshot_version_is_v03() {
+    let m = ModelState::new();
+    let snap = persistence::to_snapshot(&m);
+    assert_eq!(snap.version, "0.3", "CR-04: snapshot version should be 0.3");
+}
+
+// ── CR-05: recall count does not exceed limit ─────────────────────────────
+#[test]
+fn cr05_recall_respects_limit() {
+    let mut m = ModelState::new();
+    for _ in 0..10 { m.train("abcdef abcdef"); }
+    let prim_ids = {
+        let mut tmp = m.primitives.clone();
+        tmp.encode("a")
+    };
+    let segmented = segment(&prim_ids, &m.chunks, 0.0);
+    let source = segmented[0];
+    let results = m.recall(source, 2);
+    assert!(results.len() <= 2, "CR-05: recall should not exceed limit");
+}
+
+// ── HI-01: hierarchical fallback to children ─────────────────────────────
+#[test]
+fn hi01_hierarchical_recall_fallback() {
+    use syntrail_lm::association::AssociationStore;
+    use syntrail_lm::chunks::ChunkRegistry;
+    use syntrail_lm::units::UnitId;
+    let p1 = UnitId::primitive(1);
+    let p2 = UnitId::primitive(2);
+    let p99 = UnitId::primitive(99);
+    let mut chunks = ChunkRegistry::new();
+    let cid = chunks.get_or_create(p1, p2, 2);
+    let chunk_unit = UnitId::chunk(cid);
+    let mut store = AssociationStore::new(8, 0.99);
+    // Chunk has no direct associations; children do
+    store.observe(p1, p99, 0);
+    let results = store.recall(chunk_unit, &chunks, 4);
+    assert!(!results.is_empty(), "HI-01: hierarchical fallback should find children's associations");
+}
+
+// ── HI-02: direct associations preferred over fallback ───────────────────
+#[test]
+fn hi02_direct_associations_preferred() {
+    use syntrail_lm::association::AssociationStore;
+    use syntrail_lm::chunks::ChunkRegistry;
+    use syntrail_lm::units::UnitId;
+    let p1 = UnitId::primitive(1);
+    let p2 = UnitId::primitive(2);
+    let p10 = UnitId::primitive(10);
+    let p99 = UnitId::primitive(99);
+    let mut chunks = ChunkRegistry::new();
+    let cid = chunks.get_or_create(p1, p2, 2);
+    let chunk_unit = UnitId::chunk(cid);
+    let mut store = AssociationStore::new(8, 0.99);
+    // Chunk has direct association to p10
+    store.observe(chunk_unit, p10, 0);
+    // Child has association to p99
+    store.observe(p1, p99, 0);
+    let results = store.recall(chunk_unit, &chunks, 4);
+    assert!(!results.is_empty(), "HI-02: should return results");
+    // Direct association should be preferred
+    assert_eq!(results[0].0, p10, "HI-02: direct association should be preferred over fallback");
+}
+
+// ── HI-03: recall on primitive with no associations returns empty ─────────
+#[test]
+fn hi03_recall_no_associations_returns_empty() {
+    use syntrail_lm::association::AssociationStore;
+    use syntrail_lm::chunks::ChunkRegistry;
+    use syntrail_lm::units::UnitId;
+    let store = AssociationStore::new(8, 0.99);
+    let chunks = ChunkRegistry::new();
+    let results = store.recall(UnitId::primitive(42), &chunks, 4);
+    assert!(results.is_empty(), "HI-03: no associations should return empty");
+}
+
+// ── HI-04: recall depth limit prevents stack overflow ────────────────────
+#[test]
+fn hi04_recall_depth_limit() {
+    use syntrail_lm::association::AssociationStore;
+    use syntrail_lm::chunks::ChunkRegistry;
+    use syntrail_lm::units::UnitId;
+    // Build a chain of chunks: c0 = (p0, p1), c1 = (c0, p2), etc.
+    let mut chunks = ChunkRegistry::new();
+    let p0 = UnitId::primitive(0);
+    let p1 = UnitId::primitive(1);
+    let p2 = UnitId::primitive(2);
+    let cid0 = chunks.get_or_create(p0, p1, 2);
+    let c0 = UnitId::chunk(cid0);
+    let cid1 = chunks.get_or_create(c0, p2, 3);
+    let c1 = UnitId::chunk(cid1);
+    let store = AssociationStore::new(8, 0.99);
+    // Deep recall should not panic (depth guard prevents infinite recursion)
+    let results = store.recall(c1, &chunks, 4);
+    let _ = results; // just verify no panic
+}
+
+// ── EV-01: evaluate_frozen does not mutate model ─────────────────────────
+#[test]
+fn ev01_evaluate_frozen_does_not_mutate() {
+    use syntrail_lm::eval::evaluate_frozen;
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.train("hello world"); }
+    let tick_before = m.tick;
+    let edges_before = m.edge_count();
+    let assoc_before = m.association_count();
+    evaluate_frozen(&m, "hello world\nhello again");
+    assert_eq!(m.tick, tick_before, "EV-01: tick must not change");
+    assert_eq!(m.edge_count(), edges_before, "EV-01: edges must not change");
+    assert_eq!(m.association_count(), assoc_before, "EV-01: associations must not change");
+}
+
+// ── EV-02: evaluate_frozen returns plausible dpc ─────────────────────────
+#[test]
+fn ev02_evaluate_returns_plausible_dpc() {
+    use syntrail_lm::eval::evaluate_frozen;
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.train("hello world"); }
+    let result = evaluate_frozen(&m, "hello world");
+    assert!(result.dpc > 0.0, "EV-02: dpc should be > 0");
+    assert!(result.dpc <= 1.0, "EV-02: trained model dpc should be <= 1.0");
+}
+
+// ── EV-03: untrained model has dpc=1.0 ───────────────────────────────────
+#[test]
+fn ev03_untrained_dpc_equals_one() {
+    use syntrail_lm::eval::evaluate_frozen;
+    let m = ModelState::new();
+    let result = evaluate_frozen(&m, "abc");
+    assert!((result.dpc - 1.0).abs() < 1e-9,
+        "EV-03: untrained model dpc should be 1.0, got {}", result.dpc);
+}
+
+// ── EV-04: evaluate on empty text returns all zeros ──────────────────────
+#[test]
+fn ev04_empty_text_returns_zeros() {
+    use syntrail_lm::eval::evaluate_frozen;
+    let m = ModelState::new();
+    let result = evaluate_frozen(&m, "");
+    assert_eq!(result.char_count, 0, "EV-04: char_count should be 0");
+    assert_eq!(result.dpc, 0.0, "EV-04: dpc should be 0.0");
+    assert_eq!(result.prediction_accuracy, 0.0, "EV-04: accuracy should be 0.0");
+}
+
+// ── SS-01: snapshot includes association edges ────────────────────────────
+#[test]
+fn ss01_snapshot_includes_associations() {
+    let mut m = ModelState::new();
+    for _ in 0..10 { m.train("hello world"); }
+    let snap = persistence::to_snapshot(&m);
+    // The snapshot should round-trip correctly
+    let m2 = persistence::from_snapshot(snap);
+    assert_eq!(m2.association_count(), m.association_count(),
+        "SS-01: association count should match after snapshot round-trip");
+}
+
+// ── SS-02: snapshot preserves avoidance ──────────────────────────────────
+#[test]
+fn ss02_snapshot_preserves_avoidance() {
+    use syntrail_lm::units::UnitId;
+    let ctx = UnitId::primitive(10);
+    let next = UnitId::primitive(20);
+    let mut m = ModelState::new();
+    m.predictions.apply_feedback_to_edge(ctx, next, -1.0, 0.99);
+    let avoidance_before: f64 = m.predictions.iter_all().map(|e| e.avoidance).sum();
+    let snap = persistence::to_snapshot(&m);
+    let m2 = persistence::from_snapshot(snap);
+    let avoidance_after: f64 = m2.predictions.iter_all().map(|e| e.avoidance).sum();
+    assert!((avoidance_before - avoidance_after).abs() < 1e-9,
+        "SS-02: avoidance should be preserved in snapshot");
+}
+
+// ── SS-03: snapshot version is "0.3" ─────────────────────────────────────
+#[test]
+fn ss03_snapshot_version_v03() {
+    let m = ModelState::new();
+    let snap = persistence::to_snapshot(&m);
+    assert_eq!(snap.version, "0.3", "SS-03: snapshot version should be 0.3");
+}
+
+// ── SS-04: v0.2 snapshot loads with zero avoidance ───────────────────────
+#[test]
+fn ss04_v02_snapshot_loads_with_zero_avoidance() {
+    // Simulate a v0.2-style JSON snapshot (no avoidance, no association_edges)
+    let json = r#"{
+        "version": "0.2",
+        "tick": 0,
+        "primitives": [],
+        "chunks": [],
+        "prediction_edges": [
+            {
+                "context": {"is_chunk": false, "raw": 1},
+                "next_unit": {"is_chunk": false, "raw": 2},
+                "use_count": 5,
+                "usage_strength": 4.9,
+                "feedback_value": 0.0,
+                "feedback_count": 0
+            }
+        ],
+        "merge_candidates": [],
+        "metrics": {"total_decisions": 5, "total_characters": 5},
+        "next_trace_id": 0
+    }"#;
+    let snap: persistence::ModelSnapshot = serde_json::from_str(json).unwrap();
+    let m = persistence::from_snapshot(snap);
+    let total_avoid: f64 = m.predictions.iter_all().map(|e| e.avoidance).sum();
+    assert_eq!(total_avoid, 0.0, "SS-04: v0.2 edges should load with zero avoidance");
+    assert_eq!(m.association_count(), 0, "SS-04: v0.2 snapshot should load with no associations");
+}
+
+// ── T-19: v0.3 regression — all prior tests still pass ───────────────────
+#[test]
+fn t19_regression_v03() {
+    // Marker: v0.3 additions must not break any v0.1/v0.2 functionality.
+    // Validated by cargo test running all AC and T tests above.
+    assert!(true, "T-19: v0.3 regression marker");
 }

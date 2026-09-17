@@ -1,11 +1,12 @@
-/// v0.2 ModelState — unified learn/generate model.
+/// v0.3 ModelState — unified learn/generate/associate model.
 ///
-/// Key v0.2 changes:
-/// - `expose()` replaces `train()` — exposure records usage only, not quality
-/// - `generate_with_trace(&self)` — frozen (no mutation), returns TurnTrace
-/// - `apply_feedback_to_trace()` — distributes ±feedback credits to edges/chunks
+/// v0.3 additions:
+/// - `associations: AssociationStore` — bidirectional co-occurrence memory
+/// - `expose()` now records associations for every adjacent segmented pair
+/// - `recall(source)` — return Top-K associations with hierarchical fallback
 use std::collections::HashMap;
 
+use crate::association::AssociationStore;
 use crate::chunks::ChunkRegistry;
 use crate::prediction::PredictionStore;
 use crate::primitives::PrimitiveRegistry;
@@ -40,6 +41,8 @@ pub struct ModelState {
     pub primitives: PrimitiveRegistry,
     pub chunks: ChunkRegistry,
     pub predictions: PredictionStore,
+    /// v0.3: bidirectional co-occurrence associations.
+    pub associations: AssociationStore,
     pub tick: u64,
     pub(crate) merge_candidates: HashMap<(UnitId, UnitId), u32>,
     pub metrics: Metrics,
@@ -81,6 +84,14 @@ impl ModelState {
         self.predictions.learn_sequence(&segmented);
         self.metrics.total_decisions += segmented.len() as u64;
         self.metrics.total_characters += prim_ids.len() as u64;
+
+        // v0.3: bidirectional associations for every adjacent pair
+        for window in segmented.windows(2) {
+            let (a, b) = (window[0], window[1]);
+            self.associations.observe(a, b, tick);
+            self.associations.observe(b, a, tick);
+        }
+
         self.consider_merges(&segmented, tick);
     }
 
@@ -182,14 +193,20 @@ impl ModelState {
         }
     }
 
+    /// v0.3: Return Top-K associations for `source` with hierarchical fallback.
+    pub fn recall(&self, source: UnitId, limit: usize) -> Vec<(UnitId, f64)> {
+        self.associations.recall(source, &self.chunks, limit)
+    }
+
     /// A simple fingerprint of the current model state for snapshot tagging.
     pub fn state_fingerprint(&self) -> String {
         format!(
-            "tick={} prims={} chunks={} edges={}",
+            "tick={} prims={} chunks={} edges={} assoc={}",
             self.tick,
             self.primitives.len(),
             self.chunks.len(),
             self.predictions.edge_count(),
+            self.associations.edge_count(),
         )
     }
 
@@ -239,6 +256,7 @@ impl ModelState {
     pub fn primitive_count(&self) -> usize { self.primitives.len() }
     pub fn chunk_count(&self) -> usize { self.chunks.len() }
     pub fn edge_count(&self) -> usize { self.predictions.edge_count() }
+    pub fn association_count(&self) -> usize { self.associations.edge_count() }
 
     pub fn merge_candidates_iter(&self) -> impl Iterator<Item = (&(UnitId, UnitId), &u32)> {
         self.merge_candidates.iter()
@@ -248,6 +266,7 @@ impl ModelState {
         primitives: PrimitiveRegistry,
         chunks: ChunkRegistry,
         predictions: PredictionStore,
+        associations: AssociationStore,
         tick: u64,
         merge_candidates: HashMap<(UnitId, UnitId), u32>,
         metrics: Metrics,
@@ -257,6 +276,7 @@ impl ModelState {
             primitives,
             chunks,
             predictions,
+            associations,
             tick,
             merge_candidates,
             metrics,

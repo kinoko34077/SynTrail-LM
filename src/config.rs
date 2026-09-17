@@ -14,6 +14,15 @@ pub struct Config {
     pub self_feedback_enabled: bool,
     /// Default max units per generate call from the chat CLI.
     pub default_max_units: usize,
+    // ── v0.3 Association (§7-§11) ──────────────────────────────────────────
+    /// Maximum associations stored per UnitId (budget).
+    pub association_top_k: usize,
+    /// Decay for association strength: S_new = decay * S_old + 1.0
+    pub association_decay: f64,
+    /// Decay for the avoidance field (§19).
+    pub avoidance_decay: f64,
+    /// Max recall results returned by model.recall().
+    pub route_top_k: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +32,7 @@ pub enum FeedbackDistribution {
 }
 
 impl Config {
-    /// v0.2 standard defaults.
+    /// v0.2 standard defaults (backward compat).
     pub fn default_v02() -> Self {
         Self {
             feedback_base_magnitude: 1.0,
@@ -32,7 +41,16 @@ impl Config {
             feedback_distribution: FeedbackDistribution::Uniform,
             self_feedback_enabled: false,
             default_max_units: 50,
+            association_top_k: 32,
+            association_decay: 0.99,
+            avoidance_decay: 0.99,
+            route_top_k: 8,
         }
+    }
+
+    /// v0.3 standard defaults.
+    pub fn default_v03() -> Self {
+        Self::default_v02()
     }
 
     /// Compute M(context). v0.2: always 1.0.

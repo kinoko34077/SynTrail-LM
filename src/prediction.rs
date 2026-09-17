@@ -1,7 +1,8 @@
-/// Phase 6 / v0.2: Prediction Edges — self-supervised next-unit prediction.
+/// Phase 6 / v0.2-v0.3: Prediction Edges — self-supervised next-unit prediction.
 ///
-/// v0.2 separates usage (exposure) from evaluation (feedback).
-/// All learning calls are now positive exposures (no failure path).
+/// v0.3: Contextual Avoidance — negative feedback accumulates in `avoidance` (§19),
+/// keeping positive and negative signals separate.
+/// Route Score = Likelihood + Positive Value − Avoidance (§20).
 use std::collections::HashMap;
 use crate::units::UnitId;
 use crate::chunks::STRENGTH_DECAY;
@@ -9,7 +10,7 @@ use crate::chunks::STRENGTH_DECAY;
 pub const PREDICTION_REWARD: f64 = 1.0;
 
 /// A single directed prediction edge: context → next_unit.
-/// v0.2 fields: usage_strength (from exposure) + feedback_value (from ±1 feedback)
+/// v0.3 fields: usage_strength + feedback_value (positive) + avoidance (negative)
 #[derive(Debug, Clone)]
 pub struct PredictionEdge {
     pub context: UnitId,
@@ -18,10 +19,12 @@ pub struct PredictionEdge {
     pub use_count: u32,
     /// Decaying sum of usage events.
     pub usage_strength: f64,
-    /// Accumulated feedback signal: V_new = decay * V_old + r
+    /// Accumulated POSITIVE feedback signal only: V_new = decay * V_old + r (r > 0)
     pub feedback_value: f64,
     /// Number of feedback events applied to this edge.
     pub feedback_count: u32,
+    /// Accumulated NEGATIVE feedback magnitude (§19): A_new = decay * A_old + |r| (r < 0)
+    pub avoidance: f64,
 }
 
 impl PredictionEdge {
@@ -33,6 +36,7 @@ impl PredictionEdge {
             usage_strength: 0.0,
             feedback_value: 0.0,
             feedback_count: 0,
+            avoidance: 0.0,
         }
     }
 
@@ -42,10 +46,14 @@ impl PredictionEdge {
         self.usage_strength = STRENGTH_DECAY * self.usage_strength + PREDICTION_REWARD;
     }
 
-    /// Apply one feedback credit r to this edge.
-    /// V_new = decay * V_old + r
+    /// Apply one feedback credit r to this edge (v0.3: splits on sign).
+    /// Positive r → feedback_value; negative r → avoidance (|r|).
     pub fn apply_feedback(&mut self, r: f64, decay: f64) {
-        self.feedback_value = decay * self.feedback_value + r;
+        if r >= 0.0 {
+            self.feedback_value = decay * self.feedback_value + r;
+        } else {
+            self.avoidance = decay * self.avoidance + (-r);
+        }
         self.feedback_count += 1;
     }
 
@@ -54,12 +62,12 @@ impl PredictionEdge {
         if self.use_count > 0 { 1.0 } else { 0.0 }
     }
 
-    /// Prediction score used for ranking.
-    /// Higher usage_strength and positive feedback_value raise the score.
+    /// Route score (v0.3): Likelihood + Positive Value − Avoidance (§20).
     pub fn score(&self) -> f64 {
         let strength_norm = (self.usage_strength / 100.0).min(1.0);
-        let feedback_term = (self.feedback_value / 10.0).clamp(-1.0, 1.0);
-        self.confidence() + strength_norm + feedback_term
+        let pos_value = (self.feedback_value / 10.0).min(1.0);
+        let avoid_norm = (self.avoidance / 10.0).min(1.0);
+        self.confidence() + strength_norm + pos_value - avoid_norm
     }
 }
 

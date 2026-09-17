@@ -99,8 +99,6 @@ impl Session {
             return Ok(());
         }
 
-        // Reconstruct trace metadata for credit distribution
-        let n = step_rows.len();
         let mock_trace_id = turn_id as u64;
 
         let dummy_trace = crate::trace::TurnTrace::new(

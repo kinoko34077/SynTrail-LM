@@ -1,6 +1,8 @@
+pub mod association;
 pub mod chunks;
 pub mod config;
 pub mod db;
+pub mod eval;
 pub mod feedback;
 pub mod model;
 pub mod persistence;

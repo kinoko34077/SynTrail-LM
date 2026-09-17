@@ -1,9 +1,11 @@
-/// SynTrail-LM CLI — v0.2
-/// Commands: train / generate / inspect / evaluate / chat / feedback / snapshot / restore / history
+/// SynTrail-LM CLI — v0.3
+/// Commands: train / generate / inspect / evaluate / recall /
+///           chat / feedback / snapshot / restore / history
 use std::path::{Path, PathBuf};
 use std::process;
 
 use syntrail_lm::config::Config;
+use syntrail_lm::eval::evaluate_frozen;
 use syntrail_lm::feedback::{FeedbackSign, FeedbackSource};
 use syntrail_lm::model::ModelState;
 use syntrail_lm::persistence;
@@ -21,6 +23,7 @@ fn main() {
         "generate" => cmd_generate(&args[2..]),
         "inspect"  => cmd_inspect(&args[2..]),
         "evaluate" => cmd_evaluate(&args[2..]),
+        "recall"   => cmd_recall(&args[2..]),
         "chat"     => cmd_chat(&args[2..]),
         "feedback" => cmd_feedback(&args[2..]),
         "snapshot" => cmd_snapshot(&args[2..]),
@@ -40,7 +43,8 @@ Commands:
   train      --input <file> [--model <path>]
   generate   --seed <text>  [--model <path>] [--max-units N]
   inspect    [--model <path>]
-  evaluate   --input <file> [--model <path>]
+  evaluate   --input <file> [--model <path>]           (frozen — read-only)
+  recall     --unit <text>  [--model <path>] [--limit N]
   chat       --input <text> [--db <path>] [--model <path>]
   feedback   --turn-id <N> --sign <+|-|1|-1> [--db <path>]
   snapshot   [--db <path>] [--model <path>]
@@ -132,6 +136,7 @@ fn cmd_inspect(args: &[String]) {
     println!("Primitives    : {}", model.primitive_count());
     println!("Chunks        : {}", model.chunk_count());
     println!("Pred. edges   : {}", model.edge_count());
+    println!("Assoc. edges  : {}", model.association_count());
     println!("Tick          : {}", model.tick);
     println!("Total chars   : {}", model.metrics.total_characters);
     println!("Total decisions: {}", model.metrics.total_decisions);
@@ -143,6 +148,7 @@ fn cmd_inspect(args: &[String]) {
 
 // ── evaluate ──────────────────────────────────────────────────────────────
 
+/// v0.3: evaluate is frozen — model state is never mutated (EV-01, §46).
 fn cmd_evaluate(args: &[String]) {
     let input = flag_value(args, "--input").unwrap_or_else(|| {
         eprintln!("--input <file> required"); process::exit(1);
@@ -151,22 +157,56 @@ fn cmd_evaluate(args: &[String]) {
     let text = std::fs::read_to_string(&input).unwrap_or_else(|e| {
         eprintln!("Cannot read {input}: {e}"); process::exit(1);
     });
-    let mut eval_model = load_model(&model_path);
-    let mut decisions = 0u64;
-    let mut chars = 0u64;
-    for line in text.lines() {
-        if line.is_empty() { continue; }
-        let before_d = eval_model.metrics.total_decisions;
-        let before_c = eval_model.metrics.total_characters;
-        eval_model.expose(line);
-        decisions += eval_model.metrics.total_decisions - before_d;
-        chars += eval_model.metrics.total_characters - before_c;
+    let model = load_model(&model_path);
+    let result = evaluate_frozen(&model, &text);
+    println!("Lines evaluated    : {}", result.line_count);
+    println!("Characters         : {}", result.char_count);
+    println!("Decisions          : {}", result.decision_count);
+    println!("dpc                : {:.6}", result.dpc);
+    println!("Pred. accuracy     : {:.4}", result.prediction_accuracy);
+    println!("Correct / total    : {}/{}", result.correct_predictions, result.total_predictions);
+}
+
+// ── recall ────────────────────────────────────────────────────────────────
+
+/// v0.3: show association recall for the first unit in --unit text.
+fn cmd_recall(args: &[String]) {
+    let unit_text = flag_value(args, "--unit").unwrap_or_else(|| {
+        eprintln!("--unit <text> required"); process::exit(1);
+    });
+    let limit: usize = flag_value(args, "--limit")
+        .and_then(|v| v.parse().ok()).unwrap_or(8);
+    let model_path = flag_path(args, "--model").unwrap_or_else(default_model_path);
+    let model = load_model(&model_path);
+
+    // Encode the unit text and take the first segmented unit
+    let prim_ids = {
+        let mut tmp = model.primitives.clone();
+        tmp.encode(&unit_text)
+    };
+    if prim_ids.is_empty() {
+        println!("(no primitives for {:?})", unit_text);
+        return;
     }
-    let dpc = if chars == 0 { 0.0 } else { decisions as f64 / chars as f64 };
-    println!("Lines evaluated : {}", text.lines().count());
-    println!("Characters      : {chars}");
-    println!("Decisions       : {decisions}");
-    println!("dpc             : {dpc:.6}");
+
+    let segmented = syntrail_lm::segmentation::segment(&prim_ids, &model.chunks, 0.0);
+    let source = segmented[0];
+    let associations = model.recall(source, limit);
+
+    if associations.is_empty() {
+        println!("No associations for {:?}", unit_text);
+        return;
+    }
+    println!("Associations for {:?} (top {}):", unit_text, limit);
+    for (target, strength) in &associations {
+        let target_text = {
+            let expanded = syntrail_lm::segmentation::expand(
+                &[*target], &model.chunks, &model.primitives
+            );
+            model.primitives.decode(&expanded).unwrap_or_default()
+        };
+        println!("  {:?}  strength={:.4}", target_text, strength);
+    }
 }
 
 // ── chat ──────────────────────────────────────────────────────────────────

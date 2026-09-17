@@ -40,7 +40,7 @@ const USAGE: &str = "\
 Usage: syntrail <command> [options]
 
 Commands:
-  train      --input <file> [--model <path>]
+  train      --input <file> [--model <path>] [--hot-budget N]
   generate   --seed <text>  [--model <path>] [--max-units N]
   inspect    [--model <path>]
   evaluate   --input <file> [--model <path>]           (frozen — read-only)
@@ -89,6 +89,8 @@ fn cmd_train(args: &[String]) {
         eprintln!("--input <file> required"); process::exit(1);
     });
     let model_path = flag_path(args, "--model").unwrap_or_else(default_model_path);
+    let hot_budget: usize = flag_value(args, "--hot-budget")
+        .and_then(|v| v.parse().ok()).unwrap_or(0);
     let text = std::fs::read_to_string(&input).unwrap_or_else(|e| {
         eprintln!("Cannot read {input}: {e}"); process::exit(1);
     });
@@ -99,18 +101,23 @@ fn cmd_train(args: &[String]) {
         model.expose(line);
         if (i + 1) % 1000 == 0 || i + 1 == n {
             eprintln!(
-                "[{}/{}] primitives={} chunks={} edges={} dpc={:.4}",
+                "[{}/{}] primitives={} chunks={}(HOT={} SLEEP={}) edges={} dpc={:.4}",
                 i + 1, n,
                 model.primitive_count(), model.chunk_count(),
+                model.hot_chunk_count(), model.sleep_chunk_count(),
                 model.edge_count(), model.metrics.decision_per_character()
             );
         }
     }
+    if hot_budget > 0 {
+        model.enforce_hot_budget(hot_budget);
+        eprintln!("Hot budget enforced: HOT={} SLEEP={}", model.hot_chunk_count(), model.sleep_chunk_count());
+    }
     save_model(&model, &model_path);
     println!(
-        "Saved to {}  (primitives={} chunks={} edges={} dpc={:.4})",
+        "Saved to {}  (primitives={} chunks={}(HOT={}) edges={} dpc={:.4})",
         model_path.display(),
-        model.primitive_count(), model.chunk_count(),
+        model.primitive_count(), model.chunk_count(), model.hot_chunk_count(),
         model.edge_count(), model.metrics.decision_per_character()
     );
 }
@@ -134,7 +141,8 @@ fn cmd_inspect(args: &[String]) {
     let model = load_model(&model_path);
     println!("Model file    : {}", model_path.display());
     println!("Primitives    : {}", model.primitive_count());
-    println!("Chunks        : {}", model.chunk_count());
+    println!("Chunks        : {} (HOT={} SLEEP={})",
+        model.chunk_count(), model.hot_chunk_count(), model.sleep_chunk_count());
     println!("Pred. edges   : {}", model.edge_count());
     println!("Assoc. edges  : {}", model.association_count());
     println!("Tick          : {}", model.tick);

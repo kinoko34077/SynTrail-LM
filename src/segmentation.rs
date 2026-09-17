@@ -35,6 +35,8 @@ pub fn segment(
         for i in 0..units.len().saturating_sub(1) {
             if let Some(chunk_id) = chunks.find_by_pair(units[i], units[i + 1]) {
                 let chunk = chunks.get(chunk_id).unwrap();
+                // SLEEP chunks are in the structural registry but excluded from segmentation (§10)
+                if !chunk.is_hot() { continue; }
                 let score = chunk_score(chunk);
                 if score > best_score {
                     best_score = score;

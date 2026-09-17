@@ -23,6 +23,9 @@ pub struct Config {
     pub avoidance_decay: f64,
     /// Max recall results returned by model.recall().
     pub route_top_k: usize,
+    // ── v0.4 Residency (§10, §41) ──────────────────────────────────────────
+    /// Maximum number of HOT chunks. 0 = unlimited.
+    pub hot_budget: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,13 +48,15 @@ impl Config {
             association_decay: 0.99,
             avoidance_decay: 0.99,
             route_top_k: 8,
+            hot_budget: 0,
         }
     }
 
     /// v0.3 standard defaults.
-    pub fn default_v03() -> Self {
-        Self::default_v02()
-    }
+    pub fn default_v03() -> Self { Self::default_v02() }
+
+    /// v0.4 standard defaults.
+    pub fn default_v04() -> Self { Self::default_v02() }
 
     /// Compute M(context). v0.2: always 1.0.
     pub fn feedback_magnitude(&self) -> f64 {

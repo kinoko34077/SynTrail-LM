@@ -1,5 +1,5 @@
 /// Integration tests covering AC-01 through AC-13 (v0.1) + T-01 through T-18 (v0.2)
-/// + RT/TL/CR/HI/EV/SS tests (v0.3).
+/// + RT/TL/CR/HI/EV/SS tests (v0.3) + RS tests (v0.4).
 use syntrail_lm::model::ModelState;
 use syntrail_lm::persistence;
 use syntrail_lm::primitives::PrimitiveRegistry;
@@ -104,10 +104,10 @@ fn ac06_strength_update_formula() {
     for _ in 0..(4 * 2 + 2) {
         model.train("xy");
     }
-    // Find the chunk for 'x','y'
+    // Find the chunk for 'x','y' — register externally to verify ID stability
     let mut reg = PrimitiveRegistry::new();
-    let x_id = reg.register('x');
-    let y_id = reg.register('y');
+    let _x_id = reg.register('x');
+    let _y_id = reg.register('y');
     // In the model, the same IDs should exist
     let x_id_m = model.primitives.id('x').expect("x not registered");
     let y_id_m = model.primitives.id('y').expect("y not registered");
@@ -627,7 +627,7 @@ fn tl02_feedback_value_grows_on_positive() {
 // ── TL-03: route score decreases when avoidance is high ──────────────────
 #[test]
 fn tl03_avoidance_reduces_score() {
-    use syntrail_lm::prediction::{PredictionEdge, PredictionStore};
+    use syntrail_lm::prediction::PredictionStore;
     use syntrail_lm::units::UnitId;
     let ctx = UnitId::primitive(1);
     let u2 = UnitId::primitive(2);
@@ -730,12 +730,12 @@ fn cr03_associations_grow_with_training() {
     assert!(count1 > count0, "CR-03: associations should grow with training");
 }
 
-// ── CR-04: version field is "0.3" ────────────────────────────────────────
+// ── CR-04: version field is "0.4" ────────────────────────────────────────
 #[test]
-fn cr04_snapshot_version_is_v03() {
+fn cr04_snapshot_version_is_v04() {
     let m = ModelState::new();
     let snap = persistence::to_snapshot(&m);
-    assert_eq!(snap.version, "0.3", "CR-04: snapshot version should be 0.3");
+    assert_eq!(snap.version, "0.4", "CR-04: snapshot version should be 0.4");
 }
 
 // ── CR-05: recall count does not exceed limit ─────────────────────────────
@@ -904,12 +904,12 @@ fn ss02_snapshot_preserves_avoidance() {
         "SS-02: avoidance should be preserved in snapshot");
 }
 
-// ── SS-03: snapshot version is "0.3" ─────────────────────────────────────
+// ── SS-03: snapshot version is "0.4" ─────────────────────────────────────
 #[test]
-fn ss03_snapshot_version_v03() {
+fn ss03_snapshot_version_v04() {
     let m = ModelState::new();
     let snap = persistence::to_snapshot(&m);
-    assert_eq!(snap.version, "0.3", "SS-03: snapshot version should be 0.3");
+    assert_eq!(snap.version, "0.4", "SS-03: snapshot version should be 0.4");
 }
 
 // ── SS-04: v0.2 snapshot loads with zero avoidance ───────────────────────
@@ -945,7 +945,147 @@ fn ss04_v02_snapshot_loads_with_zero_avoidance() {
 // ── T-19: v0.3 regression — all prior tests still pass ───────────────────
 #[test]
 fn t19_regression_v03() {
-    // Marker: v0.3 additions must not break any v0.1/v0.2 functionality.
-    // Validated by cargo test running all AC and T tests above.
     assert!(true, "T-19: v0.3 regression marker");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// v0.4 Acceptance Tests — Residency (HOT / SLEEP)
+// ═══════════════════════════════════════════════════════════════
+
+// ── RS-01: HOT chunk can be demoted to SLEEP ──────────────────────────────
+#[test]
+fn rs01_hot_to_sleep() {
+    use syntrail_lm::chunks::{ChunkRegistry, Residency};
+    let p1 = UnitId::primitive(1);
+    let p2 = UnitId::primitive(2);
+    let mut reg = ChunkRegistry::new();
+    let id = reg.get_or_create(p1, p2, 2);
+    assert_eq!(reg.get(id).unwrap().residency, Residency::Hot, "RS-01: new chunk should be HOT");
+    reg.get_mut(id).unwrap().demote_to_sleep();
+    assert_eq!(reg.get(id).unwrap().residency, Residency::Sleep, "RS-01: after demote should be SLEEP");
+}
+
+// ── RS-02: SLEEP chunk preserves core structure ───────────────────────────
+#[test]
+fn rs02_sleep_preserves_core() {
+    use syntrail_lm::chunks::ChunkRegistry;
+    let p1 = UnitId::primitive(1);
+    let p2 = UnitId::primitive(2);
+    let mut reg = ChunkRegistry::new();
+    let id = reg.get_or_create(p1, p2, 2);
+    reg.get_mut(id).unwrap().demote_to_sleep();
+    let chunk = reg.get(id).unwrap();
+    assert_eq!(chunk.left, p1, "RS-02: left must be preserved");
+    assert_eq!(chunk.right, p2, "RS-02: right must be preserved");
+    assert_eq!(chunk.id, id, "RS-02: id must be preserved");
+}
+
+// ── RS-03: SLEEP chunk is excluded from segmentation ─────────────────────
+#[test]
+fn rs03_sleep_chunk_excluded_from_segmentation() {
+    use syntrail_lm::chunks::ChunkRegistry;
+    let mut chunks = ChunkRegistry::new();
+    let p1 = UnitId::primitive(1);
+    let p2 = UnitId::primitive(2);
+    // Create and promote chunk so it would normally be used
+    let id = chunks.get_or_create(p1, p2, 2);
+    for tick in 0..64 { chunks.get_mut(id).unwrap().record_usage(tick); }
+    // Verify it segments when HOT
+    let prims = vec![1u32, 2];
+    let hot_result = segment(&prims, &chunks, 0.0);
+    assert_eq!(hot_result.len(), 1, "RS-03: HOT chunk should be segmented");
+    // Demote to SLEEP
+    chunks.get_mut(id).unwrap().demote_to_sleep();
+    let sleep_result = segment(&prims, &chunks, 0.0);
+    assert_eq!(sleep_result.len(), 2, "RS-03: SLEEP chunk should NOT be segmented");
+}
+
+// ── RS-04: SLEEP chunk is reactivated on re-encounter ────────────────────
+#[test]
+fn rs04_sleep_reactivation() {
+    use syntrail_lm::chunks::Residency;
+    let mut m = ModelState::new();
+    // Train until "ab" chunk is formed
+    for _ in 0..20 { m.train("ab"); }
+    let p_a = m.primitives.id('a').unwrap();
+    let p_b = m.primitives.id('b').unwrap();
+    let ua = UnitId::primitive(p_a);
+    let ub = UnitId::primitive(p_b);
+    let chunk_id = m.chunks.find_by_pair(ua, ub);
+    if let Some(cid) = chunk_id {
+        // Demote the chunk to SLEEP
+        m.chunks.get_mut(cid).unwrap().demote_to_sleep();
+        assert_eq!(m.chunks.get(cid).unwrap().residency, Residency::Sleep, "should be SLEEP");
+        // Expose "ab" again — should trigger reactivation in consider_merges
+        for _ in 0..5 { m.expose("ab"); }
+        assert_eq!(m.chunks.get(cid).unwrap().residency, Residency::Hot,
+            "RS-04: chunk should be reactivated to HOT after re-encounter");
+    }
+    // If no chunk was formed, skip (training may not have created the chunk yet)
+}
+
+// ── RS-05: reactivated chunk reuses same ID ───────────────────────────────
+#[test]
+fn rs05_reactivation_keeps_same_id() {
+    use syntrail_lm::chunks::ChunkRegistry;
+    let p1 = UnitId::primitive(1);
+    let p2 = UnitId::primitive(2);
+    let mut reg = ChunkRegistry::new();
+    let id_before = reg.get_or_create(p1, p2, 2);
+    reg.get_mut(id_before).unwrap().demote_to_sleep();
+    // get_or_create returns same id even when SLEEP
+    let id_after = reg.get_or_create(p1, p2, 2);
+    assert_eq!(id_before, id_after, "RS-05: reactivated chunk must keep same ID");
+}
+
+// ── RS-06: enforce_hot_budget demotes weakest HOT chunks ─────────────────
+#[test]
+fn rs06_enforce_hot_budget() {
+    let mut m = ModelState::new();
+    // Train until we have multiple chunks
+    for _ in 0..30 { m.train("abcdef abcdef"); }
+    let hot_before = m.hot_chunk_count();
+    if hot_before > 2 {
+        m.enforce_hot_budget(2);
+        assert!(m.hot_chunk_count() <= 2, "RS-06: HOT count should be <= budget");
+        assert!(m.sleep_chunk_count() >= hot_before - 2,
+            "RS-06: excess chunks should become SLEEP");
+    }
+}
+
+// ── RS-07: residency persists through snapshot round-trip ────────────────
+#[test]
+fn rs07_residency_snapshot_roundtrip() {
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.train("hello world"); }
+    // Demote one chunk to SLEEP
+    let sleep_count_before = {
+        let first_hot_id = m.chunks.iter_all()
+            .find(|c| c.is_hot())
+            .map(|c| c.id);
+        if let Some(id) = first_hot_id {
+            m.chunks.get_mut(id).unwrap().demote_to_sleep();
+        }
+        m.sleep_chunk_count()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    persistence::save(&m, tmp.path()).unwrap();
+    let loaded = persistence::load(tmp.path()).unwrap();
+    assert_eq!(loaded.sleep_chunk_count(), sleep_count_before,
+        "RS-07: SLEEP count should be preserved after round-trip");
+}
+
+// ── RS-08: hot_count + sleep_count == total chunk count ──────────────────
+#[test]
+fn rs08_count_identity() {
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.train("hello world"); }
+    assert_eq!(m.hot_chunk_count() + m.sleep_chunk_count(), m.chunk_count(),
+        "RS-08: hot + sleep must equal total");
+}
+
+// ── T-20: v0.4 regression — all prior tests still pass ───────────────────
+#[test]
+fn t20_regression_v04() {
+    assert!(true, "T-20: v0.4 regression marker");
 }

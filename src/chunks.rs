@@ -7,16 +7,32 @@ pub const STRENGTH_DECAY: f64 = 0.99;
 /// Reward for an exposure event.
 pub const STRENGTH_REWARD: f64 = 1.0;
 
+/// v0.4 Phase 5: Activity state (§10, §11).
+///
+/// HOT  — active memory; participates in segmentation and recall.
+/// SLEEP — structural registry only; excluded from segmentation until reactivated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Residency {
+    Hot,
+    Sleep,
+}
+
+impl Default for Residency {
+    fn default() -> Self { Residency::Hot }
+}
+
 /// A Chunk is a binary composition of two Units.
-/// Once created, left/right are immutable; other fields evolve.
+/// Once created, left/right are the Immutable Chunk Core (§11).
+/// All other fields form the Active Overlay and can be zeroed on SLEEP.
 ///
 /// v0.2: separated usage (exposure) from evaluation (feedback).
-/// - `use_count` / `usage_strength`: incremented on every segmentation hit
-/// - `feedback_value` / `feedback_count`: updated only by external ±1 feedback
+/// v0.4: residency field controls whether chunk is active or dormant.
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub id: ChunkId,
+    /// Immutable Core: structural identity.
     pub left: UnitId,
+    /// Immutable Core: structural identity.
     pub right: UnitId,
     pub tier: Tier,
     /// Times this chunk appeared in a segmented sequence (usage / exposure).
@@ -31,6 +47,8 @@ pub struct Chunk {
     pub feedback_value: f64,
     /// Number of feedback events applied.
     pub feedback_count: u32,
+    /// v0.4: HOT = active; SLEEP = structural only, excluded from segmentation.
+    pub residency: Residency,
 }
 
 impl Chunk {
@@ -53,6 +71,20 @@ impl Chunk {
     /// Binary confidence: 1.0 if chunk has been used at all, else 0.0.
     pub fn confidence(&self) -> f64 {
         if self.use_count > 0 { 1.0 } else { 0.0 }
+    }
+
+    pub fn is_hot(&self) -> bool { self.residency == Residency::Hot }
+    pub fn is_sleep(&self) -> bool { self.residency == Residency::Sleep }
+
+    /// Move to SLEEP — excluded from active segmentation (§10).
+    /// Core structure (left, right) is preserved.
+    pub fn demote_to_sleep(&mut self) {
+        self.residency = Residency::Sleep;
+    }
+
+    /// Restore to HOT — re-enters active segmentation (§12).
+    pub fn promote_to_hot(&mut self) {
+        self.residency = Residency::Hot;
     }
 }
 
@@ -95,6 +127,7 @@ impl ChunkRegistry {
             expanded_length,
             feedback_value: 0.0,
             feedback_count: 0,
+            residency: Residency::Hot,
         };
         self.pair_to_id.insert((left, right), id);
         self.chunks.push(chunk);
@@ -119,6 +152,14 @@ impl ChunkRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
+    }
+
+    pub fn hot_count(&self) -> usize {
+        self.chunks.iter().filter(|c| c.is_hot()).count()
+    }
+
+    pub fn sleep_count(&self) -> usize {
+        self.chunks.iter().filter(|c| c.is_sleep()).count()
     }
 
     /// Iterate all chunks for serialisation.

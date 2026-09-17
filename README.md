@@ -23,6 +23,7 @@ Unicode スカラー値を最小単位として、頻出パターンを自動的
 | **Tier** | チャンクの検証状態。文字列長ではなくエビデンス量で決まる。T0 → T1 → T2 と昇格。 |
 | **Strength** | 使用実績の減衰和。`new = 0.99 × old + reward`。忘却と強化を同時に表現。 |
 | **dpc** | `total_decisions / total_characters`。主要評価指標。目標: 十分な学習後 < 1.0。 |
+| **Residency** | チャンクの活性状態。`Hot`（セグメント対象）または `Sleep`（構造レジストリのみ）。 |
 
 ### Tier 遷移（暫定閾値）
 
@@ -82,7 +83,7 @@ segment()                   →  [UnitId...]   ← 既存チャンクをスコ�
 cargo build --release
 ```
 
-### テスト（113 テスト・AC-01〜AC-13 + T-01〜T-18 含む）
+### テスト（94 lib + 69 integration テスト）
 
 ```bash
 cargo test
@@ -97,11 +98,12 @@ cargo test
 #### train — テキストファイルで学習してモデルを保存
 
 ```bash
-syntrail train --input <テキストファイル> [--model <モデルパス>]
+syntrail train --input <テキストファイル> [--model <モデルパス>] [--hot-budget N]
 ```
 
 - 既存モデルがあれば読み込んで追加学習する
 - `--model` デフォルト: `model.json`
+- `--hot-budget N`: 学習後に HOT チャンク数を N 以内に制限（弱いものを SLEEP に降格）。`0`（デフォルト）は無制限
 
 #### generate — テキスト生成
 
@@ -118,8 +120,9 @@ syntrail inspect [--model <モデルパス>]
 出力例:
 ```
 Primitives    : 87
-Chunks        : 142
+Chunks        : 142 (HOT=130 SLEEP=12)
 Pred. edges   : 1204
+Assoc. edges  : 840
 Chunk tiers   : T0=38 T1=71 T2=33
 dpc           : 0.631482
 ```
@@ -176,6 +179,41 @@ syntrail restore --snapshot-id <N> [--db <DBパス>] [--model <JSONパス>]
 syntrail history [--limit N] [--db <DBパス>]
 ```
 
+#### recall — 連想記憶から関連ユニットを検索（v0.3 新規）
+
+```bash
+syntrail recall --unit <テキスト> [--model <モデルパス>] [--limit N]
+```
+
+- `--unit` で指定したテキストの最初のユニットに対し、Top-K 関連ユニットを表示
+- `--limit N`: 取得件数上限（デフォルト: 8）
+- 直接の関連がない場合はチャンクを展開して階層的にフォールバック
+
+---
+
+## v0.4 主要変更（Residency: HOT/SLEEP）
+
+### チャンクの HOT/SLEEP
+
+| 状態 | 説明 |
+|------|------|
+| **Hot** | 通常の活性状態。`segment()` の対象。学習・生成に参加する。 |
+| **Sleep** | 構造レジストリにのみ存在。`segment()` には現れないが、(left, right) ペアは保持される。 |
+
+- `enforce_hot_budget(N)` で上位 N 個のチャンクだけを HOT に保てる
+- SLEEP チャンクの (left, right) ペアが再出現したとき、同一 ID のまま HOT に自動復帰
+- `inspect` 出力に `HOT=N SLEEP=M` を追加
+
+---
+
+## v0.3 主要変更（AssociationStore・Contextual Avoidance・Frozen Evaluation）
+
+| 機能 | 説明 |
+|------|------|
+| **AssociationStore** | 共起 Top-K メモリ。`recall --unit` コマンドで参照。 |
+| **Contextual Avoidance** | 負フィードバックで `avoidance` フィールドが蓄積。ルートスコア = `confidence + strength_norm + pos_value − avoidance`。 |
+| **Frozen Evaluation** | `evaluate` コマンドはモデルを変更しない読み取り専用評価。 |
+
 ---
 
 ## v0.2 主要変更
@@ -197,8 +235,8 @@ syntrail history [--limit N] [--db <DBパス>]
 ```
 src/
 ├── lib.rs            クレートルート
-├── main.rs           CLI（train/generate/inspect/evaluate/chat/feedback/snapshot/restore/history）
-├── config.rs         Config — 全チューナブル
+├── main.rs           CLI（train/generate/inspect/evaluate/recall/chat/feedback/snapshot/restore/history）
+├── config.rs         Config — 全チューナブル（hot_budget 含む）
 ├── trace.rs          TurnTrace / DecisionStep
 ├── feedback.rs       FeedbackSign / distribute_uniform / credit distribution
 ├── db.rs             SQLite Database wrapper (rusqlite)
@@ -206,14 +244,16 @@ src/
 ├── primitives.rs     PrimitiveRegistry — Unicode scalar ↔ u32 ID
 ├── units.rs          UnitId — タグ付き u32 (bit31: Primitive/Chunk)
 ├── tier.rs           Tier enum + 昇格/降格ロジック
-├── chunks.rs         Chunk 構造体 + ChunkRegistry
-├── prediction.rs     PredictionEdge + PredictionStore
-├── segmentation.rs   segment() / expand() — スコアベースパス競合
-├── model.rs          ModelState — 統合学習/生成ループ
-└── persistence.rs    JSON 永続化 v0.2 (save/load, v0.1後方互換)
+├── chunks.rs         Chunk 構造体 + ChunkRegistry（Residency: Hot/Sleep）
+├── prediction.rs     PredictionEdge（avoidance フィールド）+ PredictionStore
+├── segmentation.rs   segment() / expand() — HOT チャンクのみ対象
+├── association.rs    AssociationStore — 共起 Top-K メモリ（v0.3）
+├── eval.rs           evaluate_frozen() — 読み取り専用評価（v0.3）
+├── model.rs          ModelState — 統合学習/生成ループ（enforce_hot_budget 含む）
+└── persistence.rs    JSON 永続化 v0.4 (save/load, v0.1–v0.3 後方互換)
 
 tests/
-└── integration.rs    AC-01〜AC-13（v0.1回帰）+ T-01〜T-18（v0.2受入）
+└── integration.rs    AC-01〜AC-13（v0.1回帰）+ T-01〜T-19 + TL-01〜TL-06 + RS-01〜RS-08（69テスト）
 ```
 
 ---
@@ -226,6 +266,8 @@ tests/
 | `primitive_count` | 語彙サイズ相当 |
 | `chunk_count` | 形成されたパターン数（T0/T1/T2 内訳も確認） |
 | `edge_count` | 予測エッジ数（生成多様性の目安） |
+| `hot_chunk_count` / `sleep_chunk_count` | HOT/SLEEP チャンク数（v0.4 Residency） |
+| `association_count` | 共起関連エッジ数（v0.3 AssociationStore） |
 
 ---
 

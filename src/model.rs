@@ -210,14 +210,22 @@ impl ModelState {
         )
     }
 
-    // ── Merge logic (unchanged from v0.1) ────────────────────────────────
+    // ── Merge / reactivation (v0.4) ──────────────────────────────────────
 
     fn consider_merges(&mut self, units: &[UnitId], _tick: u64) {
         for window in units.windows(2) {
             let (left, right) = (window[0], window[1]);
-            if self.chunks.find_by_pair(left, right).is_some() {
+
+            if let Some(existing_id) = self.chunks.find_by_pair(left, right) {
+                // v0.4 §12: reactivate SLEEP chunks on re-encounter
+                if let Some(chunk) = self.chunks.get(existing_id) {
+                    if chunk.is_sleep() {
+                        self.chunks.get_mut(existing_id).unwrap().promote_to_hot();
+                    }
+                }
                 continue;
             }
+
             let count = self
                 .merge_candidates
                 .entry((left, right))
@@ -241,6 +249,23 @@ impl ModelState {
         }
     }
 
+    /// Enforce HOT budget — demote weakest HOT chunks to SLEEP (§41).
+    /// `budget = 0` means unlimited (no-op).
+    pub fn enforce_hot_budget(&mut self, budget: usize) {
+        if budget == 0 { return; }
+        let hot_count = self.chunks.hot_count();
+        if hot_count <= budget { return; }
+        let excess = hot_count - budget;
+        let mut hot: Vec<(u32, f64)> = self.chunks.iter_all()
+            .filter(|c| c.is_hot())
+            .map(|c| (c.id, c.usage_strength))
+            .collect();
+        hot.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (id, _) in hot.iter().take(excess) {
+            if let Some(c) = self.chunks.get_mut(*id) { c.demote_to_sleep(); }
+        }
+    }
+
     fn expanded_length(&self, unit: UnitId) -> u32 {
         if unit.is_primitive() {
             1
@@ -255,6 +280,8 @@ impl ModelState {
 
     pub fn primitive_count(&self) -> usize { self.primitives.len() }
     pub fn chunk_count(&self) -> usize { self.chunks.len() }
+    pub fn hot_chunk_count(&self) -> usize { self.chunks.hot_count() }
+    pub fn sleep_chunk_count(&self) -> usize { self.chunks.sleep_count() }
     pub fn edge_count(&self) -> usize { self.predictions.edge_count() }
     pub fn association_count(&self) -> usize { self.associations.edge_count() }
 

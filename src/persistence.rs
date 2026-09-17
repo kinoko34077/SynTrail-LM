@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::association::{AssociationEdge, AssociationStore};
-use crate::chunks::{Chunk, ChunkRegistry};
+use crate::chunks::{Chunk, ChunkRegistry, Residency};
 use crate::model::{Metrics, ModelState};
 use crate::prediction::{PredictionEdge, PredictionStore};
 use crate::primitives::PrimitiveRegistry;
@@ -67,6 +67,9 @@ struct ChunkDto {
     feedback_value: f64,
     #[serde(default)]
     feedback_count: u32,
+    /// v0.4: 0=Hot (default), 1=Sleep
+    #[serde(default)]
+    residency: u8,
 }
 
 impl From<&Chunk> for ChunkDto {
@@ -82,6 +85,7 @@ impl From<&Chunk> for ChunkDto {
             expanded_length: c.expanded_length,
             feedback_value: c.feedback_value,
             feedback_count: c.feedback_count,
+            residency: match c.residency { Residency::Hot => 0, Residency::Sleep => 1 },
         }
     }
 }
@@ -222,7 +226,7 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         model.associations.iter_all().map(AssociationEdgeDto::from).collect();
 
     ModelSnapshot {
-        version: "0.3".to_owned(),
+        version: "0.4".to_owned(),
         tick: model.tick,
         primitives,
         chunks,
@@ -258,6 +262,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         chunk.last_used = dto.last_used;
         chunk.feedback_value = dto.feedback_value;
         chunk.feedback_count = dto.feedback_count;
+        chunk.residency = if dto.residency == 1 { Residency::Sleep } else { Residency::Hot };
     }
 
     let mut predictions = PredictionStore::new();
@@ -353,7 +358,7 @@ mod tests {
     fn test_version_field() {
         let model = ModelState::new();
         let snap = to_snapshot(&model);
-        assert_eq!(snap.version, "0.3");
+        assert_eq!(snap.version, "0.4");
     }
 
     #[test]

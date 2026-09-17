@@ -108,6 +108,18 @@ impl PredictionStore {
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }
+
+    /// Iterate all edges for serialisation.
+    pub fn iter_all(&self) -> impl Iterator<Item = &PredictionEdge> {
+        self.edges.values()
+    }
+
+    /// Get or create an edge for mutation during deserialisation.
+    pub fn get_or_create(&mut self, context: UnitId, next_unit: UnitId) -> &mut PredictionEdge {
+        self.edges
+            .entry((context, next_unit))
+            .or_insert_with(|| PredictionEdge::new(context, next_unit))
+    }
 }
 
 #[cfg(test)]

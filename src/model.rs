@@ -47,10 +47,10 @@ pub struct ModelState {
     pub chunks: ChunkRegistry,
     pub predictions: PredictionStore,
     /// Monotonically increasing logical clock (incremented per training step).
-    tick: u64,
+    pub tick: u64,
     /// Observation counts for candidate (left, right) pairs not yet made
     /// into chunks.  Used for probabilistic merge decisions.
-    merge_candidates: HashMap<(UnitId, UnitId), u32>,
+    pub(crate) merge_candidates: HashMap<(UnitId, UnitId), u32>,
     pub metrics: Metrics,
 }
 
@@ -127,7 +127,15 @@ impl ModelState {
                 // A real implementation would use a seeded RNG here.
                 if freq >= 2.0 || pseudo_rand(left, right, count_val) < prob {
                     let exp_len = self.expanded_length(left) + self.expanded_length(right);
-                    self.chunks.get_or_create(left, right, exp_len);
+                    let cid = self.chunks.get_or_create(left, right, exp_len);
+                    // Bootstrap: credit one success so the initial score is positive
+                    // (score = confidence + strength_norm - cost = 1.0 + small - 0.1 > 0)
+                    // and the chunk is immediately eligible for segmentation.
+                    if let Some(chunk) = self.chunks.get_mut(cid) {
+                        if chunk.success_count == 0 {
+                            chunk.record_success(self.tick);
+                        }
+                    }
                     // Clear so repeated creation isn't triggered
                     self.merge_candidates.remove(&(left, right));
                 }
@@ -191,6 +199,30 @@ impl ModelState {
 
     pub fn edge_count(&self) -> usize {
         self.predictions.edge_count()
+    }
+
+    /// Iterator over merge candidates for serialisation.
+    pub fn merge_candidates_iter(&self) -> impl Iterator<Item = (&(UnitId, UnitId), &u32)> {
+        self.merge_candidates.iter()
+    }
+
+    /// Reconstruct from deserialised parts.
+    pub fn from_parts(
+        primitives: PrimitiveRegistry,
+        chunks: ChunkRegistry,
+        predictions: PredictionStore,
+        tick: u64,
+        merge_candidates: HashMap<(UnitId, UnitId), u32>,
+        metrics: Metrics,
+    ) -> Self {
+        Self {
+            primitives,
+            chunks,
+            predictions,
+            tick,
+            merge_candidates,
+            metrics,
+        }
     }
 }
 

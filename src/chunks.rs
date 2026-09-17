@@ -115,6 +115,11 @@ impl ChunkRegistry {
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
+
+    /// Iterate all chunks for serialisation.
+    pub fn iter_all(&self) -> impl Iterator<Item = &Chunk> {
+        self.chunks.iter()
+    }
 }
 
 #[cfg(test)]

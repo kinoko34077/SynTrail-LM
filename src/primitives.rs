@@ -8,12 +8,18 @@ pub type PrimitiveId = u32;
 
 /// Registry that maps Unicode scalar values to their stable IDs.
 /// All mutation goes through `register`; the registry only grows.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct PrimitiveRegistry {
     /// scalar → id
     scalar_to_id: HashMap<char, PrimitiveId>,
     /// id → scalar  (indexed by id, slot 0 unused)
     id_to_scalar: Vec<char>,
+}
+
+impl Default for PrimitiveRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PrimitiveRegistry {

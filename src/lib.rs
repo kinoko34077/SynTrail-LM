@@ -1,4 +1,5 @@
 pub mod chunks;
+pub mod model;
 pub mod prediction;
 pub mod primitives;
 pub mod segmentation;

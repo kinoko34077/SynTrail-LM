@@ -82,13 +82,17 @@ segment()                   →  [UnitId...]   ← 既存チャンクをスコ�
 cargo build --release
 ```
 
-### テスト（67 テスト・AC-01〜AC-13 含む）
+### テスト（113 テスト・AC-01〜AC-13 + T-01〜T-18 含む）
 
 ```bash
 cargo test
 ```
 
-### CLI
+---
+
+## CLI
+
+### バッチ学習系（v0.1 から継続）
 
 #### train — テキストファイルで学習してモデルを保存
 
@@ -96,18 +100,14 @@ cargo test
 syntrail train --input <テキストファイル> [--model <モデルパス>]
 ```
 
-- `--input`: 学習テキストファイル（UTF-8、改行区切り）
-- `--model`: モデル保存先 JSON（デフォルト: `model.json`）
 - 既存モデルがあれば読み込んで追加学習する
+- `--model` デフォルト: `model.json`
 
 #### generate — テキスト生成
 
 ```bash
-syntrail generate --seed <開始テキスト> [--max-units <N>] [--model <モデルパス>]
+syntrail generate --seed <開始テキスト> [--model <モデルパス>] [--max-units N]
 ```
-
-- `--seed`: 生成の起点テキスト
-- `--max-units`: 最大生成 Unit 数（デフォルト: 50）
 
 #### inspect — モデル統計の表示
 
@@ -118,8 +118,9 @@ syntrail inspect [--model <モデルパス>]
 出力例:
 ```
 Primitives    : 87
-Chunks        : 142  (T0=38 T1=71 T2=33)
+Chunks        : 142
 Pred. edges   : 1204
+Chunk tiers   : T0=38 T1=71 T2=33
 dpc           : 0.631482
 ```
 
@@ -131,12 +132,77 @@ syntrail evaluate --input <テキストファイル> [--model <モデルパス>]
 
 ---
 
+### 会話系（v0.2 新規）
+
+会話系コマンドは SQLite セッション DB（デフォルト: `syntrail.db`）を共有する。
+`--db <パス>` でパスを変更できる。
+
+#### chat — 1ターン会話して出力を表示
+
+```bash
+syntrail chat --input <テキスト> [--db <DBパス>]
+```
+
+- 生成（frozen）→ 入力テキストを expose → DB に記録、の順で実行
+- stderr に `[turn_id=N decisions=M tick=K]` を出力
+
+#### feedback — 過去のターンに ±1 フィードバックを付与
+
+```bash
+syntrail feedback --turn-id <N> --sign <+|-|1|-1> [--db <DBパス>]
+```
+
+- `--sign +` / `+1` / `1`: 正フィードバック（R = +1.0）
+- `--sign -` / `-1`: 負フィードバック（R = −1.0）
+- クレジットはターン内の決定数 N で均等分配（r_i = R / N）
+
+#### snapshot — 現在のモデル状態を DB に保存
+
+```bash
+syntrail snapshot [--db <DBパス>] [--model <JSONパス>]
+```
+
+- `--model` を指定すると JSON ファイルにも同時保存
+
+#### restore — スナップショットからモデル状態を復元
+
+```bash
+syntrail restore --snapshot-id <N> [--db <DBパス>] [--model <JSONパス>]
+```
+
+#### history — 会話履歴を表示
+
+```bash
+syntrail history [--limit N] [--db <DBパス>]
+```
+
+---
+
+## v0.2 主要変更
+
+| 概念 | v0.1 | v0.2 |
+|------|------|------|
+| 学習関数 | `train(text)` | `expose(text)`（`train` はエイリアス） |
+| 生成関数 | `generate(&self)` — 元から immutable | `generate_with_trace(&self)` — TurnTrace を返す |
+| 強度フィールド | `strength` | `usage_strength`（使用）+ `feedback_value`（評価） |
+| カウントフィールド | `success_count / total_count` | `use_count`（使用回数のみ） |
+| スコア confidence | `success / total` | `use_count > 0 → 1.0`（2値） |
+| フィードバック | なし | ±1 符号付き、均一クレジット分配 |
+| ログ | なし | SQLite（turns / trace_steps / feedback_events / snapshots） |
+
+---
+
 ## モジュール構成
 
 ```
 src/
 ├── lib.rs            クレートルート
-├── main.rs           CLI エントリポイント (train/generate/inspect/evaluate)
+├── main.rs           CLI（train/generate/inspect/evaluate/chat/feedback/snapshot/restore/history）
+├── config.rs         Config — 全チューナブル
+├── trace.rs          TurnTrace / DecisionStep
+├── feedback.rs       FeedbackSign / distribute_uniform / credit distribution
+├── db.rs             SQLite Database wrapper (rusqlite)
+├── session.rs        Session — ModelState + Database + Config
 ├── primitives.rs     PrimitiveRegistry — Unicode scalar ↔ u32 ID
 ├── units.rs          UnitId — タグ付き u32 (bit31: Primitive/Chunk)
 ├── tier.rs           Tier enum + 昇格/降格ロジック
@@ -144,10 +210,10 @@ src/
 ├── prediction.rs     PredictionEdge + PredictionStore
 ├── segmentation.rs   segment() / expand() — スコアベースパス競合
 ├── model.rs          ModelState — 統合学習/生成ループ
-└── persistence.rs    JSON 永続化 (save/load)
+└── persistence.rs    JSON 永続化 v0.2 (save/load, v0.1後方互換)
 
 tests/
-└── integration.rs    AC-01〜AC-13 受入テスト
+└── integration.rs    AC-01〜AC-13（v0.1回帰）+ T-01〜T-18（v0.2受入）
 ```
 
 ---

@@ -72,10 +72,15 @@ impl PredictionEdge {
 }
 
 /// Stores all prediction edges indexed by (context, next_unit).
+///
+/// Phase 5: secondary source_index maps context → Vec<next_unit> so that
+/// `predict()` is O(K) fan-out instead of O(N_total) full-scan.
 #[derive(Debug, Default)]
 pub struct PredictionStore {
-    /// (context, next_unit) → edge
+    /// (context, next_unit) → edge  (O(1) point lookup)
     edges: HashMap<(UnitId, UnitId), PredictionEdge>,
+    /// context → list of known successors  (Phase 5 source index)
+    source_index: HashMap<UnitId, Vec<UnitId>>,
 }
 
 impl PredictionStore {
@@ -90,6 +95,11 @@ impl PredictionStore {
             .entry((context, next_unit))
             .or_insert_with(|| PredictionEdge::new(context, next_unit));
         edge.record_usage();
+        // Maintain source index — only add if this is a new (context, next_unit) pair.
+        let successors = self.source_index.entry(context).or_default();
+        if !successors.contains(&next_unit) {
+            successors.push(next_unit);
+        }
     }
 
     /// Learn from a sequence of units: every adjacent pair (units[i], units[i+1])
@@ -101,12 +111,16 @@ impl PredictionStore {
     }
 
     /// Return candidates for the next unit given `context`, ranked by score.
+    ///
+    /// Phase 5: O(K) via source_index instead of O(N_total) full scan.
     pub fn predict(&self, context: UnitId) -> Vec<(&PredictionEdge, f64)> {
-        let mut candidates: Vec<(&PredictionEdge, f64)> = self
-            .edges
+        let Some(successors) = self.source_index.get(&context) else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<(&PredictionEdge, f64)> = successors
             .iter()
-            .filter(|((ctx, _), _)| *ctx == context)
-            .map(|(_, edge)| (edge, edge.score()))
+            .filter_map(|&nxt| self.edges.get(&(context, nxt)))
+            .map(|edge| (edge, edge.score()))
             .collect();
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         candidates
@@ -146,9 +160,17 @@ impl PredictionStore {
 
     /// Get or create an edge for mutation during deserialisation.
     pub fn get_or_create(&mut self, context: UnitId, next_unit: UnitId) -> &mut PredictionEdge {
-        self.edges
+        let is_new = !self.edges.contains_key(&(context, next_unit));
+        let edge = self.edges
             .entry((context, next_unit))
-            .or_insert_with(|| PredictionEdge::new(context, next_unit))
+            .or_insert_with(|| PredictionEdge::new(context, next_unit));
+        if is_new {
+            let successors = self.source_index.entry(context).or_default();
+            if !successors.contains(&next_unit) {
+                successors.push(next_unit);
+            }
+        }
+        edge
     }
 }
 

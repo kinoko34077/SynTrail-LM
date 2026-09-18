@@ -12,6 +12,7 @@ pub mod model;
 pub mod relation;
 pub mod transform;
 pub mod isa;
+pub mod core;
 pub mod persistence;
 pub mod prediction;
 pub mod primitives;

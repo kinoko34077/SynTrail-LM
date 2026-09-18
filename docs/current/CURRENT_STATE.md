@@ -36,6 +36,7 @@ crate version: 0.5.0
 - **Cross-View Identity** (Union-Find merge_identities, canonical resolution, persistence) ← Phase 11
 - **Transform / Inverse / Composition** (TransformStore, register→merge, inverse, compose) ← Phase 12
 - **Micro-ISA** (Instruction enum, Vm dispatcher, register file — all 14 opcodes) ← Phase 13
+- **Physical Core / Overlay 分離** (CoreView: segment_core, predict_core, is_core_unit; ModelState::core_view) ← Phase 14
 
 ---
 
@@ -112,7 +113,7 @@ crate version: 0.5.0
 
 | Phase | 内容 |
 |-------|------|
-| 14 | Physical Core / Overlay 分離 |
+| ~~14~~ | ~~Physical Core / Overlay 分離~~ | ✅ 完了 |
 | 15 | Flat Arrays / Arena Index |
 | 16 | Binary Persistence |
 | 17 | Fixed Point / Packing |

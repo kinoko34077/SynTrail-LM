@@ -311,6 +311,11 @@ impl ModelState {
         None
     }
 
+    /// Phase 14: return a read-only Core view (Primitives + HOT Chunks + Predictions).
+    pub fn core_view(&self) -> crate::core::CoreView<'_> {
+        crate::core::CoreView { chunks: &self.chunks, predictions: &self.predictions }
+    }
+
     pub fn state_fingerprint(&self) -> String {
         format!(
             "tick={} prims={} chunks={} edges={} assoc={}",

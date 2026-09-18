@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use crate::association::AssociationStore;
 use crate::chunks::ChunkRegistry;
+use crate::identity::IdentityStore;
 use crate::prediction::PredictionStore;
 use crate::primitives::PrimitiveRegistry;
 use crate::segmentation::{expand, segment};
@@ -43,6 +44,8 @@ pub struct ModelState {
     pub predictions: PredictionStore,
     /// v0.3: bidirectional co-occurrence associations.
     pub associations: AssociationStore,
+    /// Phase 2: Identity/View registry (Exact Identity).
+    pub identities: IdentityStore,
     pub tick: u64,
     pub(crate) merge_candidates: HashMap<(UnitId, UnitId), u32>,
     pub metrics: Metrics,
@@ -92,6 +95,10 @@ impl ModelState {
             self.associations.observe(b, a, tick);
         }
 
+        // Phase 2: register the Identity (canonical prim seq) and this View (chunk tree).
+        let identity_id = self.identities.intern_identity(&prim_ids);
+        self.identities.intern_view(&segmented, identity_id);
+
         self.consider_merges(&segmented, tick);
     }
 
@@ -126,6 +133,11 @@ impl ModelState {
         self.predictions.learn_sequence(&segmented);
         // No metrics update — this is not an external observation.
         // No association update — Adjacency tracks world co-occurrence only.
+
+        // Phase 2: register the View for this (possibly re-segmented) chunk tree.
+        // prim_ids here came from encode_existing, so only already-registered chars.
+        let identity_id = self.identities.intern_identity(&prim_ids);
+        self.identities.intern_view(&segmented, identity_id);
 
         self.consider_merges(&segmented, tick);
     }
@@ -336,6 +348,7 @@ impl ModelState {
         chunks: ChunkRegistry,
         predictions: PredictionStore,
         associations: AssociationStore,
+        identities: IdentityStore,
         tick: u64,
         merge_candidates: HashMap<(UnitId, UnitId), u32>,
         metrics: Metrics,
@@ -346,6 +359,7 @@ impl ModelState {
             chunks,
             predictions,
             associations,
+            identities,
             tick,
             merge_candidates,
             metrics,
@@ -551,5 +565,80 @@ mod tests {
         for _ in 0..7 { m.replay(text); }
         assert_eq!(m.metrics.total_characters, chars_after_one,
             "8 replays after 1 expose_external must not inflate total_characters");
+    }
+
+    // ── Phase 2: Identity / View ──────────────────────────────────────────
+
+    #[test]
+    fn expose_external_registers_identity_and_view() {
+        let mut m = ModelState::new();
+        m.expose_external("abc");
+        assert_eq!(m.identities.identity_count(), 1,
+            "one unique Primitive expansion → one Identity");
+        assert!(m.identities.view_count() >= 1,
+            "at least one View should be registered");
+    }
+
+    #[test]
+    fn replay_registers_view_same_identity() {
+        // After training, replay of the same text produces the same Identity
+        // (possibly a different View once chunks form, but same Identity).
+        let mut m = ModelState::new();
+        let text = "abab";
+        // First exposure
+        m.expose_external(text);
+        let id_after_expose = m.identities.intern_identity(
+            &m.primitives.encode_existing(text)
+        );
+        // Several replays to allow chunk formation
+        for _ in 0..10 {
+            m.expose_external(text);
+        }
+        let id_after_replay = m.identities.intern_identity(
+            &m.primitives.encode_existing(text)
+        );
+        assert_eq!(id_after_expose, id_after_replay,
+            "same Primitive expansion → same IdentityId regardless of segmentation");
+    }
+
+    #[test]
+    fn different_texts_different_identities() {
+        let mut m = ModelState::new();
+        m.expose_external("abc");
+        m.expose_external("xyz");
+        // Two distinct Primitive expansions → two Identities
+        assert_eq!(m.identities.identity_count(), 2);
+    }
+
+    #[test]
+    fn same_text_repeated_does_not_add_new_identity() {
+        let mut m = ModelState::new();
+        m.expose_external("hello");
+        m.expose_external("hello");
+        m.expose_external("hello");
+        assert_eq!(m.identities.identity_count(), 1,
+            "same text repeated → same Identity");
+    }
+
+    #[test]
+    fn different_views_same_identity_after_chunk_formation() {
+        let mut m = ModelState::new();
+        let text = "ab";
+        // Train until a chunk forms
+        for _ in 0..20 { m.expose_external(text); }
+        assert!(m.chunk_count() > 0, "chunk should have formed");
+        // Both the all-primitives view [P(a),P(b)] and the chunked view [C(ab)]
+        // should map to the same Identity.
+        let prim_ids = m.primitives.encode_existing(text);
+        let identity_id = m.identities.intern_identity(&prim_ids);
+        // All registered views for this identity should resolve to it
+        let mut found_matching = 0u32;
+        for view_id in 0..m.identities.view_count() as u32 {
+            if m.identities.identity_of_view(view_id) == Some(identity_id) {
+                found_matching += 1;
+            }
+        }
+        assert!(found_matching >= 2,
+            "at least the primitive-only view and the chunked view must share identity; got {found_matching}");
     }
 }

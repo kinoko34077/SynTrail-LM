@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::association::{AssociationEdge, AssociationStore};
 use crate::chunks::{Chunk, ChunkRegistry, Residency};
+use crate::identity::IdentityStore;
 use crate::model::{Metrics, ModelState};
 use crate::prediction::{PredictionEdge, PredictionStore};
 use crate::primitives::PrimitiveRegistry;
@@ -164,6 +165,13 @@ struct MergeCandidateDto {
     count: u32,
 }
 
+/// Phase 2: serialisable View entry — (unit sequence, identity id).
+#[derive(Serialize, Deserialize)]
+struct ViewDto {
+    units: Vec<UnitIdDto>,
+    identity: u32,
+}
+
 /// Top-level snapshot written to disk.
 #[derive(Serialize, Deserialize)]
 pub struct ModelSnapshot {
@@ -185,6 +193,12 @@ pub struct ModelSnapshot {
     /// v0.3: decay stored alongside edges.
     #[serde(default = "default_decay")]
     association_decay: f64,
+    /// Phase 2: canonical Primitive sequences indexed by IdentityId.
+    #[serde(default)]
+    identities: Vec<Vec<u32>>,
+    /// Phase 2: Views (Chunk trees) with their Identity bindings.
+    #[serde(default)]
+    views: Vec<ViewDto>,
 }
 
 fn default_top_k() -> usize { 32 }
@@ -225,8 +239,17 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
     let association_edges: Vec<AssociationEdgeDto> =
         model.associations.iter_all().map(AssociationEdgeDto::from).collect();
 
+    // Phase 2: identity / view store
+    let identities: Vec<Vec<u32>> = model.identities.all_identities().to_vec();
+    let views: Vec<ViewDto> = model.identities.all_views()
+        .map(|(units, identity)| ViewDto {
+            units: units.iter().copied().map(UnitIdDto::from).collect(),
+            identity,
+        })
+        .collect();
+
     ModelSnapshot {
-        version: "0.4".to_owned(),
+        version: "0.5".to_owned(),
         tick: model.tick,
         primitives,
         chunks,
@@ -237,6 +260,8 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         association_edges,
         association_top_k: model.associations.top_k,
         association_decay: model.associations.decay,
+        identities,
+        views,
     }
 }
 
@@ -292,11 +317,22 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
     }).collect();
     let associations = AssociationStore::from_edges(raw_assoc, snap.association_top_k, snap.association_decay);
 
+    // Phase 2: restore identity / view store
+    let identity_seqs: Vec<Vec<u32>> = snap.identities;
+    let view_pairs: Vec<(Vec<UnitId>, u32)> = snap.views.into_iter()
+        .map(|d| {
+            let units: Vec<UnitId> = d.units.into_iter().map(UnitId::from).collect();
+            (units, d.identity)
+        })
+        .collect();
+    let identities = IdentityStore::from_bulk(identity_seqs, view_pairs);
+
     ModelState::from_parts(
         primitives,
         chunks,
         predictions,
         associations,
+        identities,
         snap.tick,
         merge_candidates,
         Metrics {
@@ -358,7 +394,7 @@ mod tests {
     fn test_version_field() {
         let model = ModelState::new();
         let snap = to_snapshot(&model);
-        assert_eq!(snap.version, "0.4");
+        assert_eq!(snap.version, "0.5");
     }
 
     #[test]

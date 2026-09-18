@@ -1,8 +1,8 @@
 # 現在の実装状態
 
 最終確認: 2026-09-18  
-main HEAD: `1577ac65f782730d9ec5d220f0edf38efe48565f`  
-crate version: 0.4.0
+main HEAD: Phase 2完了後更新予定  
+crate version: 0.5.0
 
 ---
 
@@ -23,15 +23,14 @@ crate version: 0.4.0
 - Snapshot (JSON / SQLite)
 - Chat GUI (eframe/egui)
 - Adaptive Trainer (UTF-8/Shift_JIS, S/M/L/XL block, 4→8→16→32 repeat, Pause/Resume)
+- **Experience / Replay 分離** (expose_external vs replay, encode_existing)
+- **Identity / View 最小実装** (IdentityStore, Exact Identity, persistence)
 
 ---
 
 ## 未実装
 
-- Identity
-- View
 - Representation Lineage
-- **Experience / Replay 分離** ← Phase 1 (次のマイルストーン)
 - Fallback via Lineage
 - Cross-view Identity
 - Unified Relation Core
@@ -74,8 +73,8 @@ crate version: 0.4.0
 | Phase | 内容 | 完了条件 |
 |-------|------|---------|
 | 0 | 仕様書正本化・Baseline計測 | 変更を数字で比較できる |
-| **1** | **Experience / Replay 分離** | **8回ReplayしてもExternal occurrenceが1のまま** |
-| 2 | Identity / View 最小実装 (Exact Identity) | 異なるChunk木を同一Contentとして束ねられる |
+| ~~1~~ | ~~Experience / Replay 分離~~ | ✅ 完了 |
+| ~~2~~ | ~~Identity / View 最小実装 (Exact Identity)~~ | ✅ 完了 |
 | 3 | Representation Lineage | 高次Rep形成時に獲得元を保存 |
 | 4 | Fallback via Lineage | 高次View失敗時にPrimitiveまで安全に戻れる |
 

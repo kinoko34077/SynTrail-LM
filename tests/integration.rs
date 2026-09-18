@@ -735,7 +735,7 @@ fn cr03_associations_grow_with_training() {
 fn cr04_snapshot_version_is_v04() {
     let m = ModelState::new();
     let snap = persistence::to_snapshot(&m);
-    assert_eq!(snap.version, "0.4", "CR-04: snapshot version should be 0.4");
+    assert_eq!(snap.version, "0.5", "CR-04: snapshot version should be 0.5");
 }
 
 // ── CR-05: recall count does not exceed limit ─────────────────────────────
@@ -909,7 +909,7 @@ fn ss02_snapshot_preserves_avoidance() {
 fn ss03_snapshot_version_v04() {
     let m = ModelState::new();
     let snap = persistence::to_snapshot(&m);
-    assert_eq!(snap.version, "0.4", "SS-03: snapshot version should be 0.4");
+    assert_eq!(snap.version, "0.5", "SS-03: snapshot version should be 0.5");
 }
 
 // ── SS-04: v0.2 snapshot loads with zero avoidance ───────────────────────

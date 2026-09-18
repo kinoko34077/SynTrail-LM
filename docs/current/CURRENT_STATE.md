@@ -1,7 +1,7 @@
 # 現在の実装状態
 
 最終確認: 2026-09-18  
-main HEAD: 3536088 (Phase F完了)  
+main HEAD: 7dd9983 (UI-2/4/5完了)  
 crate version: 0.5.0  
 integration tests: 100
 
@@ -59,37 +59,35 @@ integration tests: 100
 
 ---
 
-## Desktop UI / GUI — 既知の問題（修正必須）
+## Desktop UI / GUI — 既知の問題
 
-### Trainer (Critical)
+### Trainer (✅ P0 修正済)
 
-| 優先 | 箇所 | 問題 |
-|------|------|------|
-| P0 | `worker_main` / `save_and_exit` | `let _ = save_model_file(...)` / `let _ = tr_state.save(...)` でsave errorを握り潰し、その後 `Saved` イベントを送信 → **データ破損リスク** (§110) |
-| P0 | `save_and_exit()` | `tr_state.model_fingerprint` を更新せずにsave → Stopして再Resume時にfingerprint不一致 (§112) |
-| P0 | `update()` D&D処理 | Running中でも `try_load_model()`/`try_load_dataset()` が呼ばれ、最終的に `check_ready()` → state が Ready に上書きされる (§108) |
-| P1 | Resume ボタン | `is_paused` 状態でResume押下が `start_training(true)` (=Resume Saved Session) を呼ぶ。Paused状態の既存workerへ `TrainerCommand::Resume` を送る経路がない (§107) |
-| P1 | Path TextEdit | model_path / dataset_path がTextEdit可能だが文字変更だけでは loaded_model と一致しない (§116) |
+| 優先 | 箇所 | 問題 | 状態 |
+|------|------|------|------|
+| ~~P0~~ | `worker_main` / `do_save()` | save errorを握り潰し (§110) | ✅ UI-4 |
+| ~~P0~~ | `save_and_exit()` | fingerprint未更新 (§112) | ✅ UI-4 |
+| ~~P0~~ | `update()` D&D | Running中にstate上書き (§108) | ✅ UI-4 |
+| ~~P1~~ | Resume ボタン | 既存workerへのResume経路なし (§107) | ✅ UI-4 |
+| P1 | Path TextEdit | model_path / dataset_path がTextEdit可能だが loaded_model と非同期 (§116) | 未 |
 
-### Chat GUI (Important)
+### Chat GUI
 
-| 優先 | 箇所 | 問題 |
-|------|------|------|
-| P1 | `send_message()` | `self.input.trim().to_string()` → モデルに渡す文字列の先頭末尾空白を削除。空白もPrimitive学習対象なため分離が必要 (§100) |
-| P1 | `generate_turn()` / Analytics | `last_output_len = output.len()` はUTF-8バイト数。表示名「Last Out Len」は文字数と誤解されやすい (§101) |
-| P2 | Analytics | N turnごと更新のため、画面Turn数とAnalytics表示が一時的に不一致。「last updated at turn N」等が必要 (§102) |
-| P2 | New操作 | history.sqliteの過去記録は残るがchat_history.clear()される。「New Model」と「New Conversation」の意味が不明確 (§103) |
+| 優先 | 箇所 | 問題 | 状態 |
+|------|------|------|------|
+| ~~P1~~ | `send_message()` | raw input trimが先行 (§100) | ✅ UI-5 |
+| ~~P1~~ | `last_output_len` (bytes) | 表示がバイト数 (§101) | ✅ UI-5 |
+| P2 | Analytics | N turnごと更新で不一致表示 (§102) | 未 |
+| P2 | New操作 | New Model / New Conversation 意味不明確 (§103) | 未 |
 
 ### 共通 (Architecture)
 
-| 優先 | 内容 |
-|------|------|
-| P1 | `setup_fonts()` がgui/trainerで重複 (§122) |
-| P1 | File Dialog定義 (rfd::FileDialog) がgui/trainerで重複 (§98) |
-| P1 | D&D処理がgui/trainerで独立実装 (§99) |
-| P1 | `desktop/` 共通層未作成 (§78) |
-| P2 | Windows Native Menu未実装 (§88-94) |
-| P2 | Keyboard shortcuts (Ctrl+N/O/S/Shift+S) 未実装 (§92) |
+| 優先 | 内容 | 状態 |
+|------|------|------|
+| ~~P1~~ | `desktop/` 共通層 (FileKind/FileCommand/DropRouter/fonts) (§78/§82/§95/§122) | ✅ UI-2 |
+| P2 | Windows Native Menu (§88-94) | 未 |
+| P2 | Keyboard shortcuts Ctrl+N/O/S/Shift+S (§92) | 未 |
+| P2 | Chat/Trainer の setup_fonts を desktop::fonts::setup_fonts に切り替え | 未 |
 
 ---
 
@@ -114,10 +112,10 @@ integration tests: 100
 | Phase | 内容 | 状態 |
 |-------|------|------|
 | UI-1 | README/CURRENT_STATE/spec現状整理 | ✅ 完了 |
-| UI-2 | FileKind / FileDialogSpec / ModelFileService 共通層 | 未着手 |
-| UI-3 | D&D共通化 (DropRouter) | 未着手 |
-| UI-4 | Trainer state machine修正 (Save error, fingerprint, Running guard, Resume) | 未着手 |
-| UI-5 | Chat GUI修正 (raw input, last_output_len) | 未着手 |
+| UI-2 | FileKind / FileDialogSpec / ModelFileService 共通層 | ✅ 完了 |
+| UI-3 | D&D共通化 (DropRouter) | ✅ 完了 (drop.rs) |
+| UI-4 | Trainer state machine修正 (Save error, fingerprint, Running guard, Resume) | ✅ 完了 |
+| UI-5 | Chat GUI修正 (raw input, last_output_chars) | ✅ 完了 |
 | UI-6 | Windows Native Menu Spike | 未着手 |
 | UI-7 | Native Menu本実装 | 未着手 |
 | UI-8 | Trainer menu/file統合 | 未着手 |

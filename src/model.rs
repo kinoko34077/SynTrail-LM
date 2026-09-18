@@ -274,6 +274,59 @@ impl ModelState {
         self.associations.recall(source, &self.chunks, limit)
     }
 
+    // ── Phase 20: Generalization / Novel Search ───────────────────────────
+
+    /// Generalised prediction for `context`.
+    ///
+    /// Falls back through three levels:
+    ///   1. `predict_with_fallback(context)` — direct + lineage chain (Phase 4)
+    ///   2. Association bridge: find the strongest associate of `context`,
+    ///      then predict from that associate.  Useful when context has no
+    ///      direct prediction edges but a co-occurring unit does.
+    ///   3. Returns `None` only when no path yields a prediction.
+    pub fn generalize(&self, context: UnitId) -> Option<(UnitId, f64)> {
+        // Level 1: lineage fallback.
+        if let Some(r) = self.predict_with_fallback(context) {
+            return Some(r);
+        }
+        // Level 2: association bridge.
+        let associates = self.associations.recall(context, &self.chunks, 8);
+        for (assoc, assoc_strength) in associates {
+            if assoc == context { continue; }
+            if let Some((next, pred_score)) = self.predictions.top1_with_score(assoc) {
+                // Combined score: geometric mean of association and prediction scores.
+                let combined = (assoc_strength * pred_score).sqrt();
+                return Some((next, combined));
+            }
+        }
+        None
+    }
+
+    /// Return novel next-unit candidates for `context` by traversing
+    /// Association edges one hop away and collecting all prediction targets.
+    ///
+    /// `limit`: maximum candidates returned, ranked by combined score.
+    ///
+    /// This enables *analogical* generation: "units that follow things similar
+    /// to `context`" even when `context` itself has no known successors.
+    pub fn novel_candidates(&self, context: UnitId, limit: usize) -> Vec<(UnitId, f64)> {
+        let associates = self.associations.recall(context, &self.chunks, 16);
+        let mut candidates: std::collections::HashMap<UnitId, f64> = HashMap::new();
+        for (assoc, assoc_strength) in associates {
+            for (edge, pred_score) in self.predictions.predict(assoc) {
+                let combined = (assoc_strength * pred_score).sqrt();
+                let entry = candidates.entry(edge.next_unit).or_insert(0.0);
+                if combined > *entry {
+                    *entry = combined;
+                }
+            }
+        }
+        let mut ranked: Vec<(UnitId, f64)> = candidates.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(limit);
+        ranked
+    }
+
     /// A simple fingerprint of the current model state for snapshot tagging.
     // ── Phase 4: Fallback via Lineage ─────────────────────────────────────
 

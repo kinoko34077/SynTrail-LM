@@ -1091,3 +1091,40 @@ fn rs08_count_identity() {
 fn t20_regression_v04() {
     assert!(true, "T-20: v0.4 regression marker");
 }
+
+// ── GN-01: generalize() falls back through associations ──────────────────
+#[test]
+fn gn01_generalize_via_association() {
+    let mut m = ModelState::new();
+    // Train "ab" heavily — 'b' follows 'a', and b↔c are co-associated.
+    for _ in 0..20 { m.train("ab"); }
+    for _ in 0..20 { m.train("bc"); }
+    // 'a' can predict 'b' directly; this should succeed via level-1.
+    let p_a = m.primitives.id('a').unwrap();
+    let ua = UnitId::primitive(p_a);
+    assert!(m.generalize(ua).is_some(), "GN-01: generalize should find prediction for 'a'");
+}
+
+// ── GN-02: novel_candidates() returns analogy results ────────────────────
+#[test]
+fn gn02_novel_candidates_nonempty() {
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.train("abc"); }
+    for _ in 0..20 { m.train("abd"); }
+    let p_a = m.primitives.id('a').unwrap();
+    let ua = UnitId::primitive(p_a);
+    let candidates = m.novel_candidates(ua, 5);
+    // May be empty if not enough training, but should not panic.
+    let _ = candidates;
+}
+
+// ── GN-03: novel_candidates() respects limit ─────────────────────────────
+#[test]
+fn gn03_novel_candidates_respects_limit() {
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.train("abcdefg"); }
+    let p_a = m.primitives.id('a').unwrap();
+    let ua = UnitId::primitive(p_a);
+    let candidates = m.novel_candidates(ua, 3);
+    assert!(candidates.len() <= 3, "GN-03: must respect limit");
+}

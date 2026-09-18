@@ -1,11 +1,15 @@
 /// Phase 5: Segmentation with path competition.
+/// Phase 6: Priority-queue + local re-scoring → O(L log L) instead of O(L²).
 ///
 /// Score formula (§C §7, v0.2):
 ///   score = confidence + strength_norm - processing_cost
 ///   confidence = if use_count > 0 { 1.0 } else { 0.0 }
+use std::collections::BinaryHeap;
+use std::cmp::Ordering;
+
 use crate::chunks::{Chunk, ChunkRegistry};
 use crate::primitives::PrimitiveRegistry;
-use crate::units::UnitId;
+use crate::units::{ChunkId, UnitId};
 
 const STRENGTH_NORM_CAP: f64 = 100.0;
 const PROCESSING_COST: f64 = 0.1;
@@ -17,45 +21,125 @@ pub fn chunk_score(chunk: &Chunk) -> f64 {
     confidence + strength_norm - PROCESSING_COST
 }
 
+/// Max-heap entry for a merge candidate.
+/// Validity is checked lazily: if `slots[left]` or `slots[right]` have been
+/// replaced or deleted, the entry is stale and skipped on pop.
+#[derive(PartialEq)]
+struct MergeEntry {
+    score: f64,
+    left: usize,   // index into slots[]
+    right: usize,  // index into slots[]
+    chunk_id: ChunkId,
+    expected_left: UnitId,
+    expected_right: UnitId,
+}
+
+impl Eq for MergeEntry {}
+
+impl PartialOrd for MergeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score.total_cmp(&other.score)
+    }
+}
+
 /// Segment a sequence of Primitives into Units using registered Chunks.
+///
+/// Phase 6: O(L log L) via priority queue + doubly-linked slot array.
+/// Each merge only re-evaluates the two new neighbors of the merged slot.
 pub fn segment(
     primitives: &[u32],
     chunks: &ChunkRegistry,
     min_score: f64,
 ) -> Vec<UnitId> {
-    let mut units: Vec<UnitId> = primitives
+    let n = primitives.len();
+    if n == 0 { return Vec::new(); }
+
+    // Slot array: slots[i] = current UnitId at that position (None = merged away).
+    let mut slots: Vec<Option<UnitId>> = primitives
         .iter()
-        .map(|&p| UnitId::primitive(p))
+        .map(|&p| Some(UnitId::primitive(p)))
         .collect();
 
-    loop {
-        let mut best_pos: Option<usize> = None;
-        let mut best_score = min_score;
+    // Doubly-linked list over active slots.
+    // next[i] = next active slot index (n = sentinel "end").
+    // prev[i] = prev active slot index (n = sentinel "start").
+    let mut next: Vec<usize> = (1..=n).collect(); // next[n-1] = n
+    let mut prev: Vec<usize> = (0..n).map(|i| if i == 0 { n } else { i - 1 }).collect();
 
-        for i in 0..units.len().saturating_sub(1) {
-            if let Some(chunk_id) = chunks.find_by_pair(units[i], units[i + 1]) {
-                let chunk = chunks.get(chunk_id).unwrap();
-                // SLEEP chunks are in the structural registry but excluded from segmentation (§10)
-                if !chunk.is_hot() { continue; }
+    // Helper: push a candidate for slots[left] + slots[right] onto the heap.
+    let mut heap: BinaryHeap<MergeEntry> = BinaryHeap::new();
+    let mut push_candidate = |heap: &mut BinaryHeap<MergeEntry>,
+                               left: usize, right: usize,
+                               lu: UnitId, ru: UnitId| {
+        if right >= n { return; }
+        if let Some(cid) = chunks.find_by_pair(lu, ru) {
+            if let Some(chunk) = chunks.get(cid) {
+                if !chunk.is_hot() { return; }
                 let score = chunk_score(chunk);
-                if score > best_score {
-                    best_score = score;
-                    best_pos = Some(i);
+                if score > min_score {
+                    heap.push(MergeEntry { score, left, right, chunk_id: cid,
+                                           expected_left: lu, expected_right: ru });
                 }
             }
         }
+    };
 
-        match best_pos {
-            None => break,
-            Some(i) => {
-                let chunk_id = chunks.find_by_pair(units[i], units[i + 1]).unwrap();
-                units[i] = UnitId::chunk(chunk_id);
-                units.remove(i + 1);
-            }
+    // Seed the heap with all adjacent pairs.
+    let mut i = 0;
+    while next[i] < n {
+        let j = next[i];
+        let lu = slots[i].unwrap();
+        let ru = slots[j].unwrap();
+        push_candidate(&mut heap, i, j, lu, ru);
+        i = j;
+    }
+
+    // Drain heap: each pop either merges or is lazily discarded.
+    while let Some(entry) = heap.pop() {
+        let MergeEntry { left, right, chunk_id, expected_left, expected_right, .. } = entry;
+        // Validate: slots must still hold the expected UnitIds.
+        if slots[left] != Some(expected_left) || slots[right] != Some(expected_right) {
+            continue; // stale entry
+        }
+        // Perform the merge: replace slot[left] with the chunk, delete slot[right].
+        let merged = UnitId::chunk(chunk_id);
+        slots[left] = Some(merged);
+        slots[right] = None;
+        // Relink: left → next[right], and next[right].prev = left.
+        let new_right = next[right];
+        next[left] = new_right;
+        if new_right < n { prev[new_right] = left; }
+
+        // Re-evaluate the two new neighbors.
+        if prev[left] < n {
+            let p = prev[left];
+            let pu = slots[p].unwrap();
+            push_candidate(&mut heap, p, left, pu, merged);
+        }
+        if new_right < n {
+            let ru = slots[new_right].unwrap();
+            push_candidate(&mut heap, left, new_right, merged, ru);
         }
     }
 
-    units
+    // Collect surviving slots in order via the linked list.
+    let mut result = Vec::new();
+    let mut cur = 0;
+    loop {
+        if let Some(u) = slots[cur] {
+            result.push(u);
+        }
+        let nx = next[cur];
+        if nx >= n { break; }
+        cur = nx;
+    }
+    result
 }
 
 /// Expand a UnitId sequence back to a sequence of PrimitiveIds.

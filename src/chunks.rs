@@ -53,12 +53,32 @@ pub struct Chunk {
 
 impl Chunk {
     /// Record one usage (exposure) of this chunk.
-    /// Updates use_count, usage_strength, and tier.
+    /// Updates use_count, usage_strength (lazy decay), and tier.
+    ///
+    /// Phase 9 Lazy Decay: s_now = s_stored · λ^Δt + reward
+    /// Accumulated time-gap decay is applied before adding the reward,
+    /// so long idle periods correctly deflate the strength.
     pub fn record_usage(&mut self, tick: u64) {
+        let elapsed = tick.saturating_sub(self.last_used);
+        let decayed = if elapsed > 0 {
+            self.usage_strength * STRENGTH_DECAY.powi(elapsed.min(u32::MAX as u64) as i32)
+        } else {
+            self.usage_strength
+        };
+        self.usage_strength = decayed + STRENGTH_REWARD;
         self.use_count += 1;
-        self.usage_strength = STRENGTH_DECAY * self.usage_strength + STRENGTH_REWARD;
         self.last_used = tick;
         self.tier = self.tier.maybe_promote(self.use_count, self.use_count);
+    }
+
+    /// Return the lazily decayed strength at `current_tick` without mutating.
+    pub fn lazy_strength(&self, current_tick: u64) -> f64 {
+        let elapsed = current_tick.saturating_sub(self.last_used);
+        if elapsed == 0 {
+            self.usage_strength
+        } else {
+            self.usage_strength * STRENGTH_DECAY.powi(elapsed.min(u32::MAX as u64) as i32)
+        }
     }
 
     /// Apply one feedback credit r to this chunk.

@@ -110,6 +110,9 @@ struct PredictionEdgeDto {
     /// v0.3: contextual avoidance accumulator (§19).
     #[serde(default)]
     avoidance: f64,
+    /// Phase 9: tick of last update for lazy decay.
+    #[serde(default)]
+    last_used_tick: u64,
 }
 
 impl From<&PredictionEdge> for PredictionEdgeDto {
@@ -122,6 +125,7 @@ impl From<&PredictionEdge> for PredictionEdgeDto {
             feedback_value: e.feedback_value,
             feedback_count: e.feedback_count,
             avoidance: e.avoidance,
+            last_used_tick: e.last_used_tick,
         }
     }
 }
@@ -311,6 +315,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         edge.feedback_value = dto.feedback_value;
         edge.feedback_count = dto.feedback_count;
         edge.avoidance = dto.avoidance;
+        edge.last_used_tick = dto.last_used_tick;
     }
 
     let mut merge_candidates: HashMap<(UnitId, UnitId), u32> = HashMap::new();

@@ -11,14 +11,17 @@ pub const PREDICTION_REWARD: f64 = 1.0;
 
 /// A single directed prediction edge: context → next_unit.
 /// v0.3 fields: usage_strength + feedback_value (positive) + avoidance (negative)
+/// Phase 9: last_used_tick enables lazy decay.
 #[derive(Debug, Clone)]
 pub struct PredictionEdge {
     pub context: UnitId,
     pub next_unit: UnitId,
     /// How many times this edge was observed during exposure.
     pub use_count: u32,
-    /// Decaying sum of usage events.
+    /// Decaying sum of usage events (stored at last_used_tick).
     pub usage_strength: f64,
+    /// Phase 9: tick of last update — for lazy decay computation.
+    pub last_used_tick: u64,
     /// Accumulated POSITIVE feedback signal only: V_new = decay * V_old + r (r > 0)
     pub feedback_value: f64,
     /// Number of feedback events applied to this edge.
@@ -34,16 +37,45 @@ impl PredictionEdge {
             next_unit,
             use_count: 0,
             usage_strength: 0.0,
+            last_used_tick: 0,
             feedback_value: 0.0,
             feedback_count: 0,
             avoidance: 0.0,
         }
     }
 
-    /// Record one observation (positive exposure).
-    pub fn record_usage(&mut self) {
+    /// Record one observation (positive exposure) at `tick`.
+    ///
+    /// Phase 9 Lazy Decay: s_now = s_stored · λ^Δt + reward
+    pub fn record_usage_at(&mut self, tick: u64) {
+        let elapsed = tick.saturating_sub(self.last_used_tick);
+        let decayed = if elapsed > 0 {
+            self.usage_strength * STRENGTH_DECAY.powi(elapsed.min(u32::MAX as u64) as i32)
+        } else {
+            self.usage_strength
+        };
+        self.usage_strength = decayed + PREDICTION_REWARD;
         self.use_count += 1;
+        self.last_used_tick = tick;
+    }
+
+    /// Return the lazily decayed strength at `current_tick` without mutating.
+    pub fn lazy_strength(&self, current_tick: u64) -> f64 {
+        let elapsed = current_tick.saturating_sub(self.last_used_tick);
+        if elapsed == 0 {
+            self.usage_strength
+        } else {
+            self.usage_strength * STRENGTH_DECAY.powi(elapsed.min(u32::MAX as u64) as i32)
+        }
+    }
+
+    /// Backward-compatible: record usage without tick (uses stored last_used_tick).
+    #[inline]
+    pub fn record_usage(&mut self) {
+        // Equivalent to record_usage_at(last_used_tick + 1) — preserves old behavior.
         self.usage_strength = STRENGTH_DECAY * self.usage_strength + PREDICTION_REWARD;
+        self.use_count += 1;
+        self.last_used_tick += 1;
     }
 
     /// Apply one feedback credit r to this edge (v0.3: splits on sign).
@@ -88,13 +120,13 @@ impl PredictionStore {
         Self::default()
     }
 
-    /// Record that `next_unit` followed `context` (positive exposure).
-    pub fn observe(&mut self, context: UnitId, next_unit: UnitId) {
+    /// Record that `next_unit` followed `context` (positive exposure) at `tick`.
+    pub fn observe_at(&mut self, context: UnitId, next_unit: UnitId, tick: u64) {
         let edge = self
             .edges
             .entry((context, next_unit))
             .or_insert_with(|| PredictionEdge::new(context, next_unit));
-        edge.record_usage();
+        edge.record_usage_at(tick);
         // Maintain source index — only add if this is a new (context, next_unit) pair.
         let successors = self.source_index.entry(context).or_default();
         if !successors.contains(&next_unit) {
@@ -102,12 +134,21 @@ impl PredictionStore {
         }
     }
 
-    /// Learn from a sequence of units: every adjacent pair (units[i], units[i+1])
-    /// is recorded as a positive observation (self-supervised).
-    pub fn learn_sequence(&mut self, units: &[UnitId]) {
+    /// Backward-compatible: observe without tick.
+    pub fn observe(&mut self, context: UnitId, next_unit: UnitId) {
+        self.observe_at(context, next_unit, 0);
+    }
+
+    /// Learn from a sequence of units at `tick` (Phase 9: lazy decay).
+    pub fn learn_sequence_at(&mut self, units: &[UnitId], tick: u64) {
         for window in units.windows(2) {
-            self.observe(window[0], window[1]);
+            self.observe_at(window[0], window[1], tick);
         }
+    }
+
+    /// Backward-compatible alias.
+    pub fn learn_sequence(&mut self, units: &[UnitId]) {
+        self.learn_sequence_at(units, 0);
     }
 
     /// Return candidates for the next unit given `context`, ranked by score.

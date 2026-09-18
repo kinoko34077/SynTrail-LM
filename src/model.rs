@@ -90,7 +90,7 @@ impl ModelState {
             }
         }
 
-        self.predictions.learn_sequence(&segmented);
+        self.predictions.learn_sequence_at(&segmented, tick);
         self.metrics.total_decisions += segmented.len() as u64;
         self.metrics.total_characters += prim_ids.len() as u64;
 
@@ -143,7 +143,7 @@ impl ModelState {
             }
         }
 
-        self.predictions.learn_sequence(&segmented);
+        self.predictions.learn_sequence_at(&segmented, tick);
         // No metrics update — this is not an external observation.
         // No association update — Adjacency tracks world co-occurrence only.
         // Phase 7: Route edges only (no Adjacency during Replay).

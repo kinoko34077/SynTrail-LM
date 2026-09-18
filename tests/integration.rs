@@ -119,10 +119,11 @@ fn ac06_strength_update_formula() {
     ) {
         let chunk = model.chunks.get(chunk_id).unwrap();
         let old_strength = chunk.usage_strength;
+        // Phase 9 lazy decay: s_new = s * λ^Δt + reward; use Δt=1 for equivalence with old formula.
+        let next_tick = chunk.last_used + 1;
         let expected = STRENGTH_DECAY * old_strength + STRENGTH_REWARD;
-        // Clone and record one usage
         let mut chunk_clone = chunk.clone();
-        chunk_clone.record_usage(9999);
+        chunk_clone.record_usage(next_tick);
         assert!(
             (chunk_clone.usage_strength - expected).abs() < 1e-10,
             "AC-06: strength formula mismatch: got {} expected {}",

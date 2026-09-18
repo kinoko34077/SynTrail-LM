@@ -59,6 +59,8 @@ impl From<TierDto> for Tier {
     }
 }
 
+/// Phase 17: strength fields in DTOs use f32 for compact serialisation.
+/// Runtime model still uses f64; the cast is lossless for values in [0, 1e6].
 #[derive(Serialize, Deserialize)]
 struct ChunkDto {
     id: u32,
@@ -68,13 +70,13 @@ struct ChunkDto {
     /// v0.2: use_count. v0.1 files: "success_count" alias loads here via backward_compat.
     #[serde(alias = "success_count")]
     use_count: u32,
-    /// v0.2: usage_strength. v0.1 alias: "strength".
+    /// Phase 17: stored as f32. v0.1 alias: "strength".
     #[serde(alias = "strength")]
-    usage_strength: f64,
+    usage_strength: f32,
     last_used: u64,
     expanded_length: u32,
     #[serde(default)]
-    feedback_value: f64,
+    feedback_value: f32,
     #[serde(default)]
     feedback_count: u32,
     /// v0.4: 0=Hot (default), 1=Sleep
@@ -90,16 +92,17 @@ impl From<&Chunk> for ChunkDto {
             right: c.right.into(),
             tier: c.tier.into(),
             use_count: c.use_count,
-            usage_strength: c.usage_strength,
+            usage_strength: c.usage_strength as f32,
             last_used: c.last_used,
             expanded_length: c.expanded_length,
-            feedback_value: c.feedback_value,
+            feedback_value: c.feedback_value as f32,
             feedback_count: c.feedback_count,
             residency: match c.residency { Residency::Hot => 0, Residency::Sleep => 1 },
         }
     }
 }
 
+/// Phase 17: strength fields stored as f32.
 #[derive(Serialize, Deserialize)]
 struct PredictionEdgeDto {
     context: UnitIdDto,
@@ -107,16 +110,16 @@ struct PredictionEdgeDto {
     /// v0.2: use_count. v0.1 alias: "success_count".
     #[serde(alias = "success_count")]
     use_count: u32,
-    /// v0.2: usage_strength. v0.1 alias: "strength".
+    /// Phase 17: stored as f32. v0.1 alias: "strength".
     #[serde(alias = "strength")]
-    usage_strength: f64,
+    usage_strength: f32,
     #[serde(default)]
-    feedback_value: f64,
+    feedback_value: f32,
     #[serde(default)]
     feedback_count: u32,
-    /// v0.3: contextual avoidance accumulator (§19).
+    /// v0.3: contextual avoidance accumulator (§19). Phase 17: f32.
     #[serde(default)]
-    avoidance: f64,
+    avoidance: f32,
     /// Phase 9: tick of last update for lazy decay.
     #[serde(default)]
     last_used_tick: u64,
@@ -128,10 +131,10 @@ impl From<&PredictionEdge> for PredictionEdgeDto {
             context: e.context.into(),
             next_unit: e.next_unit.into(),
             use_count: e.use_count,
-            usage_strength: e.usage_strength,
-            feedback_value: e.feedback_value,
+            usage_strength: e.usage_strength as f32,
+            feedback_value: e.feedback_value as f32,
             feedback_count: e.feedback_count,
-            avoidance: e.avoidance,
+            avoidance: e.avoidance as f32,
             last_used_tick: e.last_used_tick,
         }
     }
@@ -351,9 +354,9 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         let chunk = chunks.get_mut(id).unwrap();
         chunk.tier = dto.tier.into();
         chunk.use_count = dto.use_count;
-        chunk.usage_strength = dto.usage_strength;
+        chunk.usage_strength = dto.usage_strength as f64; // Phase 17: f32 → f64
         chunk.last_used = dto.last_used;
-        chunk.feedback_value = dto.feedback_value;
+        chunk.feedback_value = dto.feedback_value as f64;
         chunk.feedback_count = dto.feedback_count;
         // Phase 8: use registry demote() so hot_pair_to_id stays consistent.
         if dto.residency == 1 {
@@ -365,10 +368,10 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
     for dto in snap.prediction_edges {
         let edge = predictions.get_or_create(dto.context.into(), dto.next_unit.into());
         edge.use_count = dto.use_count;
-        edge.usage_strength = dto.usage_strength;
-        edge.feedback_value = dto.feedback_value;
+        edge.usage_strength = dto.usage_strength as f64; // Phase 17: f32 → f64
+        edge.feedback_value = dto.feedback_value as f64;
         edge.feedback_count = dto.feedback_count;
-        edge.avoidance = dto.avoidance;
+        edge.avoidance = dto.avoidance as f64;
         edge.last_used_tick = dto.last_used_tick;
     }
 

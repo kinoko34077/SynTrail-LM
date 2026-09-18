@@ -679,7 +679,8 @@ fn tl05_avoidance_persists() {
     let loaded = persistence::load(tmp.path()).unwrap();
     let avoidance_after: f64 = loaded.predictions.iter_all()
         .map(|e| e.avoidance).sum();
-    assert!((avoidance_before - avoidance_after).abs() < 1e-9,
+    // Phase 17: strength fields stored as f32 in snapshot → tolerance 1e-4.
+    assert!((avoidance_before - avoidance_after).abs() < 1e-4,
         "TL-05: avoidance should persist through snapshot");
 }
 

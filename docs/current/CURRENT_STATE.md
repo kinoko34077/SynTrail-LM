@@ -39,6 +39,7 @@ crate version: 0.5.0
 - **Physical Core / Overlay 分離** (CoreView: segment_core, predict_core, is_core_unit; ModelState::core_view) ← Phase 14
 - **Flat Arrays / Arena Index** (PredictionStore: Vec<PredictionEdge> + edge_index + source_index<usize>) ← Phase 15
 - **Binary Persistence** (save_binary/load_binary via bincode; save_auto/load_auto dispatcher) ← Phase 16
+- **Fixed Point / Packing** (DTO strength fields: f64 → f32 in ChunkDto/PredictionEdgeDto; runtime stays f64) ← Phase 17
 
 ---
 
@@ -118,7 +119,7 @@ crate version: 0.5.0
 | ~~14~~ | ~~Physical Core / Overlay 分離~~ | ✅ 完了 |
 | ~~15~~ | ~~Flat Arrays / Arena Index~~ | ✅ 完了 |
 | ~~16~~ | ~~Binary Persistence~~ | ✅ 完了 |
-| 17 | Fixed Point / Packing |
+| ~~17~~ | ~~Fixed Point / Packing~~ | ✅ 完了 |
 | 18 | Variable-bit ID / Region Encoding |
 | 19 | SIMD / Assembly (profile後のみ) |
 | 20 | Generalization / Novel Search |

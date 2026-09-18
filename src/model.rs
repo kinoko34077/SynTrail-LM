@@ -11,6 +11,7 @@ use crate::chunks::ChunkRegistry;
 use crate::identity::IdentityStore;
 use crate::lineage::LineageStore;
 use crate::prediction::PredictionStore;
+use crate::relation::{RelationKind, RelationStore};
 use crate::primitives::PrimitiveRegistry;
 use crate::segmentation::{expand, segment};
 use crate::trace::{DecisionStep, TraceId, TurnTrace, now_secs};
@@ -49,6 +50,8 @@ pub struct ModelState {
     pub identities: IdentityStore,
     /// Phase 3: Representation Lineage — derivation history for each Chunk.
     pub lineage: LineageStore,
+    /// Phase 7: Unified Relation Core — Route + Adjacency + DerivedFrom in one store.
+    pub relations: RelationStore,
     pub tick: u64,
     pub(crate) merge_candidates: HashMap<(UnitId, UnitId), u32>,
     pub metrics: Metrics,
@@ -96,6 +99,13 @@ impl ModelState {
             let (a, b) = (window[0], window[1]);
             self.associations.observe(a, b, tick);
             self.associations.observe(b, a, tick);
+            // Phase 7: mirror into unified Relation Core.
+            self.relations.observe(a, b, RelationKind::Adjacency, 1.0);
+            self.relations.observe(b, a, RelationKind::Adjacency, 1.0);
+        }
+        // Phase 7: Route edges.
+        for window in segmented.windows(2) {
+            self.relations.observe(window[0], window[1], RelationKind::Route, 1.0);
         }
 
         // Phase 2: register the Identity (canonical prim seq) and this View (chunk tree).
@@ -136,6 +146,10 @@ impl ModelState {
         self.predictions.learn_sequence(&segmented);
         // No metrics update — this is not an external observation.
         // No association update — Adjacency tracks world co-occurrence only.
+        // Phase 7: Route edges only (no Adjacency during Replay).
+        for window in segmented.windows(2) {
+            self.relations.observe(window[0], window[1], RelationKind::Route, 1.0);
+        }
 
         // Phase 2: register the View for this (possibly re-segmented) chunk tree.
         // prim_ids here came from encode_existing, so only already-registered chars.
@@ -334,6 +348,10 @@ impl ModelState {
                     let cid = self.chunks.get_or_create(left, right, exp_len);
                     // Phase 3: record derivation in Lineage.
                     self.lineage.record(cid, left, right);
+                    // Phase 7: mirror into unified Relation Core.
+                    let child_unit = UnitId::chunk(cid);
+                    self.relations.record_derivation(left, child_unit);
+                    self.relations.record_derivation(right, child_unit);
                     if let Some(chunk) = self.chunks.get_mut(cid) {
                         if chunk.use_count == 0 {
                             chunk.record_usage(self.tick);
@@ -392,6 +410,7 @@ impl ModelState {
         associations: AssociationStore,
         identities: IdentityStore,
         lineage: LineageStore,
+        relations: RelationStore,
         tick: u64,
         merge_candidates: HashMap<(UnitId, UnitId), u32>,
         metrics: Metrics,
@@ -404,6 +423,7 @@ impl ModelState {
             associations,
             identities,
             lineage,
+            relations,
             tick,
             merge_candidates,
             metrics,

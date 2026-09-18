@@ -9,6 +9,7 @@ pub mod feedback;
 pub mod identity;
 pub mod lineage;
 pub mod model;
+pub mod relation;
 pub mod persistence;
 pub mod prediction;
 pub mod primitives;

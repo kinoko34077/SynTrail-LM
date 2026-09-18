@@ -12,6 +12,7 @@ use crate::chunks::{Chunk, ChunkRegistry, Residency};
 use crate::identity::IdentityStore;
 use crate::lineage::LineageStore;
 use crate::model::{Metrics, ModelState};
+use crate::relation::RelationStore;
 use crate::prediction::{PredictionEdge, PredictionStore};
 use crate::primitives::PrimitiveRegistry;
 use crate::tier::Tier;
@@ -341,6 +342,9 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         .collect();
     let lineage = LineageStore::from_bulk(lineage_bulk);
 
+    // Phase 7: RelationStore is derived from other stores; rebuilt on use after load.
+    let relations = RelationStore::new();
+
     ModelState::from_parts(
         primitives,
         chunks,
@@ -348,6 +352,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         associations,
         identities,
         lineage,
+        relations,
         snap.tick,
         merge_candidates,
         Metrics {

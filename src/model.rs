@@ -21,8 +21,10 @@ use crate::units::UnitId;
 const MERGE_THRESHOLD: u32 = 4;
 const BASE_MERGE_PROBABILITY: f64 = 0.5;
 const SEGMENT_MIN_SCORE: f64 = 0.0;
-/// Phase 10: diversity bonus scale — each unique preceding context adds this to the freq multiplier.
-const DIVERSITY_SCALE: f64 = 0.25;
+/// Phase 10: Factorization Pressure scale — each additional left-element wanting the same
+/// right unit subtracts this from the net merge gain, making the merge harder to achieve.
+/// High right-reuse (e.g., `は` appearing in 犬は/猫は/私は) resists merge.
+const FACTORIZATION_SCALE: f64 = 1.0;
 
 /// P0 Generation: top-K route candidates per step.
 const ROUTE_TOP_K: usize = 5;
@@ -96,8 +98,9 @@ pub struct ModelState {
     pub representations: RepresentationStore,
     pub tick: u64,
     pub(crate) merge_candidates: HashMap<(UnitId, UnitId), u32>,
-    /// Phase 10: unique preceding contexts for each merge candidate — drives diversity bonus.
-    pub(crate) merge_context_diversity: HashMap<(UnitId, UnitId), std::collections::HashSet<Option<UnitId>>>,
+    /// Phase 10: distinct lefts that want to merge with each right unit.
+    /// High right-reuse means the right element is valuable on its own (factorization pressure).
+    pub merge_right_reuse: HashMap<UnitId, std::collections::HashSet<UnitId>>,
     pub metrics: Metrics,
     /// Monotonically increasing trace ID counter.
     pub(crate) next_trace_id: TraceId,
@@ -516,11 +519,12 @@ impl ModelState {
                 continue;
             }
 
-            // Phase 10: track unique preceding contexts for diversity bonus.
-            self.merge_context_diversity
-                .entry((left, right))
+            // Phase 10: track distinct lefts competing for each right (factorization pressure).
+            self.merge_right_reuse
+                .entry(right)
                 .or_default()
-                .insert(preceding);
+                .insert(left);
+            let _ = preceding; // preceding context not used in new formula
 
             let count = self
                 .merge_candidates
@@ -529,16 +533,18 @@ impl ModelState {
                 .or_insert(1);
             let count_val = *count;
 
-            // Phase 10 Factorization Pressure: pairs observed in many different contexts
-            // earn a diversity bonus that lowers the effective merge threshold.
-            let diversity = self.merge_context_diversity
-                .get(&(left, right))
+            // Phase E (§27) Factorization Pressure: net_gain = MergeSaving - FactorizationReuseValue.
+            // right_reuse > 1 means other lefts also want `right` — keeping it separate has value.
+            // High reuse RESISTS merge (correct direction, fixes §57 inversion bug).
+            let right_reuse = self.merge_right_reuse
+                .get(&right)
                 .map(|s| s.len() as f64)
                 .unwrap_or(1.0);
-            let effective_count = count_val as f64 * (1.0 + DIVERSITY_SCALE * diversity);
+            let factorization_reuse = FACTORIZATION_SCALE * (right_reuse - 1.0).max(0.0);
+            let net_gain = count_val as f64 - factorization_reuse;
 
-            if effective_count >= MERGE_THRESHOLD as f64 {
-                let freq = (effective_count / MERGE_THRESHOLD as f64).min(4.0);
+            if net_gain >= MERGE_THRESHOLD as f64 {
+                let freq = (net_gain / MERGE_THRESHOLD as f64).min(4.0);
                 let prob = BASE_MERGE_PROBABILITY * freq.sqrt();
                 if freq >= 2.0 || pseudo_rand(left, right, count_val) < prob {
                     let exp_len = self.expanded_length(left) + self.expanded_length(right);
@@ -555,7 +561,10 @@ impl ModelState {
                         }
                     }
                     self.merge_candidates.remove(&(left, right));
-                    self.merge_context_diversity.remove(&(left, right));
+                    // Clean up right-reuse entry for this left (pair is resolved).
+                    if let Some(lefts) = self.merge_right_reuse.get_mut(&right) {
+                        lefts.remove(&left);
+                    }
                 }
             }
         }
@@ -627,7 +636,7 @@ impl ModelState {
             representations,
             tick,
             merge_candidates,
-            merge_context_diversity: HashMap::new(), // not persisted; rebuilt during training
+            merge_right_reuse: HashMap::new(), // not persisted; rebuilt during training
             metrics,
             next_trace_id,
         }

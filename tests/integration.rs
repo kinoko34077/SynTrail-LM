@@ -1490,3 +1490,96 @@ fn exp06_replay_acquired_representation_has_later_tick() {
     }
     // At minimum: no panic.
 }
+
+// ── FAC-01: Low-reuse pair merges at threshold ────────────────────────────
+// A pair (a,b) that always appears together (right element `b` only wanted by `a`)
+// should merge once the count threshold is reached, without factorization pressure.
+#[test]
+fn fac01_low_reuse_pair_merges_at_threshold() {
+    let mut m = ModelState::new();
+    // Expose "ab" many times — pair (a,b) has right_reuse=1 (only `a` wants `b`).
+    for _ in 0..20 {
+        m.expose_external("ab");
+    }
+    // With no factorization pressure, `a`→`b` should merge within 20 exposures.
+    let prims_a = m.primitives.encode_existing("a");
+    let prims_b = m.primitives.encode_existing("b");
+    if !prims_a.is_empty() && !prims_b.is_empty() {
+        let ua = syntrail_lm::units::UnitId::primitive(prims_a[0]);
+        let ub = syntrail_lm::units::UnitId::primitive(prims_b[0]);
+        let merged = m.chunks.find_by_pair(ua, ub).is_some();
+        assert!(merged, "FAC-01: exclusive pair (a,b) should merge after enough exposures");
+    }
+}
+
+// ── FAC-02: High right-reuse resists merge ────────────────────────────────
+// `は` appears as the RIGHT element in pairs with 犬/猫/私.
+// With factorization pressure, each of these pairs needs a higher raw count to merge.
+#[test]
+fn fac02_high_right_reuse_resists_merge() {
+    let mut m = ModelState::new();
+    // Expose three distinct "L は" patterns just enough times to cross threshold
+    // without factorization pressure (4 times each = MERGE_THRESHOLD).
+    // With factorization_scale=1.0 and right_reuse=3: net = 4 - 2 = 2 < 4 → should NOT merge.
+    for _ in 0..4 {
+        m.expose_external("犬は");
+        m.expose_external("猫は");
+        m.expose_external("私は");
+    }
+    // Verify: none of the three pairs should have merged yet.
+    let ha_prims = m.primitives.encode_existing("は");
+    if ha_prims.is_empty() { return; } // primitives not registered → skip
+    let ha = syntrail_lm::units::UnitId::primitive(ha_prims[0]);
+    // Check that `は` is not yet merged with any of 犬/猫/私.
+    let inu_prims = m.primitives.encode_existing("犬");
+    if !inu_prims.is_empty() {
+        let inu = syntrail_lm::units::UnitId::primitive(inu_prims[0]);
+        assert!(
+            m.chunks.find_by_pair(inu, ha).is_none(),
+            "FAC-02: (犬,は) should NOT merge when は has high reuse across 3 contexts at count=4"
+        );
+    }
+}
+
+// ── FAC-03: Factorization pressure scales with right-reuse count ──────────
+// Verify that the right-reuse tracking increases when multiple lefts compete for same right.
+#[test]
+fn fac03_right_reuse_accumulates_across_pairs() {
+    let mut m = ModelState::new();
+    // Expose pairs that all share the same right element `Z`.
+    // Use distinct left elements: A, B, C each paired with Z once.
+    m.expose_external("AZ");
+    m.expose_external("BZ");
+    m.expose_external("CZ");
+    // After these exposures, `Z` should appear as a merge candidate right for multiple lefts.
+    let z_prims = m.primitives.encode_existing("Z");
+    if z_prims.is_empty() { return; }
+    let z_unit = syntrail_lm::units::UnitId::primitive(z_prims[0]);
+    // Check right-reuse count for `Z` is ≥ 2 (multiple lefts want it).
+    let reuse_count = m.merge_right_reuse.get(&z_unit).map(|s| s.len()).unwrap_or(0);
+    assert!(
+        reuse_count >= 2,
+        "FAC-03: Z should have right-reuse ≥ 2 when multiple lefts compete; got {reuse_count}"
+    );
+}
+
+// ── FAC-04: 犬は/猫は/私は — は reuse detected ────────────────────────────
+// Standard factorization test from spec §38: after learning three "L は" patterns,
+// は's reusability across contexts is captured in merge_right_reuse.
+#[test]
+fn fac04_wa_reuse_detected_across_subject_noun_pairs() {
+    let mut m = ModelState::new();
+    for _ in 0..3 {
+        m.expose_external("犬は走る");
+        m.expose_external("猫は眠る");
+        m.expose_external("私は食べる");
+    }
+    let ha_prims = m.primitives.encode_existing("は");
+    if ha_prims.is_empty() { return; }
+    let ha = syntrail_lm::units::UnitId::primitive(ha_prims[0]);
+    let reuse = m.merge_right_reuse.get(&ha).map(|s| s.len()).unwrap_or(0);
+    assert!(
+        reuse >= 2,
+        "FAC-04: は should have right-reuse ≥ 2 in 犬は/猫は/私は contexts; got {reuse}"
+    );
+}

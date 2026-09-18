@@ -1,8 +1,14 @@
-/// Phase 6 / v0.2-v0.3: Prediction Edges — self-supervised next-unit prediction.
+/// Prediction Edges — self-supervised next-unit prediction.
 ///
-/// v0.3: Contextual Avoidance — negative feedback accumulates in `avoidance` (§19),
+/// v0.3: Contextual Avoidance — negative feedback accumulates in `avoidance`,
 /// keeping positive and negative signals separate.
-/// Route Score = Likelihood + Positive Value − Avoidance (§20).
+/// Route Score = Likelihood + Positive Value − Avoidance.
+///
+/// Phase 5: secondary source_index for O(K) fan-out.
+/// Phase 9: last_used_tick + lazy decay.
+/// Phase 15: flat arena storage — edges: Vec<PredictionEdge> + edge_index for
+///           O(1) point lookup, source_index stores Vec<usize> (arena indices)
+///           instead of Vec<UnitId> for direct array access in predict().
 use std::collections::HashMap;
 use crate::units::UnitId;
 use crate::chunks::STRENGTH_DECAY;
@@ -10,23 +16,16 @@ use crate::chunks::STRENGTH_DECAY;
 pub const PREDICTION_REWARD: f64 = 1.0;
 
 /// A single directed prediction edge: context → next_unit.
-/// v0.3 fields: usage_strength + feedback_value (positive) + avoidance (negative)
 /// Phase 9: last_used_tick enables lazy decay.
 #[derive(Debug, Clone)]
 pub struct PredictionEdge {
     pub context: UnitId,
     pub next_unit: UnitId,
-    /// How many times this edge was observed during exposure.
     pub use_count: u32,
-    /// Decaying sum of usage events (stored at last_used_tick).
     pub usage_strength: f64,
-    /// Phase 9: tick of last update — for lazy decay computation.
     pub last_used_tick: u64,
-    /// Accumulated POSITIVE feedback signal only: V_new = decay * V_old + r (r > 0)
     pub feedback_value: f64,
-    /// Number of feedback events applied to this edge.
     pub feedback_count: u32,
-    /// Accumulated NEGATIVE feedback magnitude (§19): A_new = decay * A_old + |r| (r < 0)
     pub avoidance: f64,
 }
 
@@ -44,8 +43,6 @@ impl PredictionEdge {
         }
     }
 
-    /// Record one observation (positive exposure) at `tick`.
-    ///
     /// Phase 9 Lazy Decay: s_now = s_stored · λ^Δt + reward
     pub fn record_usage_at(&mut self, tick: u64) {
         let elapsed = tick.saturating_sub(self.last_used_tick);
@@ -59,7 +56,6 @@ impl PredictionEdge {
         self.last_used_tick = tick;
     }
 
-    /// Return the lazily decayed strength at `current_tick` without mutating.
     pub fn lazy_strength(&self, current_tick: u64) -> f64 {
         let elapsed = current_tick.saturating_sub(self.last_used_tick);
         if elapsed == 0 {
@@ -69,17 +65,13 @@ impl PredictionEdge {
         }
     }
 
-    /// Backward-compatible: record usage without tick (uses stored last_used_tick).
     #[inline]
     pub fn record_usage(&mut self) {
-        // Equivalent to record_usage_at(last_used_tick + 1) — preserves old behavior.
         self.usage_strength = STRENGTH_DECAY * self.usage_strength + PREDICTION_REWARD;
         self.use_count += 1;
         self.last_used_tick += 1;
     }
 
-    /// Apply one feedback credit r to this edge (v0.3: splits on sign).
-    /// Positive r → feedback_value; negative r → avoidance (|r|).
     pub fn apply_feedback(&mut self, r: f64, decay: f64) {
         if r >= 0.0 {
             self.feedback_value = decay * self.feedback_value + r;
@@ -89,12 +81,10 @@ impl PredictionEdge {
         self.feedback_count += 1;
     }
 
-    /// Binary confidence: 1.0 if this edge has been observed at all.
     pub fn confidence(&self) -> f64 {
         if self.use_count > 0 { 1.0 } else { 0.0 }
     }
 
-    /// Route score (v0.3): Likelihood + Positive Value − Avoidance (§20).
     pub fn score(&self) -> f64 {
         let strength_norm = (self.usage_strength / 100.0).min(1.0);
         let pos_value = (self.feedback_value / 10.0).min(1.0);
@@ -103,16 +93,20 @@ impl PredictionEdge {
     }
 }
 
-/// Stores all prediction edges indexed by (context, next_unit).
+/// Stores all prediction edges.
 ///
-/// Phase 5: secondary source_index maps context → Vec<next_unit> so that
-/// `predict()` is O(K) fan-out instead of O(N_total) full-scan.
+/// Phase 15 (Flat Arena): edges are stored in a contiguous Vec<PredictionEdge>.
+/// `edge_index` maps (context, next_unit) → Vec index for O(1) point lookup.
+/// `source_index` maps context → Vec<usize> (arena indices) so that `predict()`
+/// walks the flat edge array directly without secondary HashMap lookups.
 #[derive(Debug, Default)]
 pub struct PredictionStore {
-    /// (context, next_unit) → edge  (O(1) point lookup)
-    edges: HashMap<(UnitId, UnitId), PredictionEdge>,
-    /// context → list of known successors  (Phase 5 source index)
-    source_index: HashMap<UnitId, Vec<UnitId>>,
+    /// Flat arena — all edges contiguous for cache locality.
+    edges: Vec<PredictionEdge>,
+    /// (context, next_unit) → index into `edges`.
+    edge_index: HashMap<(UnitId, UnitId), usize>,
+    /// context → list of arena indices of known successor edges (Phase 5/15).
+    source_index: HashMap<UnitId, Vec<usize>>,
 }
 
 impl PredictionStore {
@@ -120,64 +114,67 @@ impl PredictionStore {
         Self::default()
     }
 
-    /// Record that `next_unit` followed `context` (positive exposure) at `tick`.
-    pub fn observe_at(&mut self, context: UnitId, next_unit: UnitId, tick: u64) {
-        let edge = self
-            .edges
-            .entry((context, next_unit))
-            .or_insert_with(|| PredictionEdge::new(context, next_unit));
-        edge.record_usage_at(tick);
-        // Maintain source index — only add if this is a new (context, next_unit) pair.
-        let successors = self.source_index.entry(context).or_default();
-        if !successors.contains(&next_unit) {
-            successors.push(next_unit);
-        }
+    // ── Internal helpers ─────────────────────────────────────────────────
+
+    /// Insert a new edge and update both indices.  Caller must verify the
+    /// edge does not already exist.
+    fn insert_new(&mut self, context: UnitId, next_unit: UnitId) -> usize {
+        let idx = self.edges.len();
+        self.edges.push(PredictionEdge::new(context, next_unit));
+        self.edge_index.insert((context, next_unit), idx);
+        self.source_index.entry(context).or_default().push(idx);
+        idx
     }
 
-    /// Backward-compatible: observe without tick.
+    // ── Public API ────────────────────────────────────────────────────────
+
+    pub fn observe_at(&mut self, context: UnitId, next_unit: UnitId, tick: u64) {
+        let idx = if let Some(&i) = self.edge_index.get(&(context, next_unit)) {
+            i
+        } else {
+            self.insert_new(context, next_unit)
+        };
+        self.edges[idx].record_usage_at(tick);
+    }
+
     pub fn observe(&mut self, context: UnitId, next_unit: UnitId) {
         self.observe_at(context, next_unit, 0);
     }
 
-    /// Learn from a sequence of units at `tick` (Phase 9: lazy decay).
     pub fn learn_sequence_at(&mut self, units: &[UnitId], tick: u64) {
         for window in units.windows(2) {
             self.observe_at(window[0], window[1], tick);
         }
     }
 
-    /// Backward-compatible alias.
     pub fn learn_sequence(&mut self, units: &[UnitId]) {
         self.learn_sequence_at(units, 0);
     }
 
     /// Return candidates for the next unit given `context`, ranked by score.
     ///
-    /// Phase 5: O(K) via source_index instead of O(N_total) full scan.
+    /// Phase 5/15: O(K) via source_index; each entry is a direct arena index.
     pub fn predict(&self, context: UnitId) -> Vec<(&PredictionEdge, f64)> {
-        let Some(successors) = self.source_index.get(&context) else {
+        let Some(indices) = self.source_index.get(&context) else {
             return Vec::new();
         };
-        let mut candidates: Vec<(&PredictionEdge, f64)> = successors
+        let mut candidates: Vec<(&PredictionEdge, f64)> = indices
             .iter()
-            .filter_map(|&nxt| self.edges.get(&(context, nxt)))
+            .map(|&i| &self.edges[i])
             .map(|edge| (edge, edge.score()))
             .collect();
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         candidates
     }
 
-    /// Top-1 prediction for `context`.  Returns None if no edges exist.
     pub fn top1(&self, context: UnitId) -> Option<UnitId> {
         self.predict(context).into_iter().next().map(|(e, _)| e.next_unit)
     }
 
-    /// Top-1 prediction with its score.
     pub fn top1_with_score(&self, context: UnitId) -> Option<(UnitId, f64)> {
         self.predict(context).into_iter().next().map(|(e, s)| (e.next_unit, s))
     }
 
-    /// Apply feedback credit r to the edge (context, next_unit) if it exists.
     pub fn apply_feedback_to_edge(
         &mut self,
         context: UnitId,
@@ -185,15 +182,15 @@ impl PredictionStore {
         r: f64,
         decay: f64,
     ) {
-        if let Some(edge) = self.edges.get_mut(&(context, next_unit)) {
-            edge.apply_feedback(r, decay);
+        if let Some(&idx) = self.edge_index.get(&(context, next_unit)) {
+            self.edges[idx].apply_feedback(r, decay);
         }
     }
 
-    /// Return the lazily-decayed strength of a specific edge at `tick`, or
-    /// None if the edge does not exist.  Read-only; does not mutate.
+    /// Return the lazily-decayed strength of a specific edge at `tick`.
     pub fn edge_lazy_strength(&self, context: UnitId, next_unit: UnitId, tick: u64) -> Option<f64> {
-        self.edges.get(&(context, next_unit)).map(|e| e.lazy_strength(tick))
+        self.edge_index.get(&(context, next_unit))
+            .map(|&i| self.edges[i].lazy_strength(tick))
     }
 
     pub fn edge_count(&self) -> usize {
@@ -202,22 +199,22 @@ impl PredictionStore {
 
     /// Iterate all edges for serialisation.
     pub fn iter_all(&self) -> impl Iterator<Item = &PredictionEdge> {
-        self.edges.values()
+        self.edges.iter()
     }
 
     /// Get or create an edge for mutation during deserialisation.
     pub fn get_or_create(&mut self, context: UnitId, next_unit: UnitId) -> &mut PredictionEdge {
-        let is_new = !self.edges.contains_key(&(context, next_unit));
-        let edge = self.edges
-            .entry((context, next_unit))
-            .or_insert_with(|| PredictionEdge::new(context, next_unit));
-        if is_new {
-            let successors = self.source_index.entry(context).or_default();
-            if !successors.contains(&next_unit) {
-                successors.push(next_unit);
-            }
-        }
-        edge
+        let idx = if let Some(&i) = self.edge_index.get(&(context, next_unit)) {
+            i
+        } else {
+            self.insert_new(context, next_unit)
+        };
+        &mut self.edges[idx]
+    }
+
+    /// Read-only point lookup — used by unit tests.
+    pub(crate) fn edge_for(&self, context: UnitId, next_unit: UnitId) -> Option<&PredictionEdge> {
+        self.edge_index.get(&(context, next_unit)).map(|&i| &self.edges[i])
     }
 }
 
@@ -280,9 +277,9 @@ mod tests {
     fn test_strength_increases_with_repetition() {
         let mut store = PredictionStore::new();
         store.observe(p(1), p(2));
-        let s1 = store.edges[&(p(1), p(2))].usage_strength;
+        let s1 = store.edge_for(p(1), p(2)).unwrap().usage_strength;
         store.observe(p(1), p(2));
-        let s2 = store.edges[&(p(1), p(2))].usage_strength;
+        let s2 = store.edge_for(p(1), p(2)).unwrap().usage_strength;
         assert!(s2 > s1);
     }
 
@@ -290,7 +287,7 @@ mod tests {
     fn test_confidence_binary() {
         let mut store = PredictionStore::new();
         store.observe(p(1), p(2));
-        let edge = &store.edges[&(p(1), p(2))];
+        let edge = store.edge_for(p(1), p(2)).unwrap();
         assert_eq!(edge.confidence(), 1.0);
         assert_eq!(edge.use_count, 1);
     }
@@ -309,7 +306,7 @@ mod tests {
         let mut store = PredictionStore::new();
         store.observe(p(1), p(2));
         store.apply_feedback_to_edge(p(1), p(2), 1.0, 0.99);
-        let edge = &store.edges[&(p(1), p(2))];
+        let edge = store.edge_for(p(1), p(2)).unwrap();
         assert!((edge.feedback_value - 1.0).abs() < 1e-9);
         assert_eq!(edge.feedback_count, 1);
     }
@@ -319,7 +316,6 @@ mod tests {
         let mut store = PredictionStore::new();
         store.observe(p(1), p(2));
         store.observe(p(1), p(3));
-        // Penalize p(2)
         for _ in 0..10 { store.apply_feedback_to_edge(p(1), p(2), -1.0, 0.99); }
         let ranked = store.predict(p(1));
         assert_eq!(ranked[0].0.next_unit, p(3), "p(3) should rank higher after p(2) is penalized");

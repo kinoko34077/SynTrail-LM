@@ -37,6 +37,7 @@ crate version: 0.5.0
 - **Transform / Inverse / Composition** (TransformStore, register→merge, inverse, compose) ← Phase 12
 - **Micro-ISA** (Instruction enum, Vm dispatcher, register file — all 14 opcodes) ← Phase 13
 - **Physical Core / Overlay 分離** (CoreView: segment_core, predict_core, is_core_unit; ModelState::core_view) ← Phase 14
+- **Flat Arrays / Arena Index** (PredictionStore: Vec<PredictionEdge> + edge_index + source_index<usize>) ← Phase 15
 
 ---
 
@@ -114,7 +115,7 @@ crate version: 0.5.0
 | Phase | 内容 |
 |-------|------|
 | ~~14~~ | ~~Physical Core / Overlay 分離~~ | ✅ 完了 |
-| 15 | Flat Arrays / Arena Index |
+| ~~15~~ | ~~Flat Arrays / Arena Index~~ | ✅ 完了 |
 | 16 | Binary Persistence |
 | 17 | Fixed Point / Packing |
 | 18 | Variable-bit ID / Region Encoding |

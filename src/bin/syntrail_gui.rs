@@ -145,13 +145,13 @@ impl SynTrailApp {
     }
 
     fn send_message(&mut self) {
-        let input = self.input.trim().to_string();
-        if input.is_empty() { return; }
+        let raw = self.input.clone();  // pass raw string to model (§100)
+        if raw.trim().is_empty() { return; }
         self.input.clear();
         self.feedback_state = FeedbackState::None; // auto-skip prior feedback
-        self.chat_history.push(ChatEntry { is_user: true, text: input.clone() });
+        self.chat_history.push(ChatEntry { is_user: true, text: raw.clone() });
 
-        match self.handle.generate_turn(&input) {
+        match self.handle.generate_turn(&raw) {
             Ok((turn_id, output)) => {
                 let a = self.handle.get_analytics();
                 self.status = format!("Turn {}  |  {} decisions", turn_id, a.last_decision_count);
@@ -342,7 +342,7 @@ impl eframe::App for SynTrailApp {
                             ui.label("dpc");             ui.label(format!("{:.6}", a.dpc));          ui.end_row();
                             ui.end_row(); ui.end_row();
                             ui.label("Last Decisions");  ui.label(a.last_decision_count.to_string()); ui.end_row();
-                            ui.label("Last Out Len");    ui.label(a.last_output_len.to_string());    ui.end_row();
+                            ui.label("Last Out Chars");  ui.label(a.last_output_chars.to_string()); ui.end_row();
                             ui.end_row(); ui.end_row();
                             ui.label("Positive FB");     ui.label(a.pos_feedback_count.to_string()); ui.end_row();
                             ui.label("Negative FB");     ui.label(a.neg_feedback_count.to_string()); ui.end_row();

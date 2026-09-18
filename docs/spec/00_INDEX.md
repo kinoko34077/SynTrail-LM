@@ -12,6 +12,7 @@
 | [04_EXECUTION_MODEL.md](04_EXECUTION_MODEL.md) | Memory Architecture / HOT/SLEEP / 疎計算原則 / Relation Budget / Lazy Decay / Consolidation |
 | [05_PHYSICAL_MODEL.md](05_PHYSICAL_MODEL.md) | Stable ID / Arena / Variable-width ID / Flat Array / Packed Binary / Fixed Point / Micro-ISA |
 | [06_EVALUATION.md](06_EVALUATION.md) | 評価指標一覧 |
+| [09_DESKTOP_UI.md](09_DESKTOP_UI.md) | Desktop Shell / File Operations / Native Menu / Trainer State Machine |
 
 ## 関連ドキュメント
 

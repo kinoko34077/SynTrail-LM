@@ -126,11 +126,8 @@ fn worker_main(
                 match cmd_rx.try_recv() {
                     Ok(TrainerCommand::Pause) => {
                         tr_state.status = TrainerStatus::Paused;
-                        let fp = model.state_fingerprint();
-                        tr_state.model_fingerprint = fp;
-                        let _ = save_model_file(&model, &model_path);
-                        let _ = tr_state.save(&PathBuf::from(&tr_state.dataset_path));
-                        let _ = ev_tx.send(TrainerEvent::Saved);
+                        tr_state.model_fingerprint = model.state_fingerprint();
+                        do_save(&model, &model_path, &tr_state, &ev_tx);
                         let _ = ev_tx.send(TrainerEvent::Paused);
                         // Wait for Resume or Stop.
                         loop {
@@ -140,7 +137,7 @@ fn worker_main(
                                     break;
                                 }
                                 Ok(TrainerCommand::Stop) | Err(_) => {
-                                    save_and_exit(&mut model, &model_path, &tr_state);
+                                    save_and_exit(&mut model, &model_path, &mut tr_state);
                                     return;
                                 }
                                 _ => {}
@@ -148,12 +145,12 @@ fn worker_main(
                         }
                     }
                     Ok(TrainerCommand::Stop) => {
-                        save_and_exit(&mut model, &model_path, &tr_state);
+                        save_and_exit(&mut model, &model_path, &mut tr_state);
                         return;
                     }
                     Ok(TrainerCommand::Resume) => {}  // already running
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => { save_and_exit(&mut model, &model_path, &tr_state); return; }
+                    Err(TryRecvError::Disconnected) => { save_and_exit(&mut model, &model_path, &mut tr_state); return; }
                 }
             }
         }};
@@ -183,9 +180,8 @@ fn worker_main(
             Some(b) => b,
             None => {
                 tr_state.status = TrainerStatus::Completed;
-                let _ = save_model_file(&model, &model_path);
-                let _ = tr_state.save(&PathBuf::from(&tr_state.dataset_path));
-                let _ = ev_tx.send(TrainerEvent::Saved);
+                tr_state.model_fingerprint = model.state_fingerprint();
+                do_save(&model, &model_path, &tr_state, &ev_tx);
                 let _ = ev_tx.send(TrainerEvent::Completed(block_idx));
                 return;
             }
@@ -251,9 +247,7 @@ fn worker_main(
 
                 // Save at each checkpoint.
                 tr_state.model_fingerprint = model.state_fingerprint();
-                let _ = save_model_file(&model, &model_path);
-                let _ = tr_state.save(&PathBuf::from(&tr_state.dataset_path));
-                let _ = ev_tx.send(TrainerEvent::Saved);
+                do_save(&model, &model_path, &tr_state, &ev_tx);
                 let _ = ev_tx.send(TrainerEvent::Analytics(Box::new(model_analytics(&model))));
 
                 if outcome == CheckpointOutcome::Finished {
@@ -304,15 +298,34 @@ fn worker_main(
 
         // Save after each block.
         tr_state.model_fingerprint = model.state_fingerprint();
-        let _ = save_model_file(&model, &model_path);
-        let _ = tr_state.save(&PathBuf::from(&tr_state.dataset_path));
-        let _ = ev_tx.send(TrainerEvent::Saved);
+        do_save(&model, &model_path, &tr_state, &ev_tx);
 
         block_idx += 1;
     }
 }
 
-fn save_and_exit(model: &mut ModelState, model_path: &PathBuf, tr_state: &TrainerState) {
+/// Save model + trainer state atomically; send Saved on success, Error on failure (§110, §111).
+fn do_save(
+    model: &ModelState,
+    model_path: &PathBuf,
+    tr_state: &TrainerState,
+    ev_tx: &Sender<TrainerEvent>,
+) -> bool {
+    if let Err(e) = save_model_file(model, model_path) {
+        let _ = ev_tx.send(TrainerEvent::Error(format!("Model save failed: {e}")));
+        return false;
+    }
+    if let Err(e) = tr_state.save(&PathBuf::from(&tr_state.dataset_path)) {
+        let _ = ev_tx.send(TrainerEvent::Error(format!("State save failed: {e}")));
+        return false;
+    }
+    let _ = ev_tx.send(TrainerEvent::Saved);
+    true
+}
+
+/// Save on worker exit; updates fingerprint before saving (§112).
+fn save_and_exit(model: &mut ModelState, model_path: &PathBuf, tr_state: &mut TrainerState) {
+    tr_state.model_fingerprint = model.state_fingerprint();
     let _ = save_model_file(model, model_path);
     let _ = tr_state.save(&PathBuf::from(&tr_state.dataset_path));
 }
@@ -551,8 +564,14 @@ impl eframe::App for TrainerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
 
-        // D&D: accept .txt files
+        // D&D: block changes while Running or Paused (§108)
+        let training_active = matches!(&self.state, AppState::Running | AppState::Paused);
         ctx.input(|i| {
+            if i.raw.dropped_files.is_empty() { return; }
+            if training_active {
+                // set status after closure; can't mutate self.status_msg here
+                return;
+            }
             for file in &i.raw.dropped_files {
                 if let Some(path) = &file.path {
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -566,6 +585,13 @@ impl eframe::App for TrainerApp {
                 }
             }
         });
+        if training_active {
+            ctx.input(|i| {
+                if !i.raw.dropped_files.is_empty() {
+                    self.status_msg = "Stop training before replacing model/dataset.".to_owned();
+                }
+            });
+        }
 
         // ── Status bar ────────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -630,11 +656,18 @@ impl eframe::App for TrainerApp {
                 if ui.add_enabled(can_start, egui::Button::new("Start")).clicked() {
                     self.start_training(false);
                 }
-                if ui.add_enabled(can_start && has_save, egui::Button::new("Resume")).clicked() {
+                // Resume Saved: create new worker from saved trainer state (§107)
+                if ui.add_enabled(can_start && has_save, egui::Button::new("Resume Saved")).clicked() {
                     self.start_training(true);
                 }
                 if ui.add_enabled(is_running, egui::Button::new("Pause")).clicked() {
                     self.send_cmd(TrainerCommand::Pause);
+                }
+                // Resume: send command to existing paused worker (§107)
+                if ui.add_enabled(is_paused, egui::Button::new("Resume")).clicked() {
+                    self.send_cmd(TrainerCommand::Resume);
+                    self.state = AppState::Running;
+                    self.status_msg = "Resumed.".to_owned();
                 }
                 if ui.add_enabled(is_running || is_paused, egui::Button::new("Stop")).clicked() {
                     self.send_cmd(TrainerCommand::Stop);

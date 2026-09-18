@@ -1,12 +1,13 @@
 # 現在の実装状態
 
 最終確認: 2026-09-18  
-main HEAD: Phase 2完了後更新予定  
-crate version: 0.5.0
+main HEAD: 3536088 (Phase F完了)  
+crate version: 0.5.0  
+integration tests: 100
 
 ---
 
-## 実装済
+## コアモデル — 実装済
 
 - Unicode Primitive (stable ID)
 - u32 tagged UnitId
@@ -17,106 +18,107 @@ crate version: 0.5.0
 - PredictionStore (Route)
 - AssociationStore (Top-K, Adjacency相当)
 - Feedback / Avoidance (Context-dependent)
-- Frozen generation (with Trace)
+- Frozen generation (with Trace, EOS, cycle detection) ← Phase D (P0)
 - Frozen Eval (evaluate_frozen, evaluate_sample_frozen)
 - History DB (SQLite)
 - Snapshot (JSON / SQLite)
-- Chat GUI (eframe/egui)
-- Adaptive Trainer (UTF-8/Shift_JIS, S/M/L/XL block, 4→8→16→32 repeat, Pause/Resume)
-- **Experience / Replay 分離** (expose_external vs replay, encode_existing) ← Phase 1
-- **Identity / View 最小実装** (IdentityStore, Exact Identity, persistence) ← Phase 2
-- **Representation Lineage** (LineageStore, derived_from edges) ← Phase 3
-- **Fallback via Lineage** (predict_with_fallback, generate_with_trace) ← Phase 4
+- **Representation Lineage** (RepresentationStore, preference_score, predecessor_of) ← Phase B
+- **Experience / Replay 分離** (expose_external vs replay; external_route_evidence分離) ← Phase C
+- **Factorization Pressure** (merge_right_reuse; net_gain = count - FACTORIZATION_SCALE*(reuse-1)) ← Phase E (§27修正)
+- **TransformKind** (EquivalentView/Mapping/Inverse/Composed; conditional merge_identities) ← Phase F (§17修正)
 - **Route Source Index** (source_index in PredictionStore, O(N)→O(K)) ← Phase 5
 - **Segmentation O(L log L)** (priority queue + doubly-linked slots) ← Phase 6
 - **Unified Relation Core** (RelationStore: Route/Adjacency/DerivedFrom) ← Phase 7
 - **HOT/SLEEP 物理分離** (hot_pair_to_id Recognition index) ← Phase 8
-- **Lazy Decay** (s = s * λ^Δt + reward for Chunk and PredictionEdge) ← Phase 9
-- **Factorization Pressure** (Context Diversity bonus in consider_merges) ← Phase 10
-- **Cross-View Identity** (Union-Find merge_identities, canonical resolution, persistence) ← Phase 11
-- **Transform / Inverse / Composition** (TransformStore, register→merge, inverse, compose) ← Phase 12
-- **Micro-ISA** (Instruction enum, Vm dispatcher, register file — all 14 opcodes) ← Phase 13
-- **Physical Core / Overlay 分離** (CoreView: segment_core, predict_core, is_core_unit; ModelState::core_view) ← Phase 14
-- **Flat Arrays / Arena Index** (PredictionStore: Vec<PredictionEdge> + edge_index + source_index<usize>) ← Phase 15
-- **Binary Persistence** (save_binary/load_binary via bincode; save_auto/load_auto dispatcher) ← Phase 16
-- **Fixed Point / Packing** (DTO strength fields: f64 → f32 in ChunkDto/PredictionEdgeDto; runtime stays f64) ← Phase 17
-- **Variable-bit ID / Region Encoding** (LEB128 + zigzag delta codec for UnitId sequences) ← Phase 18
-- **SIMD / Assembly** — profile後のみ実装のためスキップ ← Phase 19
-- **Generalization / Novel Search** (generalize() + novel_candidates() via association bridge) ← Phase 20
+- **Lazy Decay** (s = s * λ^Δt + reward) ← Phase 9
+- **Cross-View Identity** (Union-Find merge_identities, canonical, persistence) ← Phase 11
+- **Transform / Inverse / Composition** (TransformStore) ← Phase 12
+- **Micro-ISA** (14 opcodes, Vm, register file) ← Phase 13
+- **Physical Core / Overlay 分離** (CoreView) ← Phase 14
+- **Flat Arrays / Arena Index** (Vec<PredictionEdge> + edge_index + source_index<usize>) ← Phase 15
+- **Binary Persistence** (save_binary/load_binary; save_auto/load_auto) ← Phase 16
+- **Fixed Point / Packing** (f32 in DTOs) ← Phase 17
+- **Variable-bit ID / Region Encoding** (LEB128 + zigzag delta codec) ← Phase 18
+- **Generalization / Novel Search** (generalize() + novel_candidates()) ← Phase 20
+- **Chat GUI** (eframe/egui)
+- **Adaptive Trainer** (S/M/L/XL block, 4→8→16→32 repeat, Pause/Resume)
 
 ---
 
-## 既知の問題（要対応）
+## コアモデル — 未実装 / 残課題
 
-- Generation cycle / no-progress 検出なし (P0)
-- EOS学習・検出なし (P0)
-- seed/output がTurnTraceで未分離 (P0)
-- Cargo.toml 0.5.0 に統合済み
-- TransformStore::register が unconditional merge_identities (P2修正対象)
-- Replay が external_route_evidence を強化している (P1修正対象)
-- Factorization Pressure: diversity bonus が反転している (P1修正対象)
-- save_auto/load_auto が通常save経路に未統合 (P4)
-- codec.rs が binary snapshot に未接続 (P4)
+| 優先 | 内容 |
+|------|------|
+| P2 | Phase G: RelationStore canonical化 (方針A/B選択, §18) |
+| P3 | Phase H: MemoryBudgetConfig, Global Active Budget (§19-§20) |
+| P4 | Phase I: Core/Overlay physical split final |
+| P4 | Phase J: Generalization real unseen tests (GEN-01..04) |
+| P4 | Phase A残: docs/spec §64 8ファイル構成 + §65 template |
+| P5 | save_auto/load_auto が通常save経路に未統合 |
+| P5 | codec.rs が binary snapshot に未接続 |
 
 ---
 
-## 現行の主要パフォーマンス課題
+## Desktop UI / GUI — 既知の問題（修正必須）
 
-### Route (PredictionStore)
+### Trainer (Critical)
 
-`predict()` は対象Contextごとに全Prediction Edgeを走査。N Edgeで `O(N)`。
-→ **Route source-index化が高優先 (Phase 5)**
+| 優先 | 箇所 | 問題 |
+|------|------|------|
+| P0 | `worker_main` / `save_and_exit` | `let _ = save_model_file(...)` / `let _ = tr_state.save(...)` でsave errorを握り潰し、その後 `Saved` イベントを送信 → **データ破損リスク** (§110) |
+| P0 | `save_and_exit()` | `tr_state.model_fingerprint` を更新せずにsave → Stopして再Resume時にfingerprint不一致 (§112) |
+| P0 | `update()` D&D処理 | Running中でも `try_load_model()`/`try_load_dataset()` が呼ばれ、最終的に `check_ready()` → state が Ready に上書きされる (§108) |
+| P1 | Resume ボタン | `is_paused` 状態でResume押下が `start_training(true)` (=Resume Saved Session) を呼ぶ。Paused状態の既存workerへ `TrainerCommand::Resume` を送る経路がない (§107) |
+| P1 | Path TextEdit | model_path / dataset_path がTextEdit可能だが文字変更だけでは loaded_model と一致しない (§116) |
 
-### Segmentation
+### Chat GUI (Important)
 
-繰返し全候補走査 → 1 merge → 再度全候補走査。長文でO(L²)寄り。
-→ **Phase 6で priority queue + 局所再計算へ**
+| 優先 | 箇所 | 問題 |
+|------|------|------|
+| P1 | `send_message()` | `self.input.trim().to_string()` → モデルに渡す文字列の先頭末尾空白を削除。空白もPrimitive学習対象なため分離が必要 (§100) |
+| P1 | `generate_turn()` / Analytics | `last_output_len = output.len()` はUTF-8バイト数。表示名「Last Out Len」は文字数と誤解されやすい (§101) |
+| P2 | Analytics | N turnごと更新のため、画面Turn数とAnalytics表示が一時的に不一致。「last updated at turn N」等が必要 (§102) |
+| P2 | New操作 | history.sqliteの過去記録は残るがchat_history.clear()される。「New Model」と「New Conversation」の意味が不明確 (§103) |
 
-### AssociationStore
+### 共通 (Architecture)
 
-既に `source → Top-K` のため比較的良い。
+| 優先 | 内容 |
+|------|------|
+| P1 | `setup_fonts()` がgui/trainerで重複 (§122) |
+| P1 | File Dialog定義 (rfd::FileDialog) がgui/trainerで重複 (§98) |
+| P1 | D&D処理がgui/trainerで独立実装 (§99) |
+| P1 | `desktop/` 共通層未作成 (§78) |
+| P2 | Windows Native Menu未実装 (§88-94) |
+| P2 | Keyboard shortcuts (Ctrl+N/O/S/Shift+S) 未実装 (§92) |
 
 ---
 
 ## ロードマップ
 
-### A. 意味を正す (Phase 0〜4)
+### コアモデル Phases
 
-| Phase | 内容 | 完了条件 |
-|-------|------|---------|
-| 0 | 仕様書正本化・Baseline計測 | 変更を数字で比較できる |
-| ~~1~~ | ~~Experience / Replay 分離~~ | ✅ 完了 |
-| ~~2~~ | ~~Identity / View 最小実装 (Exact Identity)~~ | ✅ 完了 |
-| ~~3~~ | ~~Representation Lineage~~ | ✅ 完了 |
-| ~~4~~ | ~~Fallback via Lineage~~ | ✅ 完了 |
+| Phase | 内容 | 状態 |
+|-------|------|------|
+| D (P0) | Generation cycle detection, EOS, seed/output分離 | ✅ 完了 |
+| B | Representation Lineage (RepresentationStore) | ✅ 完了 |
+| C | Experience/Replay 分離 (external_route_evidence) | ✅ 完了 |
+| E | Factorization Pressure 修正 (merge_right_reuse) | ✅ 完了 |
+| F | TransformKind + conditional merge (§17修正) | ✅ 完了 |
+| G | RelationStore canonical化 | 未着手 |
+| H | Memory Budget | 未着手 |
+| I | Core/Overlay physical split | 未着手 |
+| J | Generalization real tests | 未着手 |
 
-### B. 現行ボトルネックを取る (Phase 5〜10)
+### Desktop UI Phases (§136)
 
-| Phase | 内容 |
-|-------|------|
-| ~~5~~ | ~~Route Source Index化~~ | ✅ 完了 |
-| ~~6~~ | ~~Segmentation 局所化 (O(L log L))~~ | ✅ 完了 |
-| ~~7~~ | ~~Unified Relation Core~~ | ✅ 完了 |
-| ~~8~~ | ~~Memory 階層 (HOT/SLEEP物理分離・Recognition/Recall分離)~~ | ✅ 完了 |
-| ~~9~~ | ~~Lazy Decay / Dirty Consolidation~~ | ✅ 完了 |
-| ~~10~~ | ~~Factorization Pressure~~ | ✅ 完了 |
-
-### C. 新しいIdentity/Relation理論を完成させる (Phase 11〜13)
-
-| Phase | 内容 |
-|-------|------|
-| ~~11~~ | ~~Cross-View Identity~~ | ✅ 完了 |
-| ~~12~~ | ~~Transform / Inverse / Composition~~ | ✅ 完了 |
-| ~~13~~ | ~~Micro-ISA 定義~~ | ✅ 完了 |
-
-### D. 機械レベルへ落とす (Phase 14〜20)
-
-| Phase | 内容 |
-|-------|------|
-| ~~14~~ | ~~Physical Core / Overlay 分離~~ | ✅ 完了 |
-| ~~15~~ | ~~Flat Arrays / Arena Index~~ | ✅ 完了 |
-| ~~16~~ | ~~Binary Persistence~~ | ✅ 完了 |
-| ~~17~~ | ~~Fixed Point / Packing~~ | ✅ 完了 |
-| ~~18~~ | ~~Variable-bit ID / Region Encoding~~ | ✅ 完了 |
-| 19 | SIMD / Assembly (profile後のみ) | ⏭️ スキップ (profile要) |
-| ~~20~~ | ~~Generalization / Novel Search~~ | ✅ 完了 |
+| Phase | 内容 | 状態 |
+|-------|------|------|
+| UI-1 | README/CURRENT_STATE/spec現状整理 | ✅ 完了 |
+| UI-2 | FileKind / FileDialogSpec / ModelFileService 共通層 | 未着手 |
+| UI-3 | D&D共通化 (DropRouter) | 未着手 |
+| UI-4 | Trainer state machine修正 (Save error, fingerprint, Running guard, Resume) | 未着手 |
+| UI-5 | Chat GUI修正 (raw input, last_output_len) | 未着手 |
+| UI-6 | Windows Native Menu Spike | 未着手 |
+| UI-7 | Native Menu本実装 | 未着手 |
+| UI-8 | Trainer menu/file統合 | 未着手 |
+| UI-9 | README最終更新 + docs/spec更新 | 未着手 |

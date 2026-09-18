@@ -74,6 +74,7 @@ pub fn model_analytics(model: &ModelState) -> Analytics {
         dpc: model.metrics.decision_per_character(),
         last_decision_count: 0,
         last_output_len: 0,
+        last_output_chars: 0,
         pos_feedback_count: 0,
         neg_feedback_count: 0,
     }
@@ -100,6 +101,7 @@ pub struct Analytics {
     pub dpc: f64,
     pub last_decision_count: usize,
     pub last_output_len: usize,
+    pub last_output_chars: usize,
     pub pos_feedback_count: u64,
     pub neg_feedback_count: u64,
 }
@@ -113,6 +115,7 @@ pub struct AppHandle {
     pub model_path: PathBuf,
     last_decision_count: usize,
     last_output_len: usize,
+    last_output_chars: usize,
     pos_feedback_count: u64,
     neg_feedback_count: u64,
 }
@@ -134,6 +137,7 @@ impl AppHandle {
             model_path,
             last_decision_count: 0,
             last_output_len: 0,
+            last_output_chars: 0,
             pos_feedback_count: 0,
             neg_feedback_count: 0,
         })
@@ -144,6 +148,7 @@ impl AppHandle {
         let (turn_id, output, trace) = self.session.turn(input)?;
         self.last_decision_count = trace.decision_count;
         self.last_output_len = output.len();
+        self.last_output_chars = output.chars().count();
         Ok((turn_id, output))
     }
 
@@ -181,6 +186,7 @@ impl AppHandle {
         self.model_path = path.to_path_buf();
         self.last_decision_count = 0;
         self.last_output_len = 0;
+        self.last_output_chars = 0;
         Ok(())
     }
 
@@ -190,6 +196,7 @@ impl AppHandle {
         self.session.turn_count = 0;
         self.last_decision_count = 0;
         self.last_output_len = 0;
+        self.last_output_chars = 0;
         self.pos_feedback_count = 0;
         self.neg_feedback_count = 0;
     }
@@ -200,6 +207,7 @@ impl AppHandle {
         a.generation = self.session.turn_count;
         a.last_decision_count = self.last_decision_count;
         a.last_output_len = self.last_output_len;
+        a.last_output_chars = self.last_output_chars;
         a.pos_feedback_count = self.pos_feedback_count;
         a.neg_feedback_count = self.neg_feedback_count;
         a

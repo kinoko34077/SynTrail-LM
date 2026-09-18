@@ -1,5 +1,7 @@
 pub mod app;
 pub mod trainer;
+#[cfg(feature = "gui")]
+pub mod desktop;
 pub mod association;
 pub mod chunks;
 pub mod config;

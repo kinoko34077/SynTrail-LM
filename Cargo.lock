@@ -2930,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "syntrail_lm"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "rusqlite",

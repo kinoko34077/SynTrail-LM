@@ -187,11 +187,10 @@ fn cmd_recall(args: &[String]) {
     let model_path = flag_path(args, "--model").unwrap_or_else(default_model_path);
     let model = load_model(&model_path);
 
-    // Encode the unit text and take the first segmented unit
-    let prim_ids = {
-        let mut tmp = model.primitives.clone();
-        tmp.encode(&unit_text)
-    };
+    // Read-only encode: skip any characters the model hasn't seen yet.
+    let prim_ids: Vec<u32> = unit_text.chars()
+        .filter_map(|c| model.primitives.id(c))
+        .collect();
     if prim_ids.is_empty() {
         println!("(no primitives for {:?})", unit_text);
         return;

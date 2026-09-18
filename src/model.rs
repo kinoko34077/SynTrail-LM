@@ -114,10 +114,10 @@ impl ModelState {
         max_units: usize,
         trace_id: TraceId,
     ) -> (String, TurnTrace) {
-        let prim_ids = {
-            let mut tmp = self.primitives.clone();
-            tmp.encode(seed_text)
-        };
+        // Read-only: only use primitives already registered; unknown chars are skipped.
+        let prim_ids: Vec<u32> = seed_text.chars()
+            .filter_map(|c| self.primitives.id(c))
+            .collect();
 
         let seed_units = segment(&prim_ids, &self.chunks, SEGMENT_MIN_SCORE);
         let mut generated_units = seed_units.clone();

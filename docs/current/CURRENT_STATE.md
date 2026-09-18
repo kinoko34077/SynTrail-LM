@@ -33,6 +33,7 @@ crate version: 0.5.0
 - **HOT/SLEEP 物理分離** (hot_pair_to_id Recognition index) ← Phase 8
 - **Lazy Decay** (s = s * λ^Δt + reward for Chunk and PredictionEdge) ← Phase 9
 - **Factorization Pressure** (Context Diversity bonus in consider_merges) ← Phase 10
+- **Cross-View Identity** (Union-Find merge_identities, canonical resolution, persistence) ← Phase 11
 
 ---
 
@@ -101,7 +102,7 @@ crate version: 0.5.0
 
 | Phase | 内容 |
 |-------|------|
-| 11 | Cross-View Identity |
+| ~~11~~ | ~~Cross-View Identity~~ | ✅ 完了 |
 | 12 | Transform / Inverse / Composition |
 | 13 | Micro-ISA 定義 |
 

@@ -1,12 +1,13 @@
-/// Phase 2: Identity and View registry — Exact Identity only.
+/// Identity and View registry.
 ///
-/// Identity: canonical Primitive expansion (Vec<PrimitiveId>).
-/// View: specific Chunk tree / segmentation (Vec<UnitId>).
-///
-/// Exact Identity rule: two Views share the same IdentityId iff their
+/// Phase 2: Exact Identity — two Views share the same IdentityId iff their
 /// Primitive expansions are identical.
 ///
-/// Phase 11+ will add Cross-View Identity (semantic similarity).
+/// Phase 11: Cross-View Identity — Union-Find merging allows explicitly
+/// declaring two Identities equivalent (e.g. via a Transform relation).
+/// `merge_identities(a, b)` unions them; `canonical(id)` resolves to the
+/// root. Phase 12 Transforms will call merge_identities when they are
+/// registered.
 use std::collections::HashMap;
 
 use crate::primitives::PrimitiveId;
@@ -16,11 +17,16 @@ pub type IdentityId = u32;
 pub type ViewId = u32;
 
 /// Registry of Identities and Views.
+///
+/// `parent[i]` is the Union-Find parent of Identity `i`.
+/// A root satisfies `parent[i] == i`.
 #[derive(Debug, Default, Clone)]
 pub struct IdentityStore {
     // identity side
     prim_seq_to_id: HashMap<Vec<PrimitiveId>, IdentityId>,
     identity_prims: Vec<Vec<PrimitiveId>>,
+    // Phase 11: Union-Find parent array (parallel to identity_prims)
+    parent: Vec<IdentityId>,
 
     // view side
     unit_seq_to_id: HashMap<Vec<UnitId>, ViewId>,
@@ -41,6 +47,7 @@ impl IdentityStore {
         let id = self.identity_prims.len() as IdentityId;
         self.identity_prims.push(prims.to_vec());
         self.prim_seq_to_id.insert(prims.to_vec(), id);
+        self.parent.push(id); // each new Identity is its own root
         id
     }
 
@@ -59,9 +66,45 @@ impl IdentityStore {
         id
     }
 
-    /// Return the IdentityId bound to a ViewId.
+    // ── Phase 11: Union-Find ──────────────────────────────────────────────
+
+    /// Return the canonical (root) IdentityId for `id`.
+    ///
+    /// Follows the parent chain without mutating (no path compression here —
+    /// chains are short in practice).
+    pub fn canonical(&self, mut id: IdentityId) -> IdentityId {
+        while (id as usize) < self.parent.len() && self.parent[id as usize] != id {
+            id = self.parent[id as usize];
+        }
+        id
+    }
+
+    /// Declare that Identities `a` and `b` are equivalent (Cross-View merge).
+    ///
+    /// The canonical root of `a`'s cluster becomes the canonical root of the
+    /// merged cluster. Idempotent if they are already in the same cluster.
+    pub fn merge_identities(&mut self, a: IdentityId, b: IdentityId) {
+        let ra = self.canonical(a);
+        let rb = self.canonical(b);
+        if ra != rb {
+            // Make ra the canonical root of both clusters.
+            if (rb as usize) < self.parent.len() {
+                self.parent[rb as usize] = ra;
+            }
+        }
+    }
+
+    /// Return the IdentityId bound to a ViewId (raw, not canonicalized).
     pub fn identity_of_view(&self, view: ViewId) -> Option<IdentityId> {
         self.view_identity.get(view as usize).copied()
+    }
+
+    /// Return the *canonical* IdentityId for the given ViewId.
+    ///
+    /// Phase 11: follows the Union-Find chain so that views whose Identities
+    /// were merged by `merge_identities` resolve to the same canonical root.
+    pub fn canonical_identity_of_view(&self, view: ViewId) -> Option<IdentityId> {
+        self.identity_of_view(view).map(|id| self.canonical(id))
     }
 
     /// Return the canonical Primitive sequence for an IdentityId.
@@ -83,6 +126,11 @@ impl IdentityStore {
         &self.identity_prims
     }
 
+    /// Phase 11: return the full Union-Find parent array for serialisation.
+    pub fn all_parents(&self) -> &[IdentityId] {
+        &self.parent
+    }
+
     pub fn all_views(&self) -> impl Iterator<Item = (&[UnitId], IdentityId)> {
         self.view_units
             .iter()
@@ -91,15 +139,26 @@ impl IdentityStore {
     }
 
     /// Reconstruct from raw bulk data (called by the persistence layer).
+    ///
+    /// `parent` is the serialised Union-Find array (Phase 11); pass `None`
+    /// or an empty vec to start with all roots (pre-Phase-11 snapshots).
     pub fn from_bulk(
         identities: Vec<Vec<PrimitiveId>>,
         views: Vec<(Vec<UnitId>, IdentityId)>,
+        parent: Option<Vec<IdentityId>>,
     ) -> Self {
         let mut store = Self::new();
         for prims in identities {
             let id = store.identity_prims.len() as IdentityId;
             store.prim_seq_to_id.insert(prims.clone(), id);
             store.identity_prims.push(prims);
+            store.parent.push(id); // self-root default
+        }
+        // Override parent array if a valid one was provided.
+        if let Some(p) = parent {
+            if p.len() == store.parent.len() {
+                store.parent = p;
+            }
         }
         for (units, identity) in views {
             let id = store.view_units.len() as ViewId;
@@ -133,39 +192,27 @@ mod tests {
 
     #[test]
     fn different_chunk_trees_same_identity() {
-        // ABCDE / AB+CDE / ABC+DE all expand to primitives [1,2,3,4,5]
         let mut store = IdentityStore::new();
         let prims = vec![1u32, 2, 3, 4, 5];
         let identity = store.intern_identity(&prims);
 
-        // View A: all primitives
         let view_a_units = vec![
-            UnitId::primitive(1),
-            UnitId::primitive(2),
-            UnitId::primitive(3),
-            UnitId::primitive(4),
-            UnitId::primitive(5),
+            UnitId::primitive(1), UnitId::primitive(2), UnitId::primitive(3),
+            UnitId::primitive(4), UnitId::primitive(5),
         ];
-        // View B: chunk(AB) + primitives(C,D,E) — C(0) represents AB
         let view_b_units = vec![
-            UnitId::chunk(0),
-            UnitId::primitive(3),
-            UnitId::primitive(4),
-            UnitId::primitive(5),
+            UnitId::chunk(0), UnitId::primitive(3), UnitId::primitive(4), UnitId::primitive(5),
         ];
-        // View C: chunk(ABC) + chunk(DE) — C(1) represents ABC, C(2) represents DE
         let view_c_units = vec![UnitId::chunk(1), UnitId::chunk(2)];
 
         let va = store.intern_view(&view_a_units, identity);
         let vb = store.intern_view(&view_b_units, identity);
         let vc = store.intern_view(&view_c_units, identity);
 
-        // All three views are distinct objects
         assert_ne!(va, vb);
         assert_ne!(vb, vc);
         assert_ne!(va, vc);
 
-        // All three resolve to the same Identity
         assert_eq!(store.identity_of_view(va), Some(identity));
         assert_eq!(store.identity_of_view(vb), Some(identity));
         assert_eq!(store.identity_of_view(vc), Some(identity));
@@ -200,10 +247,9 @@ mod tests {
         orig.intern_view(&units_b, id0);
         orig.intern_view(&vec![UnitId::primitive(3), UnitId::primitive(4)], id1);
 
-        // Reconstruct from bulk
         let idents: Vec<_> = orig.all_identities().to_vec();
         let views: Vec<_> = orig.all_views().map(|(u, id)| (u.to_vec(), id)).collect();
-        let mut restored = IdentityStore::from_bulk(idents, views);
+        let mut restored = IdentityStore::from_bulk(idents, views, None);
 
         assert_eq!(restored.identity_count(), orig.identity_count());
         assert_eq!(restored.view_count(), orig.view_count());
@@ -211,5 +257,84 @@ mod tests {
             restored.intern_identity(&[1, 2]),
             orig.prim_seq_to_id[&vec![1u32, 2]]
         );
+    }
+
+    // ── Phase 11: Cross-View Identity tests ──────────────────────────────
+
+    #[test]
+    fn ci11_merge_identities_canonical() {
+        let mut store = IdentityStore::new();
+        let a = store.intern_identity(&[1, 2]);
+        let b = store.intern_identity(&[3, 4]);
+        assert_ne!(store.canonical(a), store.canonical(b), "before merge");
+        store.merge_identities(a, b);
+        assert_eq!(store.canonical(a), store.canonical(b), "after merge");
+    }
+
+    #[test]
+    fn ci11_canonical_identity_of_view() {
+        let mut store = IdentityStore::new();
+        let a = store.intern_identity(&[1, 2]);
+        let b = store.intern_identity(&[3, 4]);
+        let va = store.intern_view(&[UnitId::primitive(1), UnitId::primitive(2)], a);
+        let vb = store.intern_view(&[UnitId::primitive(3), UnitId::primitive(4)], b);
+
+        assert_ne!(
+            store.canonical_identity_of_view(va),
+            store.canonical_identity_of_view(vb),
+            "before merge"
+        );
+        store.merge_identities(a, b);
+        assert_eq!(
+            store.canonical_identity_of_view(va),
+            store.canonical_identity_of_view(vb),
+            "after merge"
+        );
+    }
+
+    #[test]
+    fn ci11_merge_transitive() {
+        // A=B then B=C should give A, B, C all the same canonical.
+        let mut store = IdentityStore::new();
+        let a = store.intern_identity(&[1]);
+        let b = store.intern_identity(&[2]);
+        let c = store.intern_identity(&[3]);
+        store.merge_identities(a, b);
+        store.merge_identities(b, c);
+        let ca = store.canonical(a);
+        let cb = store.canonical(b);
+        let cc = store.canonical(c);
+        assert_eq!(ca, cb);
+        assert_eq!(cb, cc);
+    }
+
+    #[test]
+    fn ci11_merge_idempotent() {
+        let mut store = IdentityStore::new();
+        let a = store.intern_identity(&[1]);
+        let b = store.intern_identity(&[2]);
+        store.merge_identities(a, b);
+        let c1 = store.canonical(a);
+        store.merge_identities(a, b);
+        let c2 = store.canonical(a);
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn ci11_persistence_roundtrip_with_aliases() {
+        let mut orig = IdentityStore::new();
+        let a = orig.intern_identity(&[10, 20]);
+        let b = orig.intern_identity(&[30, 40]);
+        let c = orig.intern_identity(&[50, 60]);
+        orig.merge_identities(a, b); // a == b
+        // c remains its own root
+
+        let idents = orig.all_identities().to_vec();
+        let views: Vec<_> = orig.all_views().map(|(u, id)| (u.to_vec(), id)).collect();
+        let parent = orig.all_parents().to_vec();
+
+        let restored = IdentityStore::from_bulk(idents, views, Some(parent));
+        assert_eq!(restored.canonical(a), restored.canonical(b), "alias preserved");
+        assert_ne!(restored.canonical(a), restored.canonical(c), "non-alias preserved");
     }
 }

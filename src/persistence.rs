@@ -208,6 +208,9 @@ pub struct ModelSnapshot {
     /// Phase 3: Lineage — (child_chunk_id, left_unit, right_unit) triples.
     #[serde(default)]
     lineage_entries: Vec<(u32, UnitIdDto, UnitIdDto)>,
+    /// Phase 11: Union-Find parent array for Cross-View Identity merges.
+    #[serde(default)]
+    identity_parent: Vec<u32>,
 }
 
 fn default_top_k() -> usize { 32 }
@@ -261,6 +264,8 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         .map(|(child, l, r)| (child, UnitIdDto::from(l), UnitIdDto::from(r)))
         .collect();
 
+    let identity_parent: Vec<u32> = model.identities.all_parents().to_vec();
+
     ModelSnapshot {
         version: "0.5".to_owned(),
         tick: model.tick,
@@ -276,6 +281,7 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         identities,
         views,
         lineage_entries,
+        identity_parent,
     }
 }
 
@@ -343,7 +349,8 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
             (units, d.identity)
         })
         .collect();
-    let identities = IdentityStore::from_bulk(identity_seqs, view_pairs);
+    let parent_opt = if snap.identity_parent.is_empty() { None } else { Some(snap.identity_parent) };
+    let identities = IdentityStore::from_bulk(identity_seqs, view_pairs, parent_opt);
 
     let lineage_bulk: Vec<(u32, UnitId, UnitId)> = snap.lineage_entries.into_iter()
         .map(|(c, l, r)| (c, UnitId::from(l), UnitId::from(r)))

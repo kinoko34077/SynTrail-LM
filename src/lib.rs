@@ -10,6 +10,7 @@ pub mod identity;
 pub mod lineage;
 pub mod model;
 pub mod relation;
+pub mod transform;
 pub mod persistence;
 pub mod prediction;
 pub mod primitives;

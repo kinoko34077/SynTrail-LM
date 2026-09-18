@@ -1,3 +1,4 @@
+pub mod app;
 pub mod association;
 pub mod chunks;
 pub mod config;

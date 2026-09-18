@@ -13,6 +13,7 @@ pub mod relation;
 pub mod transform;
 pub mod isa;
 pub mod core;
+pub mod codec;
 pub mod persistence;
 pub mod prediction;
 pub mod primitives;

@@ -40,6 +40,7 @@ crate version: 0.5.0
 - **Flat Arrays / Arena Index** (PredictionStore: Vec<PredictionEdge> + edge_index + source_index<usize>) ← Phase 15
 - **Binary Persistence** (save_binary/load_binary via bincode; save_auto/load_auto dispatcher) ← Phase 16
 - **Fixed Point / Packing** (DTO strength fields: f64 → f32 in ChunkDto/PredictionEdgeDto; runtime stays f64) ← Phase 17
+- **Variable-bit ID / Region Encoding** (LEB128 + zigzag delta codec for UnitId sequences) ← Phase 18
 
 ---
 
@@ -120,6 +121,6 @@ crate version: 0.5.0
 | ~~15~~ | ~~Flat Arrays / Arena Index~~ | ✅ 完了 |
 | ~~16~~ | ~~Binary Persistence~~ | ✅ 完了 |
 | ~~17~~ | ~~Fixed Point / Packing~~ | ✅ 完了 |
-| 18 | Variable-bit ID / Region Encoding |
+| ~~18~~ | ~~Variable-bit ID / Region Encoding~~ | ✅ 完了 |
 | 19 | SIMD / Assembly (profile後のみ) |
 | 20 | Generalization / Novel Search |

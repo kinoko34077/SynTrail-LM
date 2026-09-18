@@ -116,7 +116,7 @@ integration tests: 100
 | UI-3 | D&D共通化 (DropRouter) | ✅ 完了 (drop.rs) |
 | UI-4 | Trainer state machine修正 (Save error, fingerprint, Running guard, Resume) | ✅ 完了 |
 | UI-5 | Chat GUI修正 (raw input, last_output_chars) | ✅ 完了 |
-| UI-6 | Windows Native Menu Spike | 未着手 |
-| UI-7 | Native Menu本実装 | 未着手 |
+| UI-6 | Windows Native Menu Spike (muda 0.20 互換確認) | ✅ 完了 |
+| UI-7 | Native Menu本実装 (Chat GUI, NativeMenu::build/attach/poll) | ✅ 完了 |
 | UI-8 | Trainer menu/file統合 | 未着手 |
 | UI-9 | README最終更新 + docs/spec更新 | 未着手 |

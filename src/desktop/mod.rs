@@ -6,5 +6,6 @@ pub mod dialogs;
 pub mod drop;
 pub mod file_ops;
 pub mod fonts;
+pub mod platform;
 
 pub use file_ops::{FileCommand, FileKind};

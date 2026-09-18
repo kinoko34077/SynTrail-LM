@@ -8,6 +8,9 @@ use syntrail_lm::app::{Analytics, AppHandle};
 use syntrail_lm::db::TurnRow;
 use syntrail_lm::feedback::FeedbackSign;
 
+#[cfg(all(target_os = "windows", feature = "gui"))]
+use syntrail_lm::desktop::platform::windows::NativeMenu;
+
 const DEFAULT_MODEL: &str = "model.json";
 const DEFAULT_HISTORY: &str = "history.sqlite";
 const DEFAULT_REFRESH: u32 = 5;
@@ -123,6 +126,8 @@ struct SynTrailApp {
     refresh_interval: u32,
     turns_since_refresh: u32,
     status: String,
+    #[cfg(all(target_os = "windows", feature = "gui"))]
+    native_menu: NativeMenu,
 }
 
 impl SynTrailApp {
@@ -141,6 +146,8 @@ impl SynTrailApp {
             refresh_interval: DEFAULT_REFRESH,
             turns_since_refresh: 0,
             status: "Ready".to_string(),
+            #[cfg(all(target_os = "windows", feature = "gui"))]
+            native_menu: NativeMenu::build(),
         }
     }
 
@@ -233,6 +240,27 @@ fn load_history_entries(handle: &AppHandle) -> Vec<ChatEntry> {
 impl eframe::App for SynTrailApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut action = Action::None;
+
+        // Native menu: attach on first frame, then poll each frame (§88–94)
+        #[cfg(all(target_os = "windows", feature = "gui"))]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = _frame.window_handle() {
+                if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                    let hwnd = h.hwnd.get() as isize;
+                    let _ = unsafe { self.native_menu.attach(hwnd) };
+                }
+            }
+            if let Some(cmd) = self.native_menu.poll() {
+                action = match cmd {
+                    syntrail_lm::desktop::FileCommand::New     => Action::New,
+                    syntrail_lm::desktop::FileCommand::Open    => Action::OpenLoadDialog,
+                    syntrail_lm::desktop::FileCommand::Save    => Action::Save,
+                    syntrail_lm::desktop::FileCommand::SaveAs  => Action::OpenSaveDialog,
+                    syntrail_lm::desktop::FileCommand::LoadPath(p) => Action::LoadPath(p),
+                };
+            }
+        }
 
         // File drag-and-drop (.json or .db)
         ctx.input(|i| {

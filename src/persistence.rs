@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::association::{AssociationEdge, AssociationStore};
 use crate::chunks::{Chunk, ChunkRegistry, Residency};
 use crate::identity::IdentityStore;
+use crate::lineage::LineageStore;
 use crate::model::{Metrics, ModelState};
 use crate::prediction::{PredictionEdge, PredictionStore};
 use crate::primitives::PrimitiveRegistry;
@@ -199,6 +200,9 @@ pub struct ModelSnapshot {
     /// Phase 2: Views (Chunk trees) with their Identity bindings.
     #[serde(default)]
     views: Vec<ViewDto>,
+    /// Phase 3: Lineage — (child_chunk_id, left_unit, right_unit) triples.
+    #[serde(default)]
+    lineage_entries: Vec<(u32, UnitIdDto, UnitIdDto)>,
 }
 
 fn default_top_k() -> usize { 32 }
@@ -248,6 +252,10 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         })
         .collect();
 
+    let lineage_entries: Vec<(u32, UnitIdDto, UnitIdDto)> = model.lineage.all_entries()
+        .map(|(child, l, r)| (child, UnitIdDto::from(l), UnitIdDto::from(r)))
+        .collect();
+
     ModelSnapshot {
         version: "0.5".to_owned(),
         tick: model.tick,
@@ -262,6 +270,7 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         association_decay: model.associations.decay,
         identities,
         views,
+        lineage_entries,
     }
 }
 
@@ -327,12 +336,18 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         .collect();
     let identities = IdentityStore::from_bulk(identity_seqs, view_pairs);
 
+    let lineage_bulk: Vec<(u32, UnitId, UnitId)> = snap.lineage_entries.into_iter()
+        .map(|(c, l, r)| (c, UnitId::from(l), UnitId::from(r)))
+        .collect();
+    let lineage = LineageStore::from_bulk(lineage_bulk);
+
     ModelState::from_parts(
         primitives,
         chunks,
         predictions,
         associations,
         identities,
+        lineage,
         snap.tick,
         merge_candidates,
         Metrics {

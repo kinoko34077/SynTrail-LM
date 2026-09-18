@@ -7,6 +7,7 @@ pub mod db;
 pub mod eval;
 pub mod feedback;
 pub mod identity;
+pub mod lineage;
 pub mod model;
 pub mod persistence;
 pub mod prediction;

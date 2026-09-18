@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use crate::association::AssociationStore;
 use crate::chunks::ChunkRegistry;
 use crate::identity::IdentityStore;
+use crate::lineage::LineageStore;
 use crate::prediction::PredictionStore;
 use crate::primitives::PrimitiveRegistry;
 use crate::segmentation::{expand, segment};
@@ -46,6 +47,8 @@ pub struct ModelState {
     pub associations: AssociationStore,
     /// Phase 2: Identity/View registry (Exact Identity).
     pub identities: IdentityStore,
+    /// Phase 3: Representation Lineage — derivation history for each Chunk.
+    pub lineage: LineageStore,
     pub tick: u64,
     pub(crate) merge_candidates: HashMap<(UnitId, UnitId), u32>,
     pub metrics: Metrics,
@@ -292,6 +295,8 @@ impl ModelState {
                 if freq >= 2.0 || pseudo_rand(left, right, count_val) < prob {
                     let exp_len = self.expanded_length(left) + self.expanded_length(right);
                     let cid = self.chunks.get_or_create(left, right, exp_len);
+                    // Phase 3: record derivation in Lineage.
+                    self.lineage.record(cid, left, right);
                     if let Some(chunk) = self.chunks.get_mut(cid) {
                         if chunk.use_count == 0 {
                             chunk.record_usage(self.tick);
@@ -349,6 +354,7 @@ impl ModelState {
         predictions: PredictionStore,
         associations: AssociationStore,
         identities: IdentityStore,
+        lineage: LineageStore,
         tick: u64,
         merge_candidates: HashMap<(UnitId, UnitId), u32>,
         metrics: Metrics,
@@ -360,6 +366,7 @@ impl ModelState {
             predictions,
             associations,
             identities,
+            lineage,
             tick,
             merge_candidates,
             metrics,
@@ -618,6 +625,41 @@ mod tests {
         m.expose_external("hello");
         assert_eq!(m.identities.identity_count(), 1,
             "same text repeated → same Identity");
+    }
+
+    // ── Phase 3: Representation Lineage ──────────────────────────────────
+
+    #[test]
+    fn lineage_recorded_on_chunk_creation() {
+        let mut m = ModelState::new();
+        // Train until a chunk forms
+        for _ in 0..20 { m.expose_external("ab"); }
+        assert!(m.chunk_count() > 0, "chunk should have formed");
+        assert!(m.lineage.entry_count() > 0,
+            "lineage must be recorded when a chunk is created");
+    }
+
+    #[test]
+    fn lineage_decompose_to_primitives() {
+        let mut m = ModelState::new();
+        for _ in 0..20 { m.expose_external("ab"); }
+        // The first and only chunk should decompose back to [P(a), P(b)]
+        for cid in 0..m.chunk_count() as u32 {
+            let chunk_unit = crate::units::UnitId::chunk(cid);
+            let decomposed = m.lineage.decompose_to_primitives(chunk_unit);
+            // All results should be primitives
+            assert!(decomposed.iter().all(|u| u.is_primitive()),
+                "full decomposition must yield only Primitives");
+        }
+    }
+
+    #[test]
+    fn lineage_entry_count_matches_chunk_count() {
+        let mut m = ModelState::new();
+        for _ in 0..20 { m.expose_external("abcabc"); }
+        // Every chunk that was created should have a lineage entry
+        assert_eq!(m.lineage.entry_count(), m.chunk_count(),
+            "each chunk must have exactly one lineage entry");
     }
 
     #[test]

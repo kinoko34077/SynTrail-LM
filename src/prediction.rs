@@ -175,6 +175,13 @@ impl PredictionStore {
         self.predict(context).into_iter().next().map(|(e, s)| (e.next_unit, s))
     }
 
+    /// Return up to `k` best candidates for `context`, ranked by score.
+    pub fn top_k_with_score(&self, context: UnitId, k: usize) -> Vec<(UnitId, f64)> {
+        let mut results = self.predict(context);
+        results.truncate(k);
+        results.into_iter().map(|(e, s)| (e.next_unit, s)).collect()
+    }
+
     pub fn apply_feedback_to_edge(
         &mut self,
         context: UnitId,

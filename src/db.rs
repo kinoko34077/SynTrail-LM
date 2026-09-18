@@ -310,7 +310,7 @@ mod tests {
             context: UnitId::primitive(2),
             score: 0.9,
         };
-        TurnTrace::new(id, 1, "seed".into(), "input".into(), "output".into(), vec![step], 1000)
+        TurnTrace::new(id, 1, "seed".into(), "input".into(), "output".into(), String::new(), vec![step], 1000)
     }
 
     #[test]

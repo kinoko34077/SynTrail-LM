@@ -29,14 +29,20 @@ pub struct TurnTrace {
     pub generation_seed: String,
     /// Input text for the turn (same as seed in chat mode).
     pub input_text: String,
-    /// Generated output text.
+    /// Full output text (seed + emitted, Completion mode).
     pub output_text: String,
+    /// Only the emitted portion — excludes seed (Dialogue mode output).
+    pub emitted_text: String,
     /// Decisions made during generation.
     pub decision_steps: Vec<DecisionStep>,
     /// decision_steps.len() — pre-computed for convenience.
     pub decision_count: usize,
     /// Unix timestamp seconds at creation.
     pub created_at: u64,
+    /// True if generation stopped because EOS was predicted.
+    pub stopped_by_eos: bool,
+    /// True if generation stopped because a cycle was detected.
+    pub stopped_by_cycle: bool,
 }
 
 impl TurnTrace {
@@ -46,6 +52,7 @@ impl TurnTrace {
         generation_seed: String,
         input_text: String,
         output_text: String,
+        emitted_text: String,
         decision_steps: Vec<DecisionStep>,
         created_at: u64,
     ) -> Self {
@@ -56,9 +63,12 @@ impl TurnTrace {
             generation_seed,
             input_text,
             output_text,
+            emitted_text,
             decision_steps,
             decision_count,
             created_at,
+            stopped_by_eos: false,
+            stopped_by_cycle: false,
         }
     }
 }

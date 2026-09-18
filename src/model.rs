@@ -23,6 +23,43 @@ const SEGMENT_MIN_SCORE: f64 = 0.0;
 /// Phase 10: diversity bonus scale — each unique preceding context adds this to the freq multiplier.
 const DIVERSITY_SCALE: f64 = 0.25;
 
+/// P0 Generation: top-K route candidates per step.
+const ROUTE_TOP_K: usize = 5;
+/// P0 Generation: score multiplier applied to a route that appears in recent_routes.
+const CYCLE_PENALTY: f64 = 0.05;
+/// P0 Generation: ring-buffer depth for cycle detection.
+const RECENT_ROUTES_MAX: usize = 8;
+/// P0: EOS marker — ETX character (U+0003).  Training can inject this at semantic boundaries.
+pub const EOS_CHAR: char = '\x03';
+
+/// P0: Per-call generation state for cycle detection and no-progress tracking.
+pub struct GenerationState {
+    pub step_count: usize,
+    recent_routes: std::collections::VecDeque<(crate::units::UnitId, crate::units::UnitId)>,
+}
+
+impl GenerationState {
+    pub fn new() -> Self {
+        Self { step_count: 0, recent_routes: std::collections::VecDeque::new() }
+    }
+
+    pub fn is_recent_route(&self, context: crate::units::UnitId, next: crate::units::UnitId) -> bool {
+        self.recent_routes.contains(&(context, next))
+    }
+
+    pub fn push_route(&mut self, context: crate::units::UnitId, next: crate::units::UnitId) {
+        if self.recent_routes.len() >= RECENT_ROUTES_MAX {
+            self.recent_routes.pop_front();
+        }
+        self.recent_routes.push_back((context, next));
+        self.step_count += 1;
+    }
+}
+
+impl Default for GenerationState {
+    fn default() -> Self { Self::new() }
+}
+
 /// Running counters for the primary metric.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Metrics {
@@ -176,12 +213,60 @@ impl ModelState {
         self.expose_external(text);
     }
 
-    // ── Frozen generation (v0.2) ─────────────────────────────────────────
+    // ── Frozen generation (P0: cycle detection, seed/output separation, Top-K) ──
+
+    /// P0: pick the best next unit for `context`, applying cycle penalty and lineage fallback.
+    fn pick_next_unit(&self, context: UnitId, state: &GenerationState) -> Option<(UnitId, f64)> {
+        // Direct prediction — top-K with cycle penalty.
+        let candidates = self.predictions.top_k_with_score(context, ROUTE_TOP_K);
+        if !candidates.is_empty() {
+            let best = candidates.into_iter()
+                .map(|(unit, score)| {
+                    let factor = if state.is_recent_route(context, unit) { CYCLE_PENALTY } else { 1.0 };
+                    (unit, score * factor)
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(r @ (_, s)) = best {
+                if s > 0.0 { return Some(r); }
+            }
+        }
+
+        // Lineage fallback — one-level decomposition.
+        let one_level = self.lineage.decompose_one(context);
+        if one_level.len() > 1 || one_level.first() != Some(&context) {
+            for &u in one_level.iter().rev() {
+                if let Some(r) = self.predictions.top1_with_score(u) {
+                    return Some(r);
+                }
+            }
+        }
+
+        // Full primitive decomposition.
+        let prims = self.lineage.decompose_to_primitives(context);
+        for &u in prims.iter().rev() {
+            if u != context {
+                if let Some(r) = self.predictions.top1_with_score(u) {
+                    return Some(r);
+                }
+            }
+        }
+        None
+    }
+
+    /// Return the primitive ID for `EOS_CHAR`, if registered.
+    pub fn eos_unit(&self) -> Option<UnitId> {
+        self.primitives.id(EOS_CHAR).map(UnitId::primitive)
+    }
 
     /// Generate text from `seed_text` without mutating self.
     ///
-    /// Returns the generated string and a TurnTrace recording every decision.
-    /// The seed units are NOT decisions; only units chosen by top1 are.
+    /// P0 changes:
+    /// - `context_units` (seed) and `emitted_units` are tracked separately.
+    /// - Route Top-K with cycle penalty replaces unconditional top-1.
+    /// - Cycle / no-progress detection: stops if a route repeats within the
+    ///   recent-routes window and no viable alternate candidate exists.
+    /// - EOS: stops if the predicted next unit is the EOS primitive.
+    /// - `trace.emitted_text` contains only the generated (non-seed) text.
     pub fn generate_with_trace(
         &self,
         seed_text: &str,
@@ -189,47 +274,65 @@ impl ModelState {
         max_units: usize,
         trace_id: TraceId,
     ) -> (String, TurnTrace) {
-        // Read-only: only use primitives already registered; unknown chars are skipped.
         let prim_ids: Vec<u32> = seed_text.chars()
             .filter_map(|c| self.primitives.id(c))
             .collect();
 
-        let seed_units = segment(&prim_ids, &self.chunks, SEGMENT_MIN_SCORE);
-        let mut generated_units = seed_units.clone();
+        let context_units = segment(&prim_ids, &self.chunks, SEGMENT_MIN_SCORE);
+        let mut emitted_units: Vec<UnitId> = Vec::new();
         let mut steps: Vec<DecisionStep> = Vec::new();
+        let mut gen_state = GenerationState::new();
+        let eos = self.eos_unit();
+        let mut stopped_by_eos = false;
+        let mut stopped_by_cycle = false;
 
         for step_index in 0..max_units {
-            let context = match generated_units.last() {
-                Some(&u) => u,
+            let context = emitted_units.last()
+                .or_else(|| context_units.last())
+                .copied();
+            let context = match context { Some(c) => c, None => break };
+
+            match self.pick_next_unit(context, &gen_state) {
                 None => break,
-            };
-            // Phase 4: use fallback-aware prediction.
-            match self.predict_with_fallback(context) {
                 Some((next, score)) => {
-                    steps.push(DecisionStep {
-                        step_index,
-                        unit: next,
-                        context,
-                        score,
-                    });
-                    generated_units.push(next);
+                    if eos == Some(next) {
+                        stopped_by_eos = true;
+                        break;
+                    }
+                    // After cycle-penalty application, check if we're stuck.
+                    if gen_state.is_recent_route(context, next) {
+                        stopped_by_cycle = true;
+                        break;
+                    }
+                    steps.push(DecisionStep { step_index, unit: next, context, score });
+                    gen_state.push_route(context, next);
+                    emitted_units.push(next);
                 }
-                None => break,
             }
         }
 
-        let expanded = expand(&generated_units, &self.chunks, &self.primitives);
-        let output = self.primitives.decode(&expanded).unwrap_or_default();
+        // Completion-mode output: seed + emitted.
+        let mut all_units = context_units.clone();
+        all_units.extend_from_slice(&emitted_units);
+        let expanded_all = expand(&all_units, &self.chunks, &self.primitives);
+        let output = self.primitives.decode(&expanded_all).unwrap_or_default();
 
-        let trace = TurnTrace::new(
+        // Emitted-only text for Dialogue mode.
+        let expanded_emit = expand(&emitted_units, &self.chunks, &self.primitives);
+        let emitted_text = self.primitives.decode(&expanded_emit).unwrap_or_default();
+
+        let mut trace = TurnTrace::new(
             trace_id,
             self.tick,
             seed_text.to_owned(),
             input_text.to_owned(),
             output.clone(),
+            emitted_text,
             steps,
             now_secs(),
         );
+        trace.stopped_by_eos = stopped_by_eos;
+        trace.stopped_by_cycle = stopped_by_cycle;
 
         (output, trace)
     }
@@ -238,6 +341,16 @@ impl ModelState {
     pub fn generate(&self, seed_text: &str, max_units: usize) -> String {
         let (output, _) = self.generate_with_trace(seed_text, seed_text, max_units, 0);
         output
+    }
+
+    /// Like `expose_external`, but appends an EOS marker (`EOS_CHAR`) after the text
+    /// so the model can learn to predict sequence end at semantic boundaries.
+    ///
+    /// Use only at true semantic boundaries (sentence end, turn end), NOT at
+    /// arbitrary trainer block boundaries.
+    pub fn expose_with_eos(&mut self, text: &str) {
+        let with_eos = format!("{}{}", text, EOS_CHAR);
+        self.expose_external(&with_eos);
     }
 
     /// Allocate the next trace ID (monotonically increasing).

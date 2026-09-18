@@ -107,6 +107,7 @@ impl Session {
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
             step_rows.iter().map(Database::step_row_to_decision).collect(),
             now_secs(),
         );

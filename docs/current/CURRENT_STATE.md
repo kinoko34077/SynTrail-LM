@@ -46,23 +46,17 @@ crate version: 0.5.0
 
 ---
 
-## 未実装
+## 既知の問題（要対応）
 
-- Representation Lineage
-- Fallback via Lineage
-- Cross-view Identity
-- Unified Relation Core
-- Source-indexed RouteBank
-- Factorization Pressure (Context Diversity考慮)
-- Lazy Decay
-- Physical Core/Overlay split
-- Recall/Recognition 分離
-- Micro-ISA
-- Arena local IDs
-- Variable-width IDs
-- Flat packed arrays
-- Binary journal/snapshot
-- Fixed point arithmetic
+- Generation cycle / no-progress 検出なし (P0)
+- EOS学習・検出なし (P0)
+- seed/output がTurnTraceで未分離 (P0)
+- Cargo.toml 0.5.0 に統合済み
+- TransformStore::register が unconditional merge_identities (P2修正対象)
+- Replay が external_route_evidence を強化している (P1修正対象)
+- Factorization Pressure: diversity bonus が反転している (P1修正対象)
+- save_auto/load_auto が通常save経路に未統合 (P4)
+- codec.rs が binary snapshot に未接続 (P4)
 
 ---
 

@@ -325,12 +325,8 @@ impl ModelState {
             let (left, right) = (window[0], window[1]);
 
             if let Some(existing_id) = self.chunks.find_by_pair(left, right) {
-                // v0.4 §12: reactivate SLEEP chunks on re-encounter
-                if let Some(chunk) = self.chunks.get(existing_id) {
-                    if chunk.is_sleep() {
-                        self.chunks.get_mut(existing_id).unwrap().promote_to_hot();
-                    }
-                }
+                // v0.4 §12: reactivate SLEEP chunks on re-encounter (Phase 8: via registry method)
+                self.chunks.reactivate(existing_id);
                 continue;
             }
 
@@ -375,8 +371,9 @@ impl ModelState {
             .map(|c| (c.id, c.usage_strength))
             .collect();
         hot.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Phase 8: use registry demote() to keep hot_pair_to_id in sync.
         for (id, _) in hot.iter().take(excess) {
-            if let Some(c) = self.chunks.get_mut(*id) { c.demote_to_sleep(); }
+            self.chunks.demote(*id);
         }
     }
 

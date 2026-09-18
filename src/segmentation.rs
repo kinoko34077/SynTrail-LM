@@ -74,13 +74,13 @@ pub fn segment(
 
     // Helper: push a candidate for slots[left] + slots[right] onto the heap.
     let mut heap: BinaryHeap<MergeEntry> = BinaryHeap::new();
+    // Phase 8: use HOT-only recognition index — SLEEP chunks are physically absent.
     let mut push_candidate = |heap: &mut BinaryHeap<MergeEntry>,
                                left: usize, right: usize,
                                lu: UnitId, ru: UnitId| {
         if right >= n { return; }
-        if let Some(cid) = chunks.find_by_pair(lu, ru) {
+        if let Some(cid) = chunks.find_by_pair_hot(lu, ru) {
             if let Some(chunk) = chunks.get(cid) {
-                if !chunk.is_hot() { return; }
                 let score = chunk_score(chunk);
                 if score > min_score {
                     heap.push(MergeEntry { score, left, right, chunk_id: cid,

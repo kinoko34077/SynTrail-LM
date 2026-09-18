@@ -90,10 +90,18 @@ impl Chunk {
 
 /// Central store for all Chunks.
 /// Guarantees: each (left, right) pair maps to exactly one ChunkId.
+///
+/// Phase 8: Physical HOT/SLEEP separation.
+/// `hot_pair_to_id` is a subset of `pair_to_id` that contains only HOT chunks.
+/// Segmentation (Recognition path) queries `hot_pair_to_id` exclusively,
+/// so SLEEP chunks are physically absent from the recognition index.
+/// Recall (AssociationStore) still accesses all chunks via `pair_to_id`/`chunks`.
 #[derive(Debug, Default)]
 pub struct ChunkRegistry {
-    /// (left, right) → id  — deduplication key
+    /// (left, right) → id  — full structural deduplication index (HOT + SLEEP)
     pair_to_id: HashMap<(UnitId, UnitId), ChunkId>,
+    /// (left, right) → id  — HOT-only Recognition index (Phase 8)
+    hot_pair_to_id: HashMap<(UnitId, UnitId), ChunkId>,
     /// id → Chunk
     chunks: Vec<Chunk>,
 }
@@ -130,6 +138,8 @@ impl ChunkRegistry {
             residency: Residency::Hot,
         };
         self.pair_to_id.insert((left, right), id);
+        // New chunks start HOT — add to recognition index.
+        self.hot_pair_to_id.insert((left, right), id);
         self.chunks.push(chunk);
         id
     }
@@ -144,6 +154,31 @@ impl ChunkRegistry {
 
     pub fn find_by_pair(&self, left: UnitId, right: UnitId) -> Option<ChunkId> {
         self.pair_to_id.get(&(left, right)).copied()
+    }
+
+    /// Recognition-path lookup: HOT chunks only (Phase 8).
+    pub fn find_by_pair_hot(&self, left: UnitId, right: UnitId) -> Option<ChunkId> {
+        self.hot_pair_to_id.get(&(left, right)).copied()
+    }
+
+    /// Demote a chunk to SLEEP and remove it from the HOT recognition index.
+    pub fn demote(&mut self, id: ChunkId) {
+        if let Some(chunk) = self.chunks.get_mut(id as usize) {
+            if chunk.is_hot() {
+                chunk.demote_to_sleep();
+                self.hot_pair_to_id.remove(&(chunk.left, chunk.right));
+            }
+        }
+    }
+
+    /// Promote a SLEEP chunk back to HOT and re-add it to the recognition index.
+    pub fn reactivate(&mut self, id: ChunkId) {
+        if let Some(chunk) = self.chunks.get_mut(id as usize) {
+            if chunk.is_sleep() {
+                chunk.promote_to_hot();
+                self.hot_pair_to_id.insert((chunk.left, chunk.right), id);
+            }
+        }
     }
 
     pub fn len(&self) -> usize {

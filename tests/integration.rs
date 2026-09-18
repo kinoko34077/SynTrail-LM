@@ -994,8 +994,8 @@ fn rs03_sleep_chunk_excluded_from_segmentation() {
     let prims = vec![1u32, 2];
     let hot_result = segment(&prims, &chunks, 0.0);
     assert_eq!(hot_result.len(), 1, "RS-03: HOT chunk should be segmented");
-    // Demote to SLEEP
-    chunks.get_mut(id).unwrap().demote_to_sleep();
+    // Demote to SLEEP via registry method (Phase 8: keeps hot_pair_to_id in sync)
+    chunks.demote(id);
     let sleep_result = segment(&prims, &chunks, 0.0);
     assert_eq!(sleep_result.len(), 2, "RS-03: SLEEP chunk should NOT be segmented");
 }
@@ -1013,8 +1013,8 @@ fn rs04_sleep_reactivation() {
     let ub = UnitId::primitive(p_b);
     let chunk_id = m.chunks.find_by_pair(ua, ub);
     if let Some(cid) = chunk_id {
-        // Demote the chunk to SLEEP
-        m.chunks.get_mut(cid).unwrap().demote_to_sleep();
+        // Demote the chunk to SLEEP (Phase 8: via registry method)
+        m.chunks.demote(cid);
         assert_eq!(m.chunks.get(cid).unwrap().residency, Residency::Sleep, "should be SLEEP");
         // Expose "ab" again — should trigger reactivation in consider_merges
         for _ in 0..5 { m.expose("ab"); }

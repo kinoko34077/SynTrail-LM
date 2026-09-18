@@ -297,7 +297,10 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         chunk.last_used = dto.last_used;
         chunk.feedback_value = dto.feedback_value;
         chunk.feedback_count = dto.feedback_count;
-        chunk.residency = if dto.residency == 1 { Residency::Sleep } else { Residency::Hot };
+        // Phase 8: use registry demote() so hot_pair_to_id stays consistent.
+        if dto.residency == 1 {
+            chunks.demote(id);
+        }
     }
 
     let mut predictions = PredictionStore::new();

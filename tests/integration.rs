@@ -1,6 +1,6 @@
 /// Integration tests covering AC-01 through AC-13 (v0.1) + T-01 through T-18 (v0.2)
 /// + RT/TL/CR/HI/EV/SS tests (v0.3) + RS tests (v0.4) + GEN-LOOP tests (P0)
-/// + REP tests (Phase B) + EXP tests (Phase C).
+/// + REP tests (Phase B) + EXP tests (Phase C) + FAC tests (Phase E) + TRF tests (Phase F).
 use syntrail_lm::model::ModelState;
 use syntrail_lm::persistence;
 use syntrail_lm::primitives::PrimitiveRegistry;
@@ -1582,4 +1582,117 @@ fn fac04_wa_reuse_detected_across_subject_noun_pairs() {
         reuse >= 2,
         "FAC-04: は should have right-reuse ≥ 2 in 犬は/猫は/私は contexts; got {reuse}"
     );
+}
+
+// ── TRF tests: Phase F Transform/Identity separation ──────────────────────
+
+// ── TRF-01: EquivalentView merges identities ──────────────────────────────
+#[test]
+fn trf01_equivalent_view_merges_identities() {
+    use syntrail_lm::identity::IdentityStore;
+    use syntrail_lm::transform::{TransformKind, TransformStore};
+    let mut ids = IdentityStore::new();
+    let a = ids.intern_identity(&[1]);
+    let b = ids.intern_identity(&[2]);
+    let mut ts = TransformStore::new();
+    ts.register(a, b, TransformKind::EquivalentView, &mut ids);
+    assert_eq!(ids.canonical(a), ids.canonical(b),
+        "TRF-01: EquivalentView must merge identity roots");
+}
+
+// ── TRF-02: Mapping does NOT merge identities ─────────────────────────────
+#[test]
+fn trf02_mapping_does_not_merge_identities() {
+    use syntrail_lm::identity::IdentityStore;
+    use syntrail_lm::transform::{TransformKind, TransformStore};
+    let mut ids = IdentityStore::new();
+    let a = ids.intern_identity(&[1]);
+    let b = ids.intern_identity(&[2]);
+    let mut ts = TransformStore::new();
+    ts.register(a, b, TransformKind::Mapping, &mut ids);
+    assert_ne!(ids.canonical(a), ids.canonical(b),
+        "TRF-02: Mapping must NOT merge identity roots");
+}
+
+// ── TRF-03: value and evidence start at 0.0 ───────────────────────────────
+#[test]
+fn trf03_value_evidence_default_zero() {
+    use syntrail_lm::identity::IdentityStore;
+    use syntrail_lm::transform::{TransformKind, TransformStore};
+    let mut ids = IdentityStore::new();
+    let a = ids.intern_identity(&[1]);
+    let b = ids.intern_identity(&[2]);
+    let mut ts = TransformStore::new();
+    let tid = ts.register(a, b, TransformKind::Mapping, &mut ids);
+    let t = ts.get(tid).unwrap();
+    assert_eq!(t.value, 0.0, "TRF-03: value must start at 0.0");
+    assert_eq!(t.evidence, 0.0, "TRF-03: evidence must start at 0.0");
+}
+
+// ── TRF-04: value and evidence can be set ─────────────────────────────────
+#[test]
+fn trf04_value_evidence_can_be_updated() {
+    use syntrail_lm::identity::IdentityStore;
+    use syntrail_lm::transform::{TransformKind, TransformStore};
+    let mut ids = IdentityStore::new();
+    let a = ids.intern_identity(&[1]);
+    let b = ids.intern_identity(&[2]);
+    let mut ts = TransformStore::new();
+    let tid = ts.register(a, b, TransformKind::Mapping, &mut ids);
+    ts.get_mut(tid).unwrap().value = 2.5;
+    ts.get_mut(tid).unwrap().evidence = 0.9;
+    let t = ts.get(tid).unwrap();
+    assert!((t.value - 2.5).abs() < 1e-9, "TRF-04: value update must persist");
+    assert!((t.evidence - 0.9).abs() < 1e-9, "TRF-04: evidence update must persist");
+}
+
+// ── TRF-05: Inverse is a derived transform with no merge ──────────────────
+#[test]
+fn trf05_inverse_does_not_merge() {
+    use syntrail_lm::identity::IdentityStore;
+    use syntrail_lm::transform::{TransformKind, TransformStore};
+    let mut ids = IdentityStore::new();
+    let a = ids.intern_identity(&[1]);
+    let b = ids.intern_identity(&[2]);
+    let mut ts = TransformStore::new();
+    let fwd = ts.register(a, b, TransformKind::Mapping, &mut ids);
+    let canon_a_before = ids.canonical(a);
+    let canon_b_before = ids.canonical(b);
+    let _inv = ts.inverse(fwd).unwrap();
+    // Inverse derivation must not trigger any new merge.
+    assert_eq!(ids.canonical(a), canon_a_before, "TRF-05: inverse must not change canonical(a)");
+    assert_eq!(ids.canonical(b), canon_b_before, "TRF-05: inverse must not change canonical(b)");
+}
+
+// ── TRF-06: Composed is a derived transform with no merge ─────────────────
+#[test]
+fn trf06_composed_does_not_merge() {
+    use syntrail_lm::identity::IdentityStore;
+    use syntrail_lm::transform::{TransformKind, TransformStore};
+    let mut ids = IdentityStore::new();
+    let a = ids.intern_identity(&[10]);
+    let b = ids.intern_identity(&[20]);
+    let c = ids.intern_identity(&[30]);
+    let mut ts = TransformStore::new();
+    let f = ts.register(a, b, TransformKind::Mapping, &mut ids);
+    let g = ts.register(b, c, TransformKind::Mapping, &mut ids);
+    let _h = ts.compose(f, g).unwrap();
+    // a, b, c should all have distinct canonical roots.
+    assert_ne!(ids.canonical(a), ids.canonical(c),
+        "TRF-06: composed transform must not merge endpoints");
+}
+
+// ── TRF-07: EquivalentView kind is reflected in stored transform ──────────
+#[test]
+fn trf07_equivalent_view_kind_stored() {
+    use syntrail_lm::identity::IdentityStore;
+    use syntrail_lm::transform::{TransformKind, TransformStore};
+    let mut ids = IdentityStore::new();
+    let a = ids.intern_identity(&[1]);
+    let b = ids.intern_identity(&[2]);
+    let mut ts = TransformStore::new();
+    let tid = ts.register(a, b, TransformKind::EquivalentView, &mut ids);
+    let t = ts.get(tid).unwrap();
+    assert!(matches!(t.kind, TransformKind::EquivalentView),
+        "TRF-07: stored kind must be EquivalentView");
 }

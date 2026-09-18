@@ -1,32 +1,40 @@
 /// Phase 12: Transform / Inverse / Composition.
 ///
-/// A Transform is a directed relation `f: IdentityA → IdentityB` asserting
-/// that the two Identities are equivalent under some mapping.  Registering a
-/// Transform calls `IdentityStore::merge_identities` so that both ends share
-/// a canonical IdentityId.
+/// A Transform is a directed relation `f: IdentityA → IdentityB`.
 ///
-/// Inverses and compositions are derived lazily:
-///   inverse(f: A→B)            = g: B→A
-///   compose(f: A→B, g: B→C)   = h: A→C  (only when f.target == g.source)
+/// Phase F (§17): TransformKind controls whether Identity merge is allowed.
+///   - EquivalentView: the two Identities are the same content seen differently → merge allowed
+///   - Mapping: a directional transform (e.g., singular→plural) → no merge
+///   - Inverse / Composed: derived transforms → no merge
 ///
-/// Derived transforms (inverse / composition results) are stored in the same
-/// table and carry a `DerivedFrom` tag so callers can distinguish them from
-/// directly registered transforms.
+/// Only EquivalentView triggers merge_identities. Mapping and derived kinds
+/// record the relation without collapsing the two Identities.
 use std::collections::HashMap;
 
 use crate::identity::{IdentityId, IdentityStore};
 
 pub type TransformId = u32;
 
-/// How a Transform was created.
+/// Phase F: classification of transform semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransformOrigin {
-    /// Registered directly by the caller.
-    Direct,
+pub enum TransformKind {
+    /// The two Identities are equivalent views of the same Content.
+    /// Registering this kind triggers merge_identities(source, target).
+    EquivalentView,
+    /// A directional mapping (e.g., inflection, derivation).
+    /// Does NOT trigger merge_identities.
+    Mapping,
     /// Derived as the inverse of another Transform.
     Inverse(TransformId),
     /// Derived as the composition of two Transforms.
     Composed(TransformId, TransformId),
+}
+
+impl TransformKind {
+    /// Whether this kind allows merging the two Identity endpoints.
+    pub fn allows_merge(&self) -> bool {
+        matches!(self, TransformKind::EquivalentView)
+    }
 }
 
 /// A single Transform edge: `source → target`.
@@ -35,7 +43,11 @@ pub struct Transform {
     pub id: TransformId,
     pub source: IdentityId,
     pub target: IdentityId,
-    pub origin: TransformOrigin,
+    pub kind: TransformKind,
+    /// Accumulated transform value (e.g., log-ratio, distance). Updated by callers.
+    pub value: f64,
+    /// Evidence/confidence weight for this transform. Updated by callers.
+    pub evidence: f64,
 }
 
 /// Registry of all Transforms.
@@ -53,24 +65,27 @@ impl TransformStore {
         Self::default()
     }
 
-    /// Register a direct Transform `source → target`.
+    /// Register a direct Transform `source → target` with the given kind.
     ///
-    /// Also calls `identities.merge_identities(source, target)` so that the
-    /// two Identities share a canonical root (Phase 11 integration).
+    /// Calls `identities.merge_identities(source, target)` ONLY when
+    /// `kind == EquivalentView` (§17 fix: no unconditional merge).
     ///
     /// Returns the existing TransformId if the pair was already registered.
     pub fn register(
         &mut self,
         source: IdentityId,
         target: IdentityId,
+        kind: TransformKind,
         identities: &mut IdentityStore,
     ) -> TransformId {
         if let Some(&tid) = self.by_pair.get(&(source, target)) {
             return tid;
         }
-        identities.merge_identities(source, target);
+        if kind.allows_merge() {
+            identities.merge_identities(source, target);
+        }
         let id = self.transforms.len() as TransformId;
-        self.transforms.push(Transform { id, source, target, origin: TransformOrigin::Direct });
+        self.transforms.push(Transform { id, source, target, kind, value: 0.0, evidence: 0.0 });
         self.by_pair.insert((source, target), id);
         id
     }
@@ -92,7 +107,9 @@ impl TransformStore {
             id: inv_id,
             source: tgt,
             target: src,
-            origin: TransformOrigin::Inverse(tid),
+            kind: TransformKind::Inverse(tid),
+            value: 0.0,
+            evidence: 0.0,
         });
         self.by_pair.insert((tgt, src), inv_id);
         Some(inv_id)
@@ -121,7 +138,9 @@ impl TransformStore {
             id: cid,
             source: f_src,
             target: g_tgt,
-            origin: TransformOrigin::Composed(f, g),
+            kind: TransformKind::Composed(f, g),
+            value: 0.0,
+            evidence: 0.0,
         });
         self.by_pair.insert((f_src, g_tgt), cid);
         Some(cid)
@@ -130,6 +149,11 @@ impl TransformStore {
     /// Look up a Transform by id.
     pub fn get(&self, tid: TransformId) -> Option<&Transform> {
         self.transforms.get(tid as usize)
+    }
+
+    /// Mutable access to a Transform by id (for updating value/evidence).
+    pub fn get_mut(&mut self, tid: TransformId) -> Option<&mut Transform> {
+        self.transforms.get_mut(tid as usize)
     }
 
     /// Find an existing Transform by (source, target) pair.
@@ -162,26 +186,34 @@ mod tests {
     #[test]
     fn tr01_register_direct() {
         let (mut ts, mut ids) = store_with_identities();
-        let tid = ts.register(0, 1, &mut ids);
+        let tid = ts.register(0, 1, TransformKind::Mapping, &mut ids);
         let t = ts.get(tid).unwrap();
         assert_eq!(t.source, 0);
         assert_eq!(t.target, 1);
-        assert_eq!(t.origin, TransformOrigin::Direct);
+        assert!(matches!(t.kind, TransformKind::Mapping));
     }
 
     #[test]
-    fn tr02_register_merges_identities() {
+    fn tr02_equivalent_view_merges_identities() {
         let (mut ts, mut ids) = store_with_identities();
-        ts.register(0, 1, &mut ids);
-        // After registering 0→1, their canonical ids must be the same.
+        ts.register(0, 1, TransformKind::EquivalentView, &mut ids);
+        // EquivalentView triggers merge_identities.
         assert_eq!(ids.canonical(0), ids.canonical(1));
+    }
+
+    #[test]
+    fn tr02b_mapping_does_not_merge_identities() {
+        let (mut ts, mut ids) = store_with_identities();
+        ts.register(0, 1, TransformKind::Mapping, &mut ids);
+        // Mapping must NOT merge.
+        assert_ne!(ids.canonical(0), ids.canonical(1));
     }
 
     #[test]
     fn tr03_register_idempotent() {
         let (mut ts, mut ids) = store_with_identities();
-        let t1 = ts.register(0, 1, &mut ids);
-        let t2 = ts.register(0, 1, &mut ids);
+        let t1 = ts.register(0, 1, TransformKind::Mapping, &mut ids);
+        let t2 = ts.register(0, 1, TransformKind::Mapping, &mut ids);
         assert_eq!(t1, t2);
         assert_eq!(ts.transform_count(), 1);
     }
@@ -189,18 +221,18 @@ mod tests {
     #[test]
     fn tr04_inverse_derives_reverse() {
         let (mut ts, mut ids) = store_with_identities();
-        let fwd = ts.register(0, 1, &mut ids);
+        let fwd = ts.register(0, 1, TransformKind::Mapping, &mut ids);
         let inv = ts.inverse(fwd).unwrap();
         let t = ts.get(inv).unwrap();
         assert_eq!(t.source, 1);
         assert_eq!(t.target, 0);
-        assert_eq!(t.origin, TransformOrigin::Inverse(fwd));
+        assert!(matches!(t.kind, TransformKind::Inverse(f) if f == fwd));
     }
 
     #[test]
     fn tr05_inverse_idempotent() {
         let (mut ts, mut ids) = store_with_identities();
-        let fwd = ts.register(0, 1, &mut ids);
+        let fwd = ts.register(0, 1, TransformKind::Mapping, &mut ids);
         let inv1 = ts.inverse(fwd).unwrap();
         let inv2 = ts.inverse(fwd).unwrap();
         assert_eq!(inv1, inv2);
@@ -210,28 +242,28 @@ mod tests {
     #[test]
     fn tr06_compose_connects_chain() {
         let (mut ts, mut ids) = store_with_identities();
-        let f = ts.register(0, 1, &mut ids); // 0→1
-        let g = ts.register(1, 2, &mut ids); // 1→2
+        let f = ts.register(0, 1, TransformKind::Mapping, &mut ids);
+        let g = ts.register(1, 2, TransformKind::Mapping, &mut ids);
         let h = ts.compose(f, g).unwrap();
         let t = ts.get(h).unwrap();
         assert_eq!(t.source, 0);
         assert_eq!(t.target, 2);
-        assert_eq!(t.origin, TransformOrigin::Composed(f, g));
+        assert!(matches!(t.kind, TransformKind::Composed(a, b) if a == f && b == g));
     }
 
     #[test]
     fn tr07_compose_fails_on_gap() {
         let (mut ts, mut ids) = store_with_identities();
-        let f = ts.register(0, 1, &mut ids); // 0→1
-        let g = ts.register(0, 2, &mut ids); // 0→2 (not 1→2)
+        let f = ts.register(0, 1, TransformKind::Mapping, &mut ids);
+        let g = ts.register(0, 2, TransformKind::Mapping, &mut ids);
         assert!(ts.compose(f, g).is_none());
     }
 
     #[test]
     fn tr08_compose_idempotent() {
         let (mut ts, mut ids) = store_with_identities();
-        let f = ts.register(0, 1, &mut ids);
-        let g = ts.register(1, 2, &mut ids);
+        let f = ts.register(0, 1, TransformKind::Mapping, &mut ids);
+        let g = ts.register(1, 2, TransformKind::Mapping, &mut ids);
         let h1 = ts.compose(f, g).unwrap();
         let h2 = ts.compose(f, g).unwrap();
         assert_eq!(h1, h2);
@@ -240,20 +272,39 @@ mod tests {
     #[test]
     fn tr09_find_by_pair() {
         let (mut ts, mut ids) = store_with_identities();
-        let tid = ts.register(0, 2, &mut ids);
+        let tid = ts.register(0, 2, TransformKind::Mapping, &mut ids);
         assert_eq!(ts.find(0, 2), Some(tid));
         assert_eq!(ts.find(2, 0), None);
     }
 
     #[test]
     fn tr10_inverse_of_direct_is_direct() {
-        // Registering B→A directly, then asking for inverse of A→B should
-        // return the existing B→A Transform (not create a new one).
         let (mut ts, mut ids) = store_with_identities();
-        let fwd = ts.register(0, 1, &mut ids); // 0→1
-        let rev = ts.register(1, 0, &mut ids); // 1→0 (already direct)
+        let fwd = ts.register(0, 1, TransformKind::Mapping, &mut ids);
+        let rev = ts.register(1, 0, TransformKind::Mapping, &mut ids);
         let inv = ts.inverse(fwd).unwrap();
-        assert_eq!(inv, rev); // same id
+        assert_eq!(inv, rev);
         assert_eq!(ts.transform_count(), 2);
+    }
+
+    #[test]
+    fn tr11_value_and_evidence_start_at_zero() {
+        let (mut ts, mut ids) = store_with_identities();
+        let tid = ts.register(0, 1, TransformKind::Mapping, &mut ids);
+        let t = ts.get(tid).unwrap();
+        assert_eq!(t.value, 0.0);
+        assert_eq!(t.evidence, 0.0);
+    }
+
+    #[test]
+    fn tr12_value_evidence_can_be_updated() {
+        let (mut ts, mut ids) = store_with_identities();
+        let tid = ts.register(0, 1, TransformKind::Mapping, &mut ids);
+        let t = ts.get_mut(tid).unwrap();
+        t.value = 1.5;
+        t.evidence = 0.8;
+        let t = ts.get(tid).unwrap();
+        assert!((t.value - 1.5).abs() < 1e-9);
+        assert!((t.evidence - 0.8).abs() < 1e-9);
     }
 }

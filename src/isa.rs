@@ -381,8 +381,8 @@ mod tests {
         ids.intern_identity(&[1]);
         ids.intern_identity(&[2]);
         ids.intern_identity(&[3]);
-        let f = ts.register(0, 1, &mut ids);
-        let g = ts.register(1, 2, &mut ids);
+        let f = ts.register(0, 1, crate::transform::TransformKind::Mapping, &mut ids);
+        let g = ts.register(1, 2, crate::transform::TransformKind::Mapping, &mut ids);
         let mut vm = Vm::new(&mut chunks, &mut preds, &mut ids, &lin, &mut ts);
         vm.exec(&Instruction::RelInv     { tid: f, out: 0 });
         vm.exec(&Instruction::RelCompose { f,  g,  out: 1 });

@@ -3,7 +3,6 @@
 /// AppHandle owns a Session (model + history DB) and a model file path.
 /// CLI and GUI both call the methods here; neither duplicates Core logic.
 use std::error::Error;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -12,6 +11,7 @@ use crate::feedback::{FeedbackSign, FeedbackSource};
 use crate::model::ModelState;
 use crate::persistence;
 use crate::session::Session;
+use crate::trace::now_secs;
 
 // ── Analytics ─────────────────────────────────────────────────────────────
 
@@ -94,14 +94,47 @@ impl AppHandle {
         self.session.feedback(turn_id, sign, FeedbackSource::User, None)
     }
 
-    /// Save model to `self.model_path`.
-    pub fn save_model(&self) -> io::Result<()> {
-        persistence::save(&self.session.model, &self.model_path)
+    /// Quick-save to `self.model_path` (extension-aware).
+    pub fn save_model(&self) -> Result<(), Box<dyn Error>> {
+        self.save_model_to(&self.model_path.clone())
     }
 
-    /// Load model from `path` and update `self.model_path`.
+    /// Save As: write to `path` (json or db/sqlite) and update `self.model_path`.
+    pub fn save_model_to(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("db") | Some("sqlite") => {
+                let db = Database::open(&path.to_string_lossy())?;
+                let snap = persistence::to_snapshot(&self.session.model);
+                let json = serde_json::to_string(&snap)?;
+                let fp = self.session.model.state_fingerprint();
+                db.insert_snapshot(None, self.session.model.tick, &fp, &json, now_secs())?;
+            }
+            _ => {
+                persistence::save(&self.session.model, path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load model from `path` (json or db/sqlite) and update `self.model_path`.
     pub fn load_model(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
-        self.session.model = persistence::load(path)?;
+        self.load_model_from(path)
+    }
+
+    /// Extension-aware load; updates `self.model_path` on success.
+    pub fn load_model_from(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("db") | Some("sqlite") => {
+                let db = Database::open(&path.to_string_lossy())?;
+                let json = db.load_latest_snapshot_json()?
+                    .ok_or("no snapshot found in database")?;
+                let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
+                self.session.model = persistence::from_snapshot(snap);
+            }
+            _ => {
+                self.session.model = persistence::load(path)?;
+            }
+        }
         self.model_path = path.to_path_buf();
         self.last_decision_count = 0;
         self.last_output_len = 0;

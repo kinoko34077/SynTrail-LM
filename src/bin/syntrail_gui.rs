@@ -15,7 +15,7 @@ const DEFAULT_REFRESH: u32 = 5;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 660.0])
+            .with_inner_size([1000.0, 680.0])
             .with_title("SynTrail-LM")
             .with_drag_and_drop(true),
         ..Default::default()
@@ -34,33 +34,57 @@ fn main() -> eframe::Result<()> {
 
 fn setup_fonts(ctx: &egui::Context) {
     let candidates: &[&str] = &[
-        // Windows
         r"C:\Windows\Fonts\YuGothR.ttc",
         r"C:\Windows\Fonts\meiryo.ttc",
         r"C:\Windows\Fonts\msgothic.ttc",
         r"C:\Windows\Fonts\msmincho.ttc",
-        // macOS
         "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        // Linux
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/takao-gothic/TakaoPGothic.ttf",
     ];
-
-    let Some(font_data) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
-        return; // no CJK font found; Latin-only fallback
+    let Some(data) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
     };
-
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "cjk".to_owned(),
-        egui::FontData::from_owned(font_data),
-    );
-    // Append after the default Latin font so Latin glyphs stay sharp
+    fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(data));
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts.families.entry(family).or_default().push("cjk".to_owned());
     }
     ctx.set_fonts(fonts);
+}
+
+// ── File dialogs ──────────────────────────────────────────────────────────
+
+fn open_load_dialog(current: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("モデルを開く")
+        .add_filter("SynTrail JSON", &["json"])
+        .add_filter("SynTrail DB (snapshot)", &["db", "sqlite"])
+        .add_filter("すべてのファイル", &["*"])
+        .set_directory(parent_of(current))
+        .pick_file()
+}
+
+fn open_save_dialog(current: &str) -> Option<PathBuf> {
+    let cur = PathBuf::from(current);
+    let name = cur.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("model.json");
+    rfd::FileDialog::new()
+        .set_title("名前を付けて保存")
+        .add_filter("SynTrail JSON", &["json"])
+        .add_filter("SynTrail DB (snapshot)", &["db", "sqlite"])
+        .set_file_name(name)
+        .set_directory(parent_of(current))
+        .save_file()
+}
+
+fn parent_of(path_str: &str) -> PathBuf {
+    PathBuf::from(path_str)
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 // ── Data types ────────────────────────────────────────────────────────────
@@ -79,12 +103,13 @@ enum FeedbackState {
 enum Action {
     None,
     New,
-    Load,
+    OpenLoadDialog,
     Save,
-    Send,
+    OpenSaveDialog,
     Feedback(i64, FeedbackSign),
     RefreshAnalytics,
     LoadPath(PathBuf),
+    Send,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────
@@ -98,13 +123,11 @@ struct SynTrailApp {
     refresh_interval: u32,
     turns_since_refresh: u32,
     status: String,
-    model_path_input: String,
 }
 
 impl SynTrailApp {
     fn new() -> Self {
         let model_path = PathBuf::from(DEFAULT_MODEL);
-        let model_path_input = model_path.display().to_string();
         let handle = AppHandle::new(model_path, DEFAULT_HISTORY)
             .unwrap_or_else(|e| panic!("Failed to init AppHandle: {e}"));
         let chat_history = load_history_entries(&handle);
@@ -118,7 +141,6 @@ impl SynTrailApp {
             refresh_interval: DEFAULT_REFRESH,
             turns_since_refresh: 0,
             status: "Ready".to_string(),
-            model_path_input,
         }
     }
 
@@ -126,8 +148,7 @@ impl SynTrailApp {
         let input = self.input.trim().to_string();
         if input.is_empty() { return; }
         self.input.clear();
-        // Previous pending feedback is silently skipped — no button press needed.
-        self.feedback_state = FeedbackState::None;
+        self.feedback_state = FeedbackState::None; // auto-skip prior feedback
         self.chat_history.push(ChatEntry { is_user: true, text: input.clone() });
 
         match self.handle.generate_turn(&input) {
@@ -162,9 +183,8 @@ impl SynTrailApp {
     }
 
     fn do_load(&mut self, path: PathBuf) {
-        match self.handle.load_model(&path) {
+        match self.handle.load_model_from(&path) {
             Ok(()) => {
-                self.model_path_input = path.display().to_string();
                 self.analytics = self.handle.get_analytics();
                 self.status = format!("Loaded: {}", path.display());
             }
@@ -175,6 +195,16 @@ impl SynTrailApp {
     fn do_save(&mut self) {
         match self.handle.save_model() {
             Ok(()) => self.status = format!("Saved: {}", self.handle.model_path.display()),
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    fn do_save_as(&mut self, path: PathBuf) {
+        match self.handle.save_model_to(&path) {
+            Ok(()) => {
+                self.handle.model_path = path.clone();
+                self.status = format!("Saved: {}", path.display());
+            }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
@@ -204,29 +234,30 @@ impl eframe::App for SynTrailApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut action = Action::None;
 
-        // ── File drag-and-drop (model .json) ─────────────────────────────
+        // File drag-and-drop (.json or .db)
         ctx.input(|i| {
             for file in &i.raw.dropped_files {
                 if let Some(path) = &file.path {
-                    if path.extension().map_or(false, |e| e == "json") {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if matches!(ext, "json" | "db" | "sqlite") {
                         action = Action::LoadPath(path.clone());
                     }
                 }
             }
         });
 
+        // Current model path for display
+        let model_path_str = self.handle.model_path.display().to_string();
+
         // ── Top toolbar ───────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("New").clicked()  { action = Action::New; }
-                if ui.button("Load").clicked() { action = Action::Load; }
-                if ui.button("Save").clicked() { action = Action::Save; }
+                if ui.button("New").clicked()      { action = Action::New; }
+                if ui.button("Open…").clicked()    { action = Action::OpenLoadDialog; }
+                if ui.button("Save").clicked()     { action = Action::Save; }
+                if ui.button("Save As…").clicked() { action = Action::OpenSaveDialog; }
                 ui.separator();
-                ui.label("Model:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.model_path_input)
-                        .desired_width(180.0),
-                );
+                ui.label(egui::RichText::new(&model_path_str).small().weak());
                 ui.separator();
                 let a = &self.analytics;
                 ui.label(format!(
@@ -240,7 +271,6 @@ impl eframe::App for SynTrailApp {
         egui::TopBottomPanel::bottom("input_panel")
             .min_height(110.0)
             .show(ctx, |ui| {
-                // Status + feedback buttons (○/× — no skip button; just send next msg)
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&self.status).small());
                     if let FeedbackState::Pending(tid) = self.feedback_state {
@@ -261,8 +291,6 @@ impl eframe::App for SynTrailApp {
                     }
                 });
                 ui.separator();
-
-                // Input + Send
                 ui.horizontal(|ui| {
                     let avail = ui.available_width();
                     let response = ui.add(
@@ -287,7 +315,6 @@ impl eframe::App for SynTrailApp {
             .show(ctx, |ui| {
                 ui.heading("Analytics");
                 ui.separator();
-
                 egui::ScrollArea::vertical()
                     .id_salt("analytics_scroll")
                     .show(ui, |ui| {
@@ -320,7 +347,6 @@ impl eframe::App for SynTrailApp {
                             ui.label("Positive FB");     ui.label(a.pos_feedback_count.to_string()); ui.end_row();
                             ui.label("Negative FB");     ui.label(a.neg_feedback_count.to_string()); ui.end_row();
                         });
-
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("Refresh /");
@@ -333,7 +359,7 @@ impl eframe::App for SynTrailApp {
                     });
             });
 
-        // ── Central chat panel (scrollable, selectable text) ─────────────
+        // ── Central chat panel ────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("chat_scroll")
@@ -347,11 +373,7 @@ impl eframe::App for SynTrailApp {
                         };
                         ui.horizontal_wrapped(|ui| {
                             ui.colored_label(color, prefix);
-                            ui.add(
-                                egui::Label::new(&entry.text)
-                                    .selectable(true)
-                                    .wrap(),
-                            );
+                            ui.add(egui::Label::new(&entry.text).selectable(true).wrap());
                         });
                         ui.add_space(3.0);
                     }
@@ -360,17 +382,25 @@ impl eframe::App for SynTrailApp {
 
         // ── Deferred action dispatch ──────────────────────────────────────
         match action {
-            Action::None             => {}
-            Action::New              => self.do_new(),
-            Action::Load             => {
-                let path = PathBuf::from(&self.model_path_input);
-                self.do_load(path);
-            }
-            Action::Save             => self.do_save(),
-            Action::Send             => self.send_message(),
+            Action::None => {}
+            Action::New  => self.do_new(),
+            Action::Save => self.do_save(),
+            Action::Send => self.send_message(),
             Action::Feedback(id, s)  => self.do_feedback(id, s),
             Action::RefreshAnalytics => self.analytics = self.handle.get_analytics(),
             Action::LoadPath(path)   => self.do_load(path),
+
+            // File dialogs — blocking native dialog; runs after frame is rendered
+            Action::OpenLoadDialog => {
+                if let Some(path) = open_load_dialog(&model_path_str) {
+                    self.do_load(path);
+                }
+            }
+            Action::OpenSaveDialog => {
+                if let Some(path) = open_save_dialog(&model_path_str) {
+                    self.do_save_as(path);
+                }
+            }
         }
     }
 }

@@ -13,6 +13,7 @@ use crate::lineage::LineageStore;
 use crate::prediction::PredictionStore;
 use crate::relation::{RelationKind, RelationStore};
 use crate::primitives::PrimitiveRegistry;
+use crate::representation::RepresentationStore;
 use crate::segmentation::{expand, segment};
 use crate::trace::{DecisionStep, TraceId, TurnTrace, now_secs};
 use crate::units::UnitId;
@@ -91,6 +92,8 @@ pub struct ModelState {
     pub lineage: LineageStore,
     /// Phase 7: Unified Relation Core — Route + Adjacency + DerivedFrom in one store.
     pub relations: RelationStore,
+    /// Phase B: Representation Lineage — acquisition history of representations per Identity.
+    pub representations: RepresentationStore,
     pub tick: u64,
     pub(crate) merge_candidates: HashMap<(UnitId, UnitId), u32>,
     /// Phase 10: unique preceding contexts for each merge candidate — drives diversity bonus.
@@ -131,7 +134,8 @@ impl ModelState {
             }
         }
 
-        self.predictions.learn_sequence_at(&segmented, tick);
+        // Phase C: Experience path — updates both practice_confidence AND external_route_evidence.
+        self.predictions.learn_sequence_external_at(&segmented, tick);
         self.metrics.total_decisions += segmented.len() as u64;
         self.metrics.total_characters += prim_ids.len() as u64;
 
@@ -152,6 +156,8 @@ impl ModelState {
         // Phase 2: register the Identity (canonical prim seq) and this View (chunk tree).
         let identity_id = self.identities.intern_identity(&prim_ids);
         self.identities.intern_view(&segmented, identity_id);
+        // Phase B: register this segmentation as a Representation for the Identity.
+        self.representations.intern(identity_id, segmented.clone(), tick);
 
         self.consider_merges(&segmented, tick);
     }
@@ -196,6 +202,9 @@ impl ModelState {
         // prim_ids here came from encode_existing, so only already-registered chars.
         let identity_id = self.identities.intern_identity(&prim_ids);
         self.identities.intern_view(&segmented, identity_id);
+        // Phase B: Replay can acquire a new Representation (e.g., when a chunk has
+        // just formed and segmentation changes). external_occurrence is NOT updated.
+        self.representations.intern(identity_id, segmented.clone(), tick);
 
         self.consider_merges(&segmented, tick);
     }
@@ -601,6 +610,7 @@ impl ModelState {
         identities: IdentityStore,
         lineage: LineageStore,
         relations: RelationStore,
+        representations: RepresentationStore,
         tick: u64,
         merge_candidates: HashMap<(UnitId, UnitId), u32>,
         metrics: Metrics,
@@ -614,6 +624,7 @@ impl ModelState {
             identities,
             lineage,
             relations,
+            representations,
             tick,
             merge_candidates,
             merge_context_diversity: HashMap::new(), // not persisted; rebuilt during training

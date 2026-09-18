@@ -112,6 +112,11 @@ impl IdentityStore {
         self.identity_prims.get(identity as usize).map(Vec::as_slice)
     }
 
+    /// Look up an existing IdentityId for `prims` without inserting (read-only).
+    pub fn find_identity(&self, prims: &[PrimitiveId]) -> Option<IdentityId> {
+        self.prim_seq_to_id.get(prims).copied()
+    }
+
     pub fn identity_count(&self) -> usize {
         self.identity_prims.len()
     }

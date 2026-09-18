@@ -10,6 +10,7 @@ pub mod identity;
 pub mod lineage;
 pub mod model;
 pub mod relation;
+pub mod representation;
 pub mod transform;
 pub mod isa;
 pub mod core;

@@ -22,6 +22,7 @@ use crate::model::{Metrics, ModelState};
 use crate::relation::RelationStore;
 use crate::prediction::{PredictionEdge, PredictionStore};
 use crate::primitives::PrimitiveRegistry;
+use crate::representation::{RepresentationEntry, RepresentationStore};
 use crate::tier::Tier;
 use crate::trace::TraceId;
 use crate::units::UnitId;
@@ -123,6 +124,9 @@ struct PredictionEdgeDto {
     /// Phase 9: tick of last update for lazy decay.
     #[serde(default)]
     last_used_tick: u64,
+    /// Phase C: external route evidence — only updated by Experience, not Replay.
+    #[serde(default)]
+    external_route_evidence: f32,
 }
 
 impl From<&PredictionEdge> for PredictionEdgeDto {
@@ -136,6 +140,34 @@ impl From<&PredictionEdge> for PredictionEdgeDto {
             feedback_count: e.feedback_count,
             avoidance: e.avoidance as f32,
             last_used_tick: e.last_used_tick,
+            external_route_evidence: e.external_route_evidence as f32,
+        }
+    }
+}
+
+/// Phase B: Representation Lineage entry DTO.
+#[derive(Serialize, Deserialize)]
+struct RepresentationEntryDto {
+    rep_id: u32,
+    identity_id: u32,
+    units: Vec<UnitIdDto>,
+    acquired_at: u64,
+    practice_count: u32,
+    confidence: f32,
+    #[serde(default)]
+    predecessor_rep_id: Option<u32>,
+}
+
+impl From<&RepresentationEntry> for RepresentationEntryDto {
+    fn from(e: &RepresentationEntry) -> Self {
+        Self {
+            rep_id: e.rep_id,
+            identity_id: e.identity_id,
+            units: e.units.iter().copied().map(UnitIdDto::from).collect(),
+            acquired_at: e.acquired_at,
+            practice_count: e.practice_count,
+            confidence: e.confidence,
+            predecessor_rep_id: e.predecessor_rep_id,
         }
     }
 }
@@ -221,6 +253,9 @@ pub struct ModelSnapshot {
     /// Phase 11: Union-Find parent array for Cross-View Identity merges.
     #[serde(default)]
     identity_parent: Vec<u32>,
+    /// Phase B: Representation Lineage entries.
+    #[serde(default)]
+    representation_entries: Vec<RepresentationEntryDto>,
 }
 
 fn default_top_k() -> usize { 32 }
@@ -316,6 +351,8 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         .collect();
 
     let identity_parent: Vec<u32> = model.identities.all_parents().to_vec();
+    let representation_entries: Vec<RepresentationEntryDto> =
+        model.representations.iter_all().map(RepresentationEntryDto::from).collect();
 
     ModelSnapshot {
         version: "0.5".to_owned(),
@@ -333,6 +370,7 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         views,
         lineage_entries,
         identity_parent,
+        representation_entries,
     }
 }
 
@@ -373,6 +411,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         edge.feedback_count = dto.feedback_count;
         edge.avoidance = dto.avoidance as f64;
         edge.last_used_tick = dto.last_used_tick;
+        edge.external_route_evidence = dto.external_route_evidence as f64;
     }
 
     let mut merge_candidates: HashMap<(UnitId, UnitId), u32> = HashMap::new();
@@ -411,6 +450,27 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
     // Phase 7: RelationStore is derived from other stores; rebuilt on use after load.
     let relations = RelationStore::new();
 
+    // Phase B: restore Representation Lineage.
+    // Legacy snapshots have no entries — no synthetic history is created (REP-07).
+    let representation_bulk: Vec<RepresentationEntry> = snap.representation_entries
+        .into_iter()
+        .map(|d| {
+            let units: Vec<UnitId> = d.units.into_iter().map(UnitId::from).collect();
+            let mut entry = RepresentationEntry {
+                rep_id: d.rep_id,
+                identity_id: d.identity_id,
+                units,
+                acquired_at: d.acquired_at,
+                practice_count: d.practice_count,
+                confidence: d.confidence,
+                predecessor_rep_id: d.predecessor_rep_id,
+            };
+            entry.practice_count = d.practice_count; // redundant but explicit
+            entry
+        })
+        .collect();
+    let representations = RepresentationStore::from_bulk(representation_bulk);
+
     ModelState::from_parts(
         primitives,
         chunks,
@@ -419,6 +479,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         identities,
         lineage,
         relations,
+        representations,
         snap.tick,
         merge_candidates,
         Metrics {

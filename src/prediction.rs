@@ -16,13 +16,23 @@ use crate::chunks::STRENGTH_DECAY;
 pub const PREDICTION_REWARD: f64 = 1.0;
 
 /// A single directed prediction edge: context → next_unit.
+///
 /// Phase 9: last_used_tick enables lazy decay.
+/// Phase C (spec §15): external_route_evidence and usage_strength (practice_confidence) are separate.
+///   - external_route_evidence: updated ONLY by Experience (expose_external).
+///     Represents "how often this transition was observed in the real world."
+///   - usage_strength (practice_confidence): updated by both Experience AND Replay.
+///     Represents "how well-practiced this route is."
 #[derive(Debug, Clone)]
 pub struct PredictionEdge {
     pub context: UnitId,
     pub next_unit: UnitId,
     pub use_count: u32,
+    /// Practice confidence — updated by both Experience and Replay.
     pub usage_strength: f64,
+    /// External Route Evidence — updated ONLY by Experience (expose_external).
+    /// Never modified by Replay. Represents real-world observation frequency.
+    pub external_route_evidence: f64,
     pub last_used_tick: u64,
     pub feedback_value: f64,
     pub feedback_count: u32,
@@ -36,6 +46,7 @@ impl PredictionEdge {
             next_unit,
             use_count: 0,
             usage_strength: 0.0,
+            external_route_evidence: 0.0,
             last_used_tick: 0,
             feedback_value: 0.0,
             feedback_count: 0,
@@ -128,6 +139,8 @@ impl PredictionStore {
 
     // ── Public API ────────────────────────────────────────────────────────
 
+    /// Record an edge usage from Replay (practice only): updates usage_strength.
+    /// Does NOT update external_route_evidence.
     pub fn observe_at(&mut self, context: UnitId, next_unit: UnitId, tick: u64) {
         let idx = if let Some(&i) = self.edge_index.get(&(context, next_unit)) {
             i
@@ -141,6 +154,19 @@ impl PredictionStore {
         self.observe_at(context, next_unit, 0);
     }
 
+    /// Record an edge from an external Experience: updates BOTH usage_strength
+    /// AND external_route_evidence. Only call from expose_external paths.
+    pub fn observe_external_at(&mut self, context: UnitId, next_unit: UnitId, tick: u64) {
+        let idx = if let Some(&i) = self.edge_index.get(&(context, next_unit)) {
+            i
+        } else {
+            self.insert_new(context, next_unit)
+        };
+        self.edges[idx].record_usage_at(tick);
+        self.edges[idx].external_route_evidence += 1.0;
+    }
+
+    /// Update practice_confidence only (Replay path). Does not touch external_route_evidence.
     pub fn learn_sequence_at(&mut self, units: &[UnitId], tick: u64) {
         for window in units.windows(2) {
             self.observe_at(window[0], window[1], tick);
@@ -149,6 +175,13 @@ impl PredictionStore {
 
     pub fn learn_sequence(&mut self, units: &[UnitId]) {
         self.learn_sequence_at(units, 0);
+    }
+
+    /// Update both practice_confidence AND external_route_evidence (Experience path).
+    pub fn learn_sequence_external_at(&mut self, units: &[UnitId], tick: u64) {
+        for window in units.windows(2) {
+            self.observe_external_at(window[0], window[1], tick);
+        }
     }
 
     /// Return candidates for the next unit given `context`, ranked by score.

@@ -1,12 +1,15 @@
-/// Phase 3: Representation Lineage.
+/// Structural Lineage — Chunk formation tree.
 ///
-/// Every Chunk was derived from two parent UnitIds.  LineageStore records
-/// that derivation explicitly so Phase 4 Fallback can walk the acquisition
-/// history in reverse without touching ChunkRegistry internals.
+/// Records how each Chunk was formed from two parent UnitIds.
+/// This is STRUCTURAL lineage (composition tree), NOT Representation Lineage.
+///
+/// Distinction (per spec §9 / §10):
+///   Structural Lineage: Chunk ABC → left=AB, right=C (§9)
+///   Representation Lineage: Content X had representations R0→R1→R2 over time (§10, representation.rs)
 ///
 /// Derivation edge: child_chunk → (left, right).
-/// The full decomposition path (R2 → R1 → R0 → Primitives) is obtained by
-/// recursively following parents until only Primitives remain.
+/// Used by Fallback (Phase 4) to decompose chunks back to their components
+/// when a higher-granularity route fails.
 use std::collections::HashMap;
 
 use crate::units::{ChunkId, UnitId};

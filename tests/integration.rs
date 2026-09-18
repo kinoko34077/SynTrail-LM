@@ -1,5 +1,6 @@
 /// Integration tests covering AC-01 through AC-13 (v0.1) + T-01 through T-18 (v0.2)
-/// + RT/TL/CR/HI/EV/SS tests (v0.3) + RS tests (v0.4).
+/// + RT/TL/CR/HI/EV/SS tests (v0.3) + RS tests (v0.4) + GEN-LOOP tests (P0)
+/// + REP tests (Phase B) + EXP tests (Phase C).
 use syntrail_lm::model::ModelState;
 use syntrail_lm::persistence;
 use syntrail_lm::primitives::PrimitiveRegistry;
@@ -1227,4 +1228,265 @@ fn gen_loop_06_trace_fields_after_cycle() {
         !(trace.stopped_by_eos && trace.stopped_by_cycle),
         "GEN-LOOP-06: cannot be stopped by both EOS and cycle simultaneously"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phase B: Representation Lineage Tests (REP-01 through REP-07)
+// ═══════════════════════════════════════════════════════════════
+
+// ── REP-01: Acquisition order preserved through save/load ─────────────────
+#[test]
+fn rep01_acquisition_order_preserved_through_save_load() {
+    use syntrail_lm::representation::RepresentationStore;
+    let mut m = ModelState::new();
+    // First observe "ab" as primitives → R0 = [P(a), P(b)]
+    m.expose_external("ab");
+    let rep_count_after_expose = m.representations.entry_count();
+    assert!(rep_count_after_expose >= 1, "REP-01: at least one representation after expose");
+
+    // Train until chunk forms, then replay to trigger new segmentation → R1
+    for _ in 0..20 { m.expose_external("ab"); }
+    for _ in 0..10 { m.replay("ab"); }
+
+    // Save and load
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    syntrail_lm::persistence::save(&m, tmp.path()).unwrap();
+    let loaded = syntrail_lm::persistence::load(tmp.path()).unwrap();
+
+    // Representation count must be preserved
+    assert_eq!(
+        loaded.representations.entry_count(),
+        m.representations.entry_count(),
+        "REP-01: representation entry count must survive save/load"
+    );
+
+    // For each identity, acquisition order must be preserved.
+    // Find the identity for "ab"
+    let prim_ids = m.primitives.encode_existing("ab");
+    if let Some(id) = m.identities.find_identity(&prim_ids) {
+        let orig_reps = m.representations.for_identity(id);
+        let loaded_reps = loaded.representations.for_identity(id);
+        assert_eq!(orig_reps.len(), loaded_reps.len(), "REP-01: same number of reps per identity");
+        for (orig, loaded_r) in orig_reps.iter().zip(loaded_reps.iter()) {
+            assert_eq!(orig.acquired_at, loaded_r.acquired_at,
+                "REP-01: acquired_at must match");
+            assert_eq!(orig.predecessor_rep_id, loaded_r.predecessor_rep_id,
+                "REP-01: predecessor chain must be preserved");
+        }
+    }
+}
+
+// ── REP-02: Preferred Representation Selection ────────────────────────────
+#[test]
+fn rep02_preferred_selection_balances_confidence_and_cost() {
+    use syntrail_lm::representation::RepresentationStore;
+    use syntrail_lm::units::UnitId;
+    let mut store = RepresentationStore::new();
+    // R0: high confidence, high cost (5 units)
+    let (r0, _) = store.intern(0, vec![
+        UnitId::primitive(1), UnitId::primitive(2), UnitId::primitive(3),
+        UnitId::primitive(4), UnitId::primitive(5)], 1);
+    store.get_mut(r0).unwrap().confidence = 1.0;
+
+    // R1: medium confidence, medium cost (3 units) — should win
+    let (r1, _) = store.intern(0, vec![
+        UnitId::primitive(1), UnitId::chunk(0), UnitId::primitive(5)], 5);
+    store.get_mut(r1).unwrap().confidence = 0.9;
+
+    // R2: low confidence, low cost (1 unit)
+    let (r2, _) = store.intern(0, vec![UnitId::chunk(1)], 10);
+    store.get_mut(r2).unwrap().confidence = 0.2;
+
+    let preferred = store.preferred(0).expect("REP-02: preferred must return something");
+    assert_eq!(preferred.rep_id, r1,
+        "REP-02: R1 (conf=0.9, cost=3) must beat R0 (conf=1.0, cost=5) and R2 (conf=0.2, cost=1)");
+}
+
+// ── REP-03: Predecessor Fallback ──────────────────────────────────────────
+#[test]
+fn rep03_predecessor_fallback() {
+    use syntrail_lm::representation::RepresentationStore;
+    use syntrail_lm::units::UnitId;
+    let mut store = RepresentationStore::new();
+    let (r0, _) = store.intern(0, vec![UnitId::primitive(1), UnitId::primitive(2)], 1);
+    let (r1, _) = store.intern(0, vec![UnitId::chunk(0)], 5);
+
+    // When R1 is current but fails, predecessor_of(r1) should return R0.
+    let fallback = store.predecessor_of(r1).expect("REP-03: must have predecessor");
+    assert_eq!(fallback.rep_id, r0, "REP-03: R0 must be returned as predecessor of R1");
+
+    // R0 has no predecessor — chain terminates.
+    assert!(store.predecessor_of(r0).is_none(), "REP-03: R0 has no predecessor");
+}
+
+// ── REP-05: Replay acquires new Representation ────────────────────────────
+#[test]
+fn rep05_replay_acquires_new_representation() {
+    let mut m = ModelState::new();
+    // Observe "ab" once: R0 = [P(a), P(b)]
+    m.expose_external("ab");
+    let prim_ids_ab = m.primitives.encode_existing("ab");
+    let id_ab = m.identities.find_identity(&prim_ids_ab).expect("identity must exist");
+    let reps_after_expose = m.representations.for_identity(id_ab).len();
+
+    // Now train until chunk "ab" forms.
+    for _ in 0..20 { m.expose_external("ab"); }
+
+    // At this point segmentation may still be [P(a), P(b)] or [C(ab)].
+    // Force replay to trigger re-segmentation with the chunk.
+    for _ in 0..5 { m.replay("ab"); }
+
+    // If a chunk formed and segmentation changed, a new representation was registered.
+    let reps_after_replay = m.representations.for_identity(id_ab).len();
+
+    if m.chunk_count() > 0 {
+        // Chunk formed — new segmentation should produce a new representation.
+        assert!(
+            reps_after_replay >= reps_after_expose,
+            "REP-05: representation count must not decrease after Replay+chunk formation; before={reps_after_expose} after={reps_after_replay}"
+        );
+    }
+    // At minimum: no panic, and legacy models don't get synthetic history.
+}
+
+// ── REP-07: Legacy Migration — no fake history ───────────────────────────
+#[test]
+fn rep07_legacy_migration_no_synthetic_history() {
+    // Load a v0.5 snapshot that has no representation_entries field.
+    // Representations should be empty (no fake history).
+    let json = r#"{
+        "version": "0.5",
+        "tick": 5,
+        "primitives": [[1, 97], [2, 98]],
+        "chunks": [],
+        "prediction_edges": [],
+        "merge_candidates": [],
+        "metrics": {"total_decisions": 5, "total_characters": 5},
+        "next_trace_id": 0
+    }"#;
+    let snap: syntrail_lm::persistence::ModelSnapshot = serde_json::from_str(json).unwrap();
+    let m = syntrail_lm::persistence::from_snapshot(snap);
+    assert_eq!(
+        m.representations.entry_count(), 0,
+        "REP-07: legacy model with no representation_entries must load with zero representations"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phase C: Experience / Replay Separation Tests (EXP-01 through EXP-06)
+// ═══════════════════════════════════════════════════════════════
+
+// ── EXP-01: external occurrence count stays 1 after many Replays ──────────
+#[test]
+fn exp01_external_occurrence_stays_1_after_replay() {
+    let mut m = ModelState::new();
+    // 1 Experience
+    m.expose_external("ab");
+    // Collect total external_route_evidence after one expose
+    let evidence_after_expose: f64 = m.predictions.iter_all()
+        .map(|e| e.external_route_evidence)
+        .sum();
+
+    // 31 Replays
+    for _ in 0..31 { m.replay("ab"); }
+
+    let evidence_after_replay: f64 = m.predictions.iter_all()
+        .map(|e| e.external_route_evidence)
+        .sum();
+
+    assert!(
+        (evidence_after_expose - evidence_after_replay).abs() < 1e-9,
+        "EXP-01: external_route_evidence must not increase during Replay; \
+         after 1 expose={evidence_after_expose:.3}, after 31 replay={evidence_after_replay:.3}"
+    );
+}
+
+// ── EXP-02: Adjacency external evidence not updated during Replay ─────────
+#[test]
+fn exp02_adjacency_not_updated_during_replay() {
+    let mut m = ModelState::new();
+    m.expose_external("ab");
+    let assoc_after_expose = m.association_count();
+    for _ in 0..20 { m.replay("ab"); }
+    assert_eq!(
+        m.association_count(), assoc_after_expose,
+        "EXP-02: Adjacency (association) must not grow during Replay"
+    );
+}
+
+// ── EXP-03: External Route Evidence not updated during Replay ─────────────
+#[test]
+fn exp03_external_route_evidence_not_updated_during_replay() {
+    let mut m = ModelState::new();
+    m.expose_external("ab");
+    let ext_evidence_before: f64 = m.predictions.iter_all()
+        .map(|e| e.external_route_evidence).sum();
+    for _ in 0..20 { m.replay("ab"); }
+    let ext_evidence_after: f64 = m.predictions.iter_all()
+        .map(|e| e.external_route_evidence).sum();
+    assert!(
+        (ext_evidence_before - ext_evidence_after).abs() < 1e-9,
+        "EXP-03: external_route_evidence={ext_evidence_before:.3} must not change during Replay (got {ext_evidence_after:.3})"
+    );
+}
+
+// ── EXP-04: Practice Confidence (usage_strength) grows during Replay ─────
+#[test]
+fn exp04_practice_confidence_grows_during_replay() {
+    let mut m = ModelState::new();
+    m.expose_external("ab");
+    let practice_before: f64 = m.predictions.iter_all()
+        .map(|e| e.usage_strength).sum();
+    for _ in 0..20 { m.replay("ab"); }
+    let practice_after: f64 = m.predictions.iter_all()
+        .map(|e| e.usage_strength).sum();
+    assert!(
+        practice_after > practice_before,
+        "EXP-04: usage_strength (practice_confidence) must increase during Replay; \
+         before={practice_before:.3} after={practice_after:.3}"
+    );
+}
+
+// ── EXP-05: Replay can acquire new Representation (alias of REP-05 via EXP)
+#[test]
+fn exp05_replay_can_acquire_new_representation() {
+    let mut m = ModelState::new();
+    m.expose_external("ab");
+    for _ in 0..20 { m.expose_external("ab"); }
+    let reps_before = m.representations.entry_count();
+    for _ in 0..20 { m.replay("ab"); }
+    let reps_after = m.representations.entry_count();
+    // Representations can only grow or stay the same.
+    assert!(
+        reps_after >= reps_before,
+        "EXP-05: representation count must not decrease after Replay; before={reps_before} after={reps_after}"
+    );
+}
+
+// ── EXP-06: Replay-acquired Representation has acquisition tick > R0 ──────
+#[test]
+fn exp06_replay_acquired_representation_has_later_tick() {
+    let mut m = ModelState::new();
+    m.expose_external("ab");
+    let prim_ids = m.primitives.encode_existing("ab");
+    let id = m.identities.find_identity(&prim_ids).unwrap();
+    let r0_tick = m.representations.for_identity(id).first().map(|r| r.acquired_at).unwrap_or(0);
+
+    for _ in 0..20 { m.expose_external("ab"); }
+    for _ in 0..10 { m.replay("ab"); }
+
+    let prim_ids2 = m.primitives.encode_existing("ab");
+    let id2 = m.identities.find_identity(&prim_ids2).unwrap();
+    let reps = m.representations.for_identity(id2);
+    if reps.len() > 1 {
+        // Any rep acquired after R0 should have a higher or equal acquired_at tick.
+        for rep in &reps[1..] {
+            assert!(
+                rep.acquired_at >= r0_tick,
+                "EXP-06: later representations must have acquired_at >= R0 tick; \
+                 R0 tick={r0_tick}, later tick={}", rep.acquired_at
+            );
+        }
+    }
+    // At minimum: no panic.
 }

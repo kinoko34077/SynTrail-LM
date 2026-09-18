@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use syntrail_lm::app::{load_model_file, model_analytics, save_model_file, Analytics};
+use syntrail_lm::desktop::file_ops::FileCommand;
 use syntrail_lm::eval::evaluate_sample_frozen;
 use syntrail_lm::model::ModelState;
 use syntrail_lm::trainer::adaptive::{decide_level_change, BlockLevel};
@@ -16,6 +17,9 @@ use syntrail_lm::trainer::dataset::Dataset;
 use syntrail_lm::trainer::scheduler::{CheckpointOutcome, TrainingScheduler};
 use syntrail_lm::trainer::splitter::BlockSplitter;
 use syntrail_lm::trainer::state::{TrainerState, TrainerStatus};
+
+#[cfg(all(target_os = "windows", feature = "gui"))]
+use syntrail_lm::desktop::platform::windows::NativeMenu;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -372,6 +376,8 @@ struct TrainerApp {
     loaded_dataset: Option<Dataset>,
     // Detected existing trainer state
     resume_state: Option<Result<TrainerState, String>>,
+    #[cfg(all(target_os = "windows", feature = "gui"))]
+    native_menu: NativeMenu,
 }
 
 impl TrainerApp {
@@ -388,6 +394,8 @@ impl TrainerApp {
             loaded_model: None,
             loaded_dataset: None,
             resume_state: None,
+            #[cfg(all(target_os = "windows", feature = "gui"))]
+            native_menu: NativeMenu::build(),
         }
     }
 
@@ -563,6 +571,80 @@ impl TrainerApp {
 impl eframe::App for TrainerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
+
+        // Native menu: attach on first frame, then poll each frame (§88–94)
+        #[cfg(all(target_os = "windows", feature = "gui"))]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let training_active_menu = matches!(&self.state, AppState::Running | AppState::Paused);
+            if let Ok(handle) = _frame.window_handle() {
+                if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                    let hwnd = h.hwnd.get() as isize;
+                    let _ = unsafe { self.native_menu.attach(hwnd) };
+                }
+            }
+            if let Some(cmd) = self.native_menu.poll() {
+                match cmd {
+                    FileCommand::New => {
+                        if !training_active_menu {
+                            self.loaded_model = None;
+                            self.loaded_dataset = None;
+                            self.resume_state = None;
+                            self.state = AppState::Idle;
+                            self.status_msg = "Ready for new model and dataset.".to_owned();
+                        } else {
+                            self.status_msg = "Stop training before starting new session.".to_owned();
+                        }
+                    }
+                    FileCommand::Open => {
+                        if !training_active_menu {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .set_title("モデルを開く")
+                                .add_filter("Model files", &["json", "db", "sqlite"])
+                                .pick_file()
+                            {
+                                self.model_path = p.to_string_lossy().to_string();
+                                self.try_load_model();
+                            }
+                        } else {
+                            self.status_msg = "Stop training before opening a new model.".to_owned();
+                        }
+                    }
+                    FileCommand::Save => {
+                        let p = PathBuf::from(&self.model_path);
+                        if let Some(m) = &self.loaded_model {
+                            match save_model_file(m, &p) {
+                                Ok(()) => self.status_msg = format!("Saved: {}", p.display()),
+                                Err(e) => self.status_msg = format!("Save failed: {e}"),
+                            }
+                        }
+                    }
+                    FileCommand::SaveAs => {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .set_title("名前を付けて保存")
+                            .add_filter("Model JSON", &["json"])
+                            .save_file()
+                        {
+                            if let Some(m) = &self.loaded_model {
+                                match save_model_file(m, &p) {
+                                    Ok(()) => {
+                                        self.model_path = p.to_string_lossy().to_string();
+                                        self.status_msg = format!("Saved: {}", p.display());
+                                    }
+                                    Err(e) => self.status_msg = format!("Save failed: {e}"),
+                                }
+                            }
+                        }
+                    }
+                    FileCommand::LoadPath(p) => {
+                        if !training_active_menu {
+                            self.model_path = p.to_string_lossy().to_string();
+                            self.try_load_model();
+                        }
+                    }
+                }
+            }
+        }
 
         // D&D: block changes while Running or Paused (§108)
         let training_active = matches!(&self.state, AppState::Running | AppState::Paused);

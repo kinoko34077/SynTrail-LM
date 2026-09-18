@@ -11,7 +11,7 @@ Unicode スカラー値を最小単位として、頻出パターンを自動的
 # CLI のみ（依存が軽い）
 cargo build --release
 
-# GUI 込み（eframe/egui が追加される）
+# GUI 込み（eframe/egui + muda が追加される）
 cargo build --release --features gui
 ```
 
@@ -29,10 +29,10 @@ cargo build --release --features gui
 
 | ファイル | 内容 | 備考 |
 |---------|------|------|
-| `model.json` | モデル状態（チャンク・予測エッジ・連想エッジ） | CLI `--model`、GUI の Model 欄で変更可 |
+| `model.json` | モデル状態（チャンク・予測エッジ・連想エッジ） | CLI `--model`、GUI で変更可 |
 | `history.sqlite` | GUI の会話履歴 | モデルとは独立。削除してもモデルは変わらない |
 | `syntrail.db` | CLI chat コマンドのセッション DB | CLI 専用 |
-| `<dataset>.syntrail-trainer.json` | Trainer の学習進捗 | モデルとは別ファイル。Pause/Resume に使用 |
+| `<dataset>.syntrail-trainer.json` | Trainer の学習進捗 | Pause/Resume に使用 |
 
 ---
 
@@ -44,29 +44,35 @@ cargo build --release --features gui
 cargo run --release --features gui --bin syntrail-gui
 ```
 
-または、ビルド済みバイナリなら:
-
-```bash
-./target/release/syntrail-gui
-```
-
 カレントディレクトリに `model.json` があれば自動で読み込む。なければ空のモデルで起動する。
+
+### Windows Native Menu / キーボードショートカット
+
+| 操作 | 内容 |
+|------|------|
+| `Ctrl+N` | 空のモデルを新規作成 |
+| `Ctrl+O` | ファイルを開く |
+| `Ctrl+S` | 現在のパスへ保存 |
+| `Ctrl+Shift+S` | 名前を付けて保存 |
+
+メニューバーの `File` からも同じ操作が可能。ツールバーの New / Open… / Save / Save As… ボタンとすべて同一コマンド経路。
 
 ### 画面構成
 
 ```
-┌─ New / Load / Save ─ Model: model.json ─ Gen: 0  HOT: 0  dpc: 0.0000 ─┐
-├────────────────────────────────────┬───────────────────────────────────┤
-│                                    │ Analytics                         │
-│  チャット履歴（スクロール）          │  Generation  0                    │
-│                                    │  Primitive   0                    │
-│  User:  入力テキスト                │  Chunk       0                    │
-│  Model: 生成テキスト                │  HOT / SLEEP 0 / 0                │
-│                                    │  …                                │
-│                                    │  [Refresh / 5 turns] [Update Now] │
-├──────────── ステータス ── [skip][○][×] ────────────────────────────────┤
-│  [入力テキスト（複数行）]                                    [Send]      │
-└────────────────────────────────────────────────────────────────────────┘
+┌─ File ─────────────────────────────────────────────────────────┐  ← Native Menu
+├─ New / Open… / Save / Save As… ─ model.json ─ Gen/Chunk/dpc ─┤  ← Toolbar
+├──────────────────────────────┬────────────────────────────────┤
+│                              │ Analytics                      │
+│  チャット履歴（スクロール）    │  Generation  0                 │
+│                              │  Chunk       0 (HOT:0)        │
+│  User:  入力テキスト          │  dpc         0.000000         │
+│  Model: 生成テキスト          │  Last Out Chars  0            │
+│                              │  …                            │
+│                              │  [Refresh / 5] [Update Now]   │
+├────── ステータス ── [○][×] ──────────────────────────────────┤
+│  [入力テキスト（複数行）]                            [Send]    │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### 操作手順
@@ -74,39 +80,24 @@ cargo run --release --features gui --bin syntrail-gui
 **会話する**
 
 1. 下の入力欄にテキストを入力する
-2. `Send` ボタンを押す（または `Enter` キー）
+2. `Send` ボタンまたは `Enter` キー
 3. `Shift+Enter` で入力欄内の改行
 
-**フィードバックを付ける**
+**フィードバック**
 
-- 返答後にステータス行の右側に `○` `×` `skip` が出る
-- `○` = ポジティブ（+1）
-- `×` = ネガティブ（−1）
-- `skip` または何も押さず次の入力 = フィードバックなしで次ターンへ
-
-フィードバックは最新ターンの予測エッジと強度値に反映される。
-
-**モデルの操作**
-
-| ボタン | 動作 |
-|--------|------|
-| `New` | 空のモデルを新規作成（未保存状態） |
-| `Load` | `Model:` 欄のパスから JSON を読み込む |
-| `Save` | `Model:` 欄のパスへ JSON として保存する |
-
-`Model:` 欄のパスは直接入力で変更できる。
+- 返答後にステータス行の右側に `○` `×` が出る
+- `○` = ポジティブ（+1）、`×` = ネガティブ（−1）
+- 何も押さず次の入力 = フィードバックなし
 
 **Analytics パネル**
 
-右パネルに現在のモデル状態を数値一覧で表示する。
-
+- `Last Out Chars` = 直前出力の Unicode 文字数（バイト数ではない）
 - `Refresh / N turns` のスライダーで N ターンごとに自動更新（デフォルト 5）
-- `Update Now` で即時更新
 
 **履歴の永続化**
 
 - 会話履歴は `history.sqlite` に自動保存される
-- アプリを再起動すると直近 60 ターン分が画面に復元される
+- アプリ再起動で直近 60 ターン分を画面に復元
 
 ---
 
@@ -119,31 +110,12 @@ syntrail train --input <ファイル> [--model <パス>] [--hot-budget N]
 ```
 
 - 既存モデルがあれば追加学習する。なければ新規作成。
-- `--model` デフォルト: `model.json`
-- `--hot-budget N`: 学習後に HOT チャンクを N 個以内に絞る（弱いものを SLEEP に降格）。`0`（デフォルト）は無制限。
-
-```bash
-syntrail train --input corpus.txt
-syntrail train --input corpus.txt --hot-budget 500
-```
-
-学習中は 1000 行ごとに進捗を stderr へ出力:
-
-```
-[1000/5000] primitives=87 chunks=142(HOT=142 SLEEP=0) edges=1204 dpc=0.8312
-```
+- `--hot-budget N`: 学習後に HOT チャンクを N 個以内に絞る。`0`（デフォルト）は無制限。
 
 ### generate — テキスト生成
 
 ```bash
 syntrail generate --seed <テキスト> [--model <パス>] [--max-units N]
-```
-
-- `--seed` を起点にして予測エッジを辿って生成する
-- `--max-units` デフォルト: 50
-
-```bash
-syntrail generate --seed "hello"
 ```
 
 ### inspect — モデル統計の表示
@@ -152,36 +124,10 @@ syntrail generate --seed "hello"
 syntrail inspect [--model <パス>]
 ```
 
-出力例:
-
-```
-Model file    : model.json
-Primitives    : 87
-Chunks        : 142 (HOT=130 SLEEP=12)
-Pred. edges   : 1204
-Assoc. edges  : 840
-Tick          : 204
-Total chars   : 58320
-Total decisions: 42110
-dpc           : 0.721824
-Chunk tiers   : T0=38 T1=71 T2=33
-```
-
 ### evaluate — dpc 計測（モデル変更なし）
 
 ```bash
 syntrail evaluate --input <ファイル> [--model <パス>]
-```
-
-モデルを一切変更しない読み取り専用評価（Frozen Evaluation）。
-
-```
-Lines evaluated    : 500
-Characters         : 24000
-Decisions          : 18120
-dpc                : 0.755000
-Pred. accuracy     : 0.6312
-Correct / total    : 11432/18120
 ```
 
 ### recall — 連想記憶の検索
@@ -190,31 +136,16 @@ Correct / total    : 11432/18120
 syntrail recall --unit <テキスト> [--model <パス>] [--limit N]
 ```
 
-指定テキストの最初のユニットに対して、AssociationStore から Top-K 関連ユニットを表示する。直接の関連がない場合はチャンクを展開して階層的にフォールバックする。`--limit` デフォルト: 8。
-
-```bash
-syntrail recall --unit "hello"
-```
-
-出力例:
-
-```
-Associations for "hello" (top 8):
-  " world"  strength=3.8120
-  "!"       strength=1.2041
-  ...
-```
-
 ### chat — 1 ターン会話
 
 ```bash
 syntrail chat --input <テキスト> [--db <DBパス>] [--model <パス>]
 ```
 
-生成（frozen） → 入力を expose → DB に記録、の順で実行。`--db` デフォルト: `syntrail.db`。
+### feedback — 過去のターンにフィードバックを付与
 
 ```bash
-syntrail chat --input "hello"
+syntrail feedback --turn-id <N> --sign <+|-|1|-1> [--db <DBパス>]
 ```
 
 ---
@@ -231,85 +162,48 @@ cargo run --release --features gui --bin syntrail-trainer
 
 ### 使い方
 
-1. **Model** — `model.json`（または `.db`/`.sqlite`）を Open、または D&D で読み込む
-2. **Dataset** — `.txt` ファイルを Open、または D&D で読み込む（UTF-8 または Shift_JIS）
-3. **Start** を押すと学習開始
+1. **Model** — `.json` / `.db` / `.sqlite` を Open またはD&D
+2. **Dataset** — `.txt` ファイルを Open またはD&D（UTF-8 / Shift_JIS 自動判定）
+3. **Start** で学習開始
 
-### テキスト投入と改行込みExposure
+Windows では `File` メニューと `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S` が使用可能。
 
-- `.txt` ファイルは CRLF/CR → LF に正規化する
-- 原文を複数行（デフォルト 4 行 / 800 文字）のブロックに分割
-- `\n` を含む 1 ブロック全体を `ModelState::expose()` に渡す（改行も Primitive として学習対象）
-- `concat(blocks) == normalized_source` が常に成立（文字欠落なし）
+### Pause / Resume
+
+| ボタン | 動作 |
+|--------|------|
+| **Pause** | 即時保存して一時停止。既存 worker は保持。 |
+| **Resume** | 停止中の既存 worker を再開（`TrainerCommand::Resume` 送信）。 |
+| **Resume Saved** | 保存済み TrainerState から新規 worker を起動（アプリ再起動後の再開）。 |
+| **Stop** | 保存して worker を終了。 |
+
+- Pause→Resume は同セッション内のみ。アプリを終了した場合は Resume Saved を使う。
+- dataset または model の fingerprint が一致しない場合は Resume Saved は失敗する。
 
 ### Adaptive 反復（同一ブロック）
 
-チェックポイント: 4 → 8 → 16 → 32 回。最低 8 回、最大 32 回。
+チェックポイント: 4 → 8 → 16 → 32 回。
 
 | 評価タイミング | 判断基準 | 動作 |
 |---|---|---|
 | 4 回目 | 常に継続 | → 8 回へ |
-| 8 回目 | 4 回時との dpc 改善率 ≥ 2% | → 16 回へ、それ以外終了 |
-| 16 回目 | 8 回時との dpc 改善率 ≥ 1% | → 32 回へ、それ以外終了 |
+| 8 回目 | dpc 改善率 ≥ 2% | → 16 回へ、それ以外終了 |
+| 16 回目 | dpc 改善率 ≥ 1% | → 32 回へ、それ以外終了 |
 | 32 回目 | 常に終了 | ブロック完了 |
 
 ### Block サイズ自動調整
 
-直近 8 ブロックの pre-dpc（expose 前の評価値）と反復数の中央値で判断：
+直近 8 ブロックの pre-dpc と反復数中央値で判断（S / M / L / XL）。
 
-- `median(pre_dpc) ≤ 0.70 かつ median(repeats) ≤ 8` → 1 段階拡大（S→M→L→XL）
-- `median(pre_dpc) ≥ 0.90 かつ median(repeats) ≥ 16` → 1 段階縮小
-- それ以外 → 維持
+### Experience / Replay 分離
 
-### Pause / Resume
+- **First pass**: `expose_external()` — 新規テキストとして扱う
+- **Subsequent passes**: `replay()` — 内部ルート強化のみ（外部ルートバイアスなし）
 
-- **Pause** でモデルとTrainer進捗を即時保存して一時停止
-- アプリ終了後も同じ位置から **Resume** 可能
-- DatasetまたはModelが変更された場合（フィンガープリント不一致）は自動再開しない
+### D&D
 
-### ファイルの独立性
-
-- モデル（`model.json` 等）と学習進捗（`<dataset名>.syntrail-trainer.json`）は別ファイル
-- Trainer を使わなくても Chat GUI や CLI でモデルを読み書き可能
-- Chat GUI とモデル互換（`.json` / `.db` / `.sqlite` すべて対応）
-
-stderr に `[turn_id=N decisions=M tick=K]` を出力する。
-
-### feedback — 過去のターンにフィードバックを付与
-
-```bash
-syntrail feedback --turn-id <N> --sign <+|-|1|-1> [--db <DBパス>]
-```
-
-- `--sign +` / `1` / `+1`: ポジティブ（R = +1.0）
-- `--sign -` / `-1`: ネガティブ（R = −1.0）
-
-```bash
-syntrail feedback --turn-id 3 --sign +
-syntrail feedback --turn-id 5 --sign -1
-```
-
-### snapshot — モデル状態を DB に保存
-
-```bash
-syntrail snapshot [--db <DBパス>] [--model <JSONパス>]
-```
-
-`--model` を指定すると JSON ファイルにも同時保存する。
-
-### restore — スナップショットから復元
-
-```bash
-syntrail restore --snapshot-id <N> [--db <DBパス>] [--model <JSONパス>]
-```
-
-### history — 会話履歴の表示
-
-```bash
-syntrail history [--limit N] [--db <DBパス>]
-```
-
-デフォルトで直近 20 ターンを表示する。
+- Running / Paused 中はモデル/データセットの差し替えをブロックする（状態破壊防止）
+- 複数ファイルの同時ドロップはエラー表示
 
 ---
 
@@ -318,22 +212,22 @@ syntrail history [--limit N] [--db <DBパス>]
 | 項目 | 説明 |
 |------|------|
 | Generation | 現セッションのターン数 |
-| Tick | expose() 呼び出し累計（学習量の目安） |
-| Primitive | 登録済みの Unicode スカラー数（語彙サイズ相当） |
-| Chunk | 形成されたチャンク総数 |
-| HOT | セグメント対象のアクティブチャンク数 |
-| SLEEP | 構造レジストリのみに存在する休止チャンク数 |
-| Association | 共起関連エッジ総数（AssociationStore） |
-| Route (edges) | 予測エッジ総数（生成の多様性の目安） |
+| Tick | expose() 呼び出し累計 |
+| Primitive | Unicode スカラー数（語彙サイズ相当） |
+| Chunk | チャンク総数 |
+| HOT | アクティブチャンク数（セグメント対象） |
+| SLEEP | 休止チャンク数 |
+| Association | 共起関連エッジ総数 |
+| Route (edges) | 予測エッジ総数 |
 | T0 / T1 / T2 | チャンクのティア分布 |
-| Avg Exp Len | チャンクの平均展開長（1 チャンク = 何文字相当か） |
+| Avg Exp Len | チャンクの平均展開長（文字数） |
 | Total Chars | 累計入力文字数 |
 | Total Decisions | 累計決定回数 |
 | dpc | `decisions / characters`。学習が進むと下がる。目標: < 1.0 |
 | Last Decisions | 直前ターンの決定回数 |
-| Last Out Len | 直前ターンの出力文字数 |
-| Positive FB | セッション内のポジティブフィードバック累計 |
-| Negative FB | セッション内のネガティブフィードバック累計 |
+| Last Out Chars | 直前ターンの出力 Unicode 文字数 |
+| Positive FB | ポジティブフィードバック累計 |
+| Negative FB | ネガティブフィードバック累計 |
 
 ---
 
@@ -343,11 +237,14 @@ syntrail history [--limit N] [--db <DBパス>]
 |------|------|
 | **Primitive** | Unicode スカラー値 1 個。削除不可の最小単位。 |
 | **Chunk** | 二分合成 `(left, right)`。再帰的・可変長の再利用可能単位。 |
-| **HOT** | セグメント対象のアクティブ状態。`--hot-budget` で上限を設定できる。 |
-| **SLEEP** | セグメント対象外の休止状態。同じ `(left, right)` ペアが再出現すると自動復帰。 |
+| **HOT** | セグメント対象のアクティブ状態。 |
+| **SLEEP** | セグメント対象外の休止状態。再出現で自動復帰。 |
 | **dpc** | `decisions / characters`。主要評価指標。 |
-| **AssociationStore** | 共起 Top-K メモリ。`recall` コマンドで参照できる。 |
-| **Frozen Evaluation** | `evaluate` コマンドはモデルを変更しない読み取り専用評価。 |
+| **Experience** | 新規テキストの expose（外部ルートバイアスあり）。 |
+| **Replay** | 既学習テキストの再 expose（内部ルート強化のみ）。 |
+| **AssociationStore** | 共起 Top-K メモリ。`recall` コマンドで参照。 |
+| **Frozen Evaluation** | モデルを変更しない読み取り専用評価。 |
+| **TransformKind** | EquivalentView / Mapping / Inverse / Composed。EquivalentView のみ Identity を統合。 |
 
 ---
 
@@ -355,29 +252,38 @@ syntrail history [--limit N] [--db <DBパス>]
 
 ```
 src/
-├── lib.rs            クレートルート
-├── main.rs           CLI
-├── app.rs            Application API（CLI/GUI 共通）
+├── lib.rs                クレートルート
+├── main.rs               CLI
+├── app.rs                Application API（CLI/GUI 共通）
 ├── bin/
-│   └── syntrail_gui.rs  GUI バイナリ（--features gui）
-├── config.rs         Config（hot_budget 含む全チューナブル）
-├── trace.rs          TurnTrace / DecisionStep
-├── feedback.rs       FeedbackSign / credit distribution
-├── db.rs             SQLite Database
-├── session.rs        Session（ModelState + Database + Config）
-├── primitives.rs     PrimitiveRegistry
-├── units.rs          UnitId（タグ付き u32）
-├── tier.rs           Tier（T0/T1/T2）
-├── chunks.rs         Chunk + ChunkRegistry（Residency: Hot/Sleep）
-├── prediction.rs     PredictionEdge（avoidance）+ PredictionStore
-├── segmentation.rs   segment() / expand()（HOT チャンクのみ）
-├── association.rs    AssociationStore（共起 Top-K）
-├── eval.rs           evaluate_frozen()
-├── model.rs          ModelState（enforce_hot_budget 含む）
-└── persistence.rs    JSON 永続化 v0.4（v0.1〜v0.3 後方互換）
+│   ├── syntrail_gui.rs   Chat GUI（--features gui）
+│   └── syntrail_trainer.rs  Trainer GUI（--features gui）
+├── desktop/              OS/Desktop 共通層（--features gui）
+│   ├── file_ops.rs       FileKind / FileCommand / DocumentState
+│   ├── dialogs.rs        rfd ファイルダイアログ
+│   ├── drop.rs           DropRouter（D&D 分類）
+│   ├── fonts.rs          CJK フォント設定
+│   └── platform/
+│       └── windows.rs    Windows Native Menu（muda）
+├── trainer/              Trainer ロジック
+│   ├── adaptive.rs       Adaptive Block Level
+│   ├── dataset.rs        Dataset（UTF-8 / Shift_JIS 読み込み）
+│   ├── scheduler.rs      TrainingScheduler（checkpoint 判定）
+│   ├── splitter.rs       BlockSplitter
+│   └── state.rs          TrainerState（Pause/Resume 状態）
+├── config.rs             Config（hot_budget 含む全チューナブル）
+├── model.rs              ModelState（merge_right_reuse, enforce_hot_budget）
+├── transform.rs          TransformStore / TransformKind
+├── representation.rs     RepresentationStore（Lineage）
+├── identity.rs           IdentityStore（Union-Find）
+├── prediction.rs         PredictionEdge + PredictionStore
+├── association.rs        AssociationStore（共起 Top-K）
+├── segmentation.rs       segment() / expand()
+├── eval.rs               evaluate_frozen()
+└── persistence.rs        JSON / SQLite 永続化
 
 tests/
-└── integration.rs    69 テスト（AC / T / TL / RS 系列）
+└── integration.rs        100 integration tests
 ```
 
 ---
@@ -388,7 +294,7 @@ tests/
 cargo test
 ```
 
-94 lib + 69 integration、警告ゼロ。
+100 integration tests、警告ゼロ（lib warnings 2 件は既存コードの未使用 API）。
 
 ---
 

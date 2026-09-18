@@ -1,7 +1,7 @@
 # 現在の実装状態
 
 最終確認: 2026-09-18  
-main HEAD: 7dd9983 (UI-2/4/5完了)  
+main HEAD: (UI-8/9完了後更新予定)  
 crate version: 0.5.0  
 integration tests: 100
 
@@ -118,5 +118,5 @@ integration tests: 100
 | UI-5 | Chat GUI修正 (raw input, last_output_chars) | ✅ 完了 |
 | UI-6 | Windows Native Menu Spike (muda 0.20 互換確認) | ✅ 完了 |
 | UI-7 | Native Menu本実装 (Chat GUI, NativeMenu::build/attach/poll) | ✅ 完了 |
-| UI-8 | Trainer menu/file統合 | 未着手 |
-| UI-9 | README最終更新 + docs/spec更新 | 未着手 |
+| UI-8 | Trainer Native Menu + File操作統合 | ✅ 完了 |
+| UI-9 | README最終更新 + docs/spec更新 | ✅ 完了 |

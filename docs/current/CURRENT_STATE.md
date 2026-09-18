@@ -35,6 +35,7 @@ crate version: 0.5.0
 - **Factorization Pressure** (Context Diversity bonus in consider_merges) ← Phase 10
 - **Cross-View Identity** (Union-Find merge_identities, canonical resolution, persistence) ← Phase 11
 - **Transform / Inverse / Composition** (TransformStore, register→merge, inverse, compose) ← Phase 12
+- **Micro-ISA** (Instruction enum, Vm dispatcher, register file — all 14 opcodes) ← Phase 13
 
 ---
 
@@ -105,7 +106,7 @@ crate version: 0.5.0
 |-------|------|
 | ~~11~~ | ~~Cross-View Identity~~ | ✅ 完了 |
 | ~~12~~ | ~~Transform / Inverse / Composition~~ | ✅ 完了 |
-| 13 | Micro-ISA 定義 |
+| ~~13~~ | ~~Micro-ISA 定義~~ | ✅ 完了 |
 
 ### D. 機械レベルへ落とす (Phase 14〜20)
 

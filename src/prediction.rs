@@ -190,6 +190,12 @@ impl PredictionStore {
         }
     }
 
+    /// Return the lazily-decayed strength of a specific edge at `tick`, or
+    /// None if the edge does not exist.  Read-only; does not mutate.
+    pub fn edge_lazy_strength(&self, context: UnitId, next_unit: UnitId, tick: u64) -> Option<f64> {
+        self.edges.get(&(context, next_unit)).map(|e| e.lazy_strength(tick))
+    }
+
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }

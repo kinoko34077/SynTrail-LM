@@ -23,8 +23,16 @@ crate version: 0.5.0
 - Snapshot (JSON / SQLite)
 - Chat GUI (eframe/egui)
 - Adaptive Trainer (UTF-8/Shift_JIS, S/M/L/XL block, 4→8→16→32 repeat, Pause/Resume)
-- **Experience / Replay 分離** (expose_external vs replay, encode_existing)
-- **Identity / View 最小実装** (IdentityStore, Exact Identity, persistence)
+- **Experience / Replay 分離** (expose_external vs replay, encode_existing) ← Phase 1
+- **Identity / View 最小実装** (IdentityStore, Exact Identity, persistence) ← Phase 2
+- **Representation Lineage** (LineageStore, derived_from edges) ← Phase 3
+- **Fallback via Lineage** (predict_with_fallback, generate_with_trace) ← Phase 4
+- **Route Source Index** (source_index in PredictionStore, O(N)→O(K)) ← Phase 5
+- **Segmentation O(L log L)** (priority queue + doubly-linked slots) ← Phase 6
+- **Unified Relation Core** (RelationStore: Route/Adjacency/DerivedFrom) ← Phase 7
+- **HOT/SLEEP 物理分離** (hot_pair_to_id Recognition index) ← Phase 8
+- **Lazy Decay** (s = s * λ^Δt + reward for Chunk and PredictionEdge) ← Phase 9
+- **Factorization Pressure** (Context Diversity bonus in consider_merges) ← Phase 10
 
 ---
 
@@ -75,19 +83,19 @@ crate version: 0.5.0
 | 0 | 仕様書正本化・Baseline計測 | 変更を数字で比較できる |
 | ~~1~~ | ~~Experience / Replay 分離~~ | ✅ 完了 |
 | ~~2~~ | ~~Identity / View 最小実装 (Exact Identity)~~ | ✅ 完了 |
-| 3 | Representation Lineage | 高次Rep形成時に獲得元を保存 |
-| 4 | Fallback via Lineage | 高次View失敗時にPrimitiveまで安全に戻れる |
+| ~~3~~ | ~~Representation Lineage~~ | ✅ 完了 |
+| ~~4~~ | ~~Fallback via Lineage~~ | ✅ 完了 |
 
 ### B. 現行ボトルネックを取る (Phase 5〜10)
 
 | Phase | 内容 |
 |-------|------|
-| 5 | Route Source Index化 |
-| 6 | Segmentation 局所化 (O(L log L)) |
-| 7 | Unified Relation Core |
-| 8 | Memory 階層 (HOT/SLEEP物理分離・Recognition/Recall分離) |
-| 9 | Lazy Decay / Dirty Consolidation |
-| 10 | Factorization Pressure |
+| ~~5~~ | ~~Route Source Index化~~ | ✅ 完了 |
+| ~~6~~ | ~~Segmentation 局所化 (O(L log L))~~ | ✅ 完了 |
+| ~~7~~ | ~~Unified Relation Core~~ | ✅ 完了 |
+| ~~8~~ | ~~Memory 階層 (HOT/SLEEP物理分離・Recognition/Recall分離)~~ | ✅ 完了 |
+| ~~9~~ | ~~Lazy Decay / Dirty Consolidation~~ | ✅ 完了 |
+| ~~10~~ | ~~Factorization Pressure~~ | ✅ 完了 |
 
 ### C. 新しいIdentity/Relation理論を完成させる (Phase 11〜13)
 

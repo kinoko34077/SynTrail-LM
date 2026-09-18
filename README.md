@@ -20,7 +20,8 @@ cargo build --release --features gui
 | バイナリ | パス |
 |---------|------|
 | CLI | `target/release/syntrail` |
-| GUI | `target/release/syntrail-gui`（`--features gui` 時のみ） |
+| GUI（Chat） | `target/release/syntrail-gui`（`--features gui` 時のみ） |
+| Trainer | `target/release/syntrail-trainer`（`--features gui` 時のみ） |
 
 ---
 
@@ -31,6 +32,7 @@ cargo build --release --features gui
 | `model.json` | モデル状態（チャンク・予測エッジ・連想エッジ） | CLI `--model`、GUI の Model 欄で変更可 |
 | `history.sqlite` | GUI の会話履歴 | モデルとは独立。削除してもモデルは変わらない |
 | `syntrail.db` | CLI chat コマンドのセッション DB | CLI 専用 |
+| `<dataset>.syntrail-trainer.json` | Trainer の学習進捗 | モデルとは別ファイル。Pause/Resume に使用 |
 
 ---
 
@@ -214,6 +216,62 @@ syntrail chat --input <テキスト> [--db <DBパス>] [--model <パス>]
 ```bash
 syntrail chat --input "hello"
 ```
+
+---
+
+## SynTrail Trainer
+
+長文テキストを複数行ブロック単位で Adaptive 反復学習させる専用 GUI。
+
+### 起動
+
+```bash
+cargo run --release --features gui --bin syntrail-trainer
+```
+
+### 使い方
+
+1. **Model** — `model.json`（または `.db`/`.sqlite`）を Open、または D&D で読み込む
+2. **Dataset** — `.txt` ファイルを Open、または D&D で読み込む（UTF-8 または Shift_JIS）
+3. **Start** を押すと学習開始
+
+### テキスト投入と改行込みExposure
+
+- `.txt` ファイルは CRLF/CR → LF に正規化する
+- 原文を複数行（デフォルト 4 行 / 800 文字）のブロックに分割
+- `\n` を含む 1 ブロック全体を `ModelState::expose()` に渡す（改行も Primitive として学習対象）
+- `concat(blocks) == normalized_source` が常に成立（文字欠落なし）
+
+### Adaptive 反復（同一ブロック）
+
+チェックポイント: 4 → 8 → 16 → 32 回。最低 8 回、最大 32 回。
+
+| 評価タイミング | 判断基準 | 動作 |
+|---|---|---|
+| 4 回目 | 常に継続 | → 8 回へ |
+| 8 回目 | 4 回時との dpc 改善率 ≥ 2% | → 16 回へ、それ以外終了 |
+| 16 回目 | 8 回時との dpc 改善率 ≥ 1% | → 32 回へ、それ以外終了 |
+| 32 回目 | 常に終了 | ブロック完了 |
+
+### Block サイズ自動調整
+
+直近 8 ブロックの pre-dpc（expose 前の評価値）と反復数の中央値で判断：
+
+- `median(pre_dpc) ≤ 0.70 かつ median(repeats) ≤ 8` → 1 段階拡大（S→M→L→XL）
+- `median(pre_dpc) ≥ 0.90 かつ median(repeats) ≥ 16` → 1 段階縮小
+- それ以外 → 維持
+
+### Pause / Resume
+
+- **Pause** でモデルとTrainer進捗を即時保存して一時停止
+- アプリ終了後も同じ位置から **Resume** 可能
+- DatasetまたはModelが変更された場合（フィンガープリント不一致）は自動再開しない
+
+### ファイルの独立性
+
+- モデル（`model.json` 等）と学習進捗（`<dataset名>.syntrail-trainer.json`）は別ファイル
+- Trainer を使わなくても Chat GUI や CLI でモデルを読み書き可能
+- Chat GUI とモデル互換（`.json` / `.db` / `.sqlite` すべて対応）
 
 stderr に `[turn_id=N decisions=M tick=K]` を出力する。
 

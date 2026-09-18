@@ -16,6 +16,11 @@ name = "syntrail-gui"
 path = "src/bin/syntrail_gui.rs"
 required-features = ["gui"]
 
+[[bin]]
+name = "syntrail-trainer"
+path = "src/bin/syntrail_trainer.rs"
+required-features = ["gui"]
+
 [lib]
 name = "syntrail_lm"
 path = "src/lib.rs"
@@ -24,6 +29,7 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+encoding_rs = "0.8"
 eframe = { version = "0.29", optional = true }
 rfd   = { version = "0.15", optional = true }
 

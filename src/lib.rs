@@ -1,4 +1,5 @@
 pub mod app;
+pub mod trainer;
 pub mod association;
 pub mod chunks;
 pub mod config;

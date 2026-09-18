@@ -20,6 +20,8 @@ use crate::units::UnitId;
 const MERGE_THRESHOLD: u32 = 4;
 const BASE_MERGE_PROBABILITY: f64 = 0.5;
 const SEGMENT_MIN_SCORE: f64 = 0.0;
+/// Phase 10: diversity bonus scale — each unique preceding context adds this to the freq multiplier.
+const DIVERSITY_SCALE: f64 = 0.25;
 
 /// Running counters for the primary metric.
 #[derive(Debug, Default, Clone, Copy)]
@@ -54,6 +56,8 @@ pub struct ModelState {
     pub relations: RelationStore,
     pub tick: u64,
     pub(crate) merge_candidates: HashMap<(UnitId, UnitId), u32>,
+    /// Phase 10: unique preceding contexts for each merge candidate — drives diversity bonus.
+    pub(crate) merge_context_diversity: HashMap<(UnitId, UnitId), std::collections::HashSet<Option<UnitId>>>,
     pub metrics: Metrics,
     /// Monotonically increasing trace ID counter.
     pub(crate) next_trace_id: TraceId,
@@ -321,8 +325,10 @@ impl ModelState {
     // ── Merge / reactivation (v0.4) ──────────────────────────────────────
 
     fn consider_merges(&mut self, units: &[UnitId], _tick: u64) {
-        for window in units.windows(2) {
-            let (left, right) = (window[0], window[1]);
+        for i in 0..units.len().saturating_sub(1) {
+            let left = units[i];
+            let right = units[i + 1];
+            let preceding: Option<UnitId> = if i > 0 { Some(units[i - 1]) } else { None };
 
             if let Some(existing_id) = self.chunks.find_by_pair(left, right) {
                 // v0.4 §12: reactivate SLEEP chunks on re-encounter (Phase 8: via registry method)
@@ -330,14 +336,29 @@ impl ModelState {
                 continue;
             }
 
+            // Phase 10: track unique preceding contexts for diversity bonus.
+            self.merge_context_diversity
+                .entry((left, right))
+                .or_default()
+                .insert(preceding);
+
             let count = self
                 .merge_candidates
                 .entry((left, right))
                 .and_modify(|c| *c += 1)
                 .or_insert(1);
             let count_val = *count;
-            if count_val >= MERGE_THRESHOLD {
-                let freq = (count_val as f64 / MERGE_THRESHOLD as f64).min(4.0);
+
+            // Phase 10 Factorization Pressure: pairs observed in many different contexts
+            // earn a diversity bonus that lowers the effective merge threshold.
+            let diversity = self.merge_context_diversity
+                .get(&(left, right))
+                .map(|s| s.len() as f64)
+                .unwrap_or(1.0);
+            let effective_count = count_val as f64 * (1.0 + DIVERSITY_SCALE * diversity);
+
+            if effective_count >= MERGE_THRESHOLD as f64 {
+                let freq = (effective_count / MERGE_THRESHOLD as f64).min(4.0);
                 let prob = BASE_MERGE_PROBABILITY * freq.sqrt();
                 if freq >= 2.0 || pseudo_rand(left, right, count_val) < prob {
                     let exp_len = self.expanded_length(left) + self.expanded_length(right);
@@ -354,6 +375,7 @@ impl ModelState {
                         }
                     }
                     self.merge_candidates.remove(&(left, right));
+                    self.merge_context_diversity.remove(&(left, right));
                 }
             }
         }
@@ -423,6 +445,7 @@ impl ModelState {
             relations,
             tick,
             merge_candidates,
+            merge_context_diversity: HashMap::new(), // not persisted; rebuilt during training
             metrics,
             next_trace_id,
         }

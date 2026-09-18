@@ -1,7 +1,7 @@
 # 現在の実装状態
 
 最終確認: 2026-09-18  
-main HEAD: (UI-8/9完了後更新予定)  
+main HEAD: 5abba20 (Desktop UI全フェーズ完了)  
 crate version: 0.5.0  
 integration tests: 100
 

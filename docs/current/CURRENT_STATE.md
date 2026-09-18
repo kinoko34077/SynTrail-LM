@@ -1,0 +1,111 @@
+# 現在の実装状態
+
+最終確認: 2026-09-18  
+main HEAD: `1577ac65f782730d9ec5d220f0edf38efe48565f`  
+crate version: 0.4.0
+
+---
+
+## 実装済
+
+- Unicode Primitive (stable ID)
+- u32 tagged UnitId
+- Recursive binary Chunk (left/right)
+- Merge candidate (count-based)
+- Usage/Tier (T0/T1/T2)
+- HOT/SLEEP 論理状態
+- PredictionStore (Route)
+- AssociationStore (Top-K, Adjacency相当)
+- Feedback / Avoidance (Context-dependent)
+- Frozen generation (with Trace)
+- Frozen Eval (evaluate_frozen, evaluate_sample_frozen)
+- History DB (SQLite)
+- Snapshot (JSON / SQLite)
+- Chat GUI (eframe/egui)
+- Adaptive Trainer (UTF-8/Shift_JIS, S/M/L/XL block, 4→8→16→32 repeat, Pause/Resume)
+
+---
+
+## 未実装
+
+- Identity
+- View
+- Representation Lineage
+- **Experience / Replay 分離** ← Phase 1 (次のマイルストーン)
+- Fallback via Lineage
+- Cross-view Identity
+- Unified Relation Core
+- Source-indexed RouteBank
+- Factorization Pressure (Context Diversity考慮)
+- Lazy Decay
+- Physical Core/Overlay split
+- Recall/Recognition 分離
+- Micro-ISA
+- Arena local IDs
+- Variable-width IDs
+- Flat packed arrays
+- Binary journal/snapshot
+- Fixed point arithmetic
+
+---
+
+## 現行の主要パフォーマンス課題
+
+### Route (PredictionStore)
+
+`predict()` は対象Contextごとに全Prediction Edgeを走査。N Edgeで `O(N)`。
+→ **Route source-index化が高優先 (Phase 5)**
+
+### Segmentation
+
+繰返し全候補走査 → 1 merge → 再度全候補走査。長文でO(L²)寄り。
+→ **Phase 6で priority queue + 局所再計算へ**
+
+### AssociationStore
+
+既に `source → Top-K` のため比較的良い。
+
+---
+
+## ロードマップ
+
+### A. 意味を正す (Phase 0〜4)
+
+| Phase | 内容 | 完了条件 |
+|-------|------|---------|
+| 0 | 仕様書正本化・Baseline計測 | 変更を数字で比較できる |
+| **1** | **Experience / Replay 分離** | **8回ReplayしてもExternal occurrenceが1のまま** |
+| 2 | Identity / View 最小実装 (Exact Identity) | 異なるChunk木を同一Contentとして束ねられる |
+| 3 | Representation Lineage | 高次Rep形成時に獲得元を保存 |
+| 4 | Fallback via Lineage | 高次View失敗時にPrimitiveまで安全に戻れる |
+
+### B. 現行ボトルネックを取る (Phase 5〜10)
+
+| Phase | 内容 |
+|-------|------|
+| 5 | Route Source Index化 |
+| 6 | Segmentation 局所化 (O(L log L)) |
+| 7 | Unified Relation Core |
+| 8 | Memory 階層 (HOT/SLEEP物理分離・Recognition/Recall分離) |
+| 9 | Lazy Decay / Dirty Consolidation |
+| 10 | Factorization Pressure |
+
+### C. 新しいIdentity/Relation理論を完成させる (Phase 11〜13)
+
+| Phase | 内容 |
+|-------|------|
+| 11 | Cross-View Identity |
+| 12 | Transform / Inverse / Composition |
+| 13 | Micro-ISA 定義 |
+
+### D. 機械レベルへ落とす (Phase 14〜20)
+
+| Phase | 内容 |
+|-------|------|
+| 14 | Physical Core / Overlay 分離 |
+| 15 | Flat Arrays / Arena Index |
+| 16 | Binary Persistence |
+| 17 | Fixed Point / Packing |
+| 18 | Variable-bit ID / Region Encoding |
+| 19 | SIMD / Assembly (profile後のみ) |
+| 20 | Generalization / Novel Search |

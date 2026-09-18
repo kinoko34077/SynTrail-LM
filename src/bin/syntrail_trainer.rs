@@ -153,20 +153,23 @@ fn worker_main(
                     }
                     Ok(TrainerCommand::Resume) => {}  // already running
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Disconnected) => { save_and_exit(&mut model, &model_path, &tr_state); return; }
                 }
             }
         }};
     }
 
-    let mut block_idx = tr_state.completed_block_count;
+    // Capture initial count so the resume-path condition stays stable as
+    // completed_block_count and block_idx are incremented in lockstep.
+    let resume_block_idx = tr_state.completed_block_count;
+    let mut block_idx = resume_block_idx;
 
     // ── Main training loop ────────────────────────────────────────────────
     loop {
         check_cmd!();
 
         // Get the current block.
-        let block = match if is_resuming && block_idx == tr_state.completed_block_count {
+        let block = match if is_resuming && block_idx == resume_block_idx {
             // Re-read the in-progress block from its start.
             let mut tmp = BlockSplitter::with_cursor(
                 dataset.normalized.clone(),
@@ -221,7 +224,12 @@ fn worker_main(
         loop {
             check_cmd!();
 
-            model.expose(&block.text);
+            // First pass = Experience; subsequent passes = Replay (Phase 1).
+            if sched.repeat_count == 0 {
+                model.expose_external(&block.text);
+            } else {
+                model.replay(&block.text);
+            }
             sched.record_exposure();
             tr_state.current_block_repeat = sched.repeat_count;
 
@@ -261,16 +269,8 @@ fn worker_main(
         tr_state.current_block_repeat = 0;
         tr_state.cursor = block.end;
 
-        // Advance splitter if we were resuming mid-block (now done with it).
-        if is_resuming && block_idx == tr_state.completed_block_count - 1 {
-            // Splitter is already at the right position from the resume re-read.
-            // Set it to after the current block.
-            let _ = BlockSplitter::with_cursor(
-                dataset.normalized.clone(),
-                tr_state.block_level,
-                block.end,
-            );
-            // Replace splitter with one starting after the resumed block.
+        // After the resumed block, advance the main splitter past it.
+        if is_resuming && block_idx == resume_block_idx {
             splitter = BlockSplitter::with_cursor(
                 dataset.normalized.clone(),
                 tr_state.block_level,

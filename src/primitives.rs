@@ -70,6 +70,12 @@ impl PrimitiveRegistry {
         text.chars().map(|c| self.register(c)).collect()
     }
 
+    /// Encode without registering: skip characters that are not yet registered.
+    /// Used by `ModelState::replay()` so Replay never adds new Primitives.
+    pub fn encode_existing(&self, text: &str) -> Vec<PrimitiveId> {
+        text.chars().filter_map(|c| self.id(c)).collect()
+    }
+
     /// Decode a sequence of Primitive IDs back to a String.
     /// Returns `None` if any ID is unregistered.
     pub fn decode(&self, ids: &[PrimitiveId]) -> Option<String> {

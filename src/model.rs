@@ -57,12 +57,12 @@ impl ModelState {
 
     // ── Exposure (v0.2 rename of train) ──────────────────────────────────
 
-    /// Expose the model to one text sample.
+    /// Process one external observation (Experience).
     ///
-    /// Updates usage statistics (use_count, usage_strength) and builds
-    /// prediction edges from the segmented sequence.
-    /// Does NOT apply external feedback.
-    pub fn expose(&mut self, text: &str) {
+    /// Registers new Primitives, updates Adjacency associations, and counts
+    /// the input toward `metrics.total_characters` / `metrics.total_decisions`.
+    /// Call this for first-time observations from the outside world.
+    pub fn expose_external(&mut self, text: &str) {
         self.tick += 1;
         let tick = self.tick;
 
@@ -95,10 +95,52 @@ impl ModelState {
         self.consider_merges(&segmented, tick);
     }
 
+    /// Re-process previously observed text (Replay).
+    ///
+    /// Strengthens Chunk familiarity, prediction edges, and merge candidates,
+    /// but does NOT register new Primitives, update Adjacency associations, or
+    /// increment the external-observation metrics (`total_characters` /
+    /// `total_decisions`).  Characters not yet registered are silently skipped.
+    ///
+    /// Use for repeated passes over a block in the Adaptive Trainer: the first
+    /// pass is `expose_external`; all subsequent passes are `replay`.
+    pub fn replay(&mut self, text: &str) {
+        self.tick += 1;
+        let tick = self.tick;
+
+        let prim_ids = self.primitives.encode_existing(text);
+        if prim_ids.is_empty() {
+            return;
+        }
+
+        let segmented = segment(&prim_ids, &self.chunks, SEGMENT_MIN_SCORE);
+
+        for &unit in &segmented {
+            if let Some(cid) = unit.as_chunk() {
+                if let Some(chunk) = self.chunks.get_mut(cid) {
+                    chunk.record_usage(tick);
+                }
+            }
+        }
+
+        self.predictions.learn_sequence(&segmented);
+        // No metrics update — this is not an external observation.
+        // No association update — Adjacency tracks world co-occurrence only.
+
+        self.consider_merges(&segmented, tick);
+    }
+
+    /// Process one text sample (Experience).
+    /// Alias for `expose_external`; kept for backward compatibility.
+    #[inline]
+    pub fn expose(&mut self, text: &str) {
+        self.expose_external(text);
+    }
+
     /// Backward-compatible alias — callers not yet migrated to `expose`.
     #[inline]
     pub fn train(&mut self, text: &str) {
-        self.expose(text);
+        self.expose_external(text);
     }
 
     // ── Frozen generation (v0.2) ─────────────────────────────────────────
@@ -446,5 +488,68 @@ mod tests {
         m.train("abc");
         let fp2 = m.state_fingerprint();
         assert_ne!(fp1, fp2);
+    }
+
+    // ── Experience / Replay 分離テスト (Phase 1) ─────────────────────────
+
+    #[test]
+    fn replay_does_not_update_metrics() {
+        let mut m = ModelState::new();
+        m.expose_external("hello");
+        let chars = m.metrics.total_characters;
+        let decs = m.metrics.total_decisions;
+        m.replay("hello");
+        assert_eq!(m.metrics.total_characters, chars, "replay must not increment total_characters");
+        assert_eq!(m.metrics.total_decisions, decs, "replay must not increment total_decisions");
+    }
+
+    #[test]
+    fn replay_does_not_update_associations() {
+        let mut m = ModelState::new();
+        m.expose_external("ab");
+        let assoc_before = m.associations.edge_count();
+        // replay with same text should not add new associations
+        m.replay("ab");
+        assert_eq!(m.associations.edge_count(), assoc_before, "replay must not update associations");
+    }
+
+    #[test]
+    fn replay_does_not_register_new_primitives() {
+        let mut m = ModelState::new();
+        m.expose_external("abc");
+        let prims_before = m.primitive_count();
+        // "xyz" contains new chars — replay must not register them
+        m.replay("xyz");
+        assert_eq!(m.primitive_count(), prims_before, "replay must not register new primitives");
+    }
+
+    #[test]
+    fn replay_strengthens_predictions() {
+        let mut m = ModelState::new();
+        // Prime the model so "ab" primitives exist and there are prediction edges.
+        for _ in 0..10 { m.expose_external("ab"); }
+        let edges_after_experience = m.edge_count();
+        // Replay should be able to strengthen edges (at minimum, not crash).
+        for _ in 0..5 { m.replay("ab"); }
+        assert!(m.edge_count() >= edges_after_experience, "replay should not remove prediction edges");
+    }
+
+    #[test]
+    fn expose_external_8x_counts_as_8_observations() {
+        let mut m = ModelState::new();
+        let text = "hello";
+        for _ in 0..8 { m.expose_external(text); }
+        assert_eq!(m.metrics.total_characters, (text.chars().count() * 8) as u64);
+    }
+
+    #[test]
+    fn replay_8x_does_not_inflate_observation_count() {
+        let mut m = ModelState::new();
+        let text = "hello";
+        m.expose_external(text);
+        let chars_after_one = m.metrics.total_characters;
+        for _ in 0..7 { m.replay(text); }
+        assert_eq!(m.metrics.total_characters, chars_after_one,
+            "8 replays after 1 expose_external must not inflate total_characters");
     }
 }

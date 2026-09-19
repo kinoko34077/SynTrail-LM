@@ -36,6 +36,18 @@ impl SupervisedDataset {
         }
         Ok(SupervisedDataset { samples, source_path: path.to_owned() })
     }
+
+    /// §34: FNV-1a fingerprint over all (prompt, response) pairs for resume consistency.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h: u64 = 14695981039346656037;
+        for s in &self.samples {
+            for b in s.prompt.as_bytes().iter().chain(b"\x00".iter()).chain(s.response.as_bytes()) {
+                h = h.wrapping_mul(1099511628211);
+                h ^= *b as u64;
+            }
+        }
+        h
+    }
 }
 
 // ── Internal deserialization ─────────────────────────────────────────────

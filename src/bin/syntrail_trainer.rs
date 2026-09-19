@@ -24,6 +24,7 @@ use syntrail_lm::trainer::scheduler::{CheckpointOutcome, TrainingScheduler};
 use syntrail_lm::trainer::splitter::BlockSplitter;
 use syntrail_lm::trainer::state::{TrainerState, TrainerStatus};
 use syntrail_lm::trainer::supervised::SupervisedDataset;
+use syntrail_lm::eval::evaluate_supervised_pair_frozen;
 
 #[cfg(all(target_os = "windows", feature = "gui"))]
 use syntrail_lm::desktop::platform::windows::TrainerMenu;
@@ -120,9 +121,15 @@ enum TrainerEvent {
     Analytics(Box<Analytics>),
 }
 
+/// §34: What the worker trains on — text blocks or supervised pairs.
+enum TrainingInput {
+    Text(Dataset),
+    Supervised(SupervisedDataset),
+}
+
 fn worker_main(
     mut model: ModelState,
-    dataset: Dataset,
+    input: TrainingInput,
     mut tr_state: TrainerState,
     model_path: PathBuf,
     hot_chunks_max: usize,
@@ -131,21 +138,6 @@ fn worker_main(
 ) {
     // §28: worker owns the canonical model path; SaveAs updates it here and in tr_state.
     let mut current_model_path = model_path;
-    let total_bytes = dataset.normalized.len();
-
-    // Determine starting position.
-    let resume_block_start = tr_state.current_block_start;
-    let resume_repeat = tr_state.current_block_repeat;
-    let resume_checkpoint_dpcs = tr_state.checkpoint_dpcs;
-    let resume_pre_dpc = tr_state.current_block_pre_dpc;
-    let is_resuming = resume_repeat > 0 && resume_block_start < total_bytes;
-
-    let mut splitter = BlockSplitter::with_seed(
-        dataset.normalized.clone(),
-        tr_state.block_level,
-        if is_resuming { resume_block_start } else { tr_state.cursor },
-        tr_state.split_seed,
-    );
 
     macro_rules! check_cmd {
         () => {{
@@ -215,99 +207,179 @@ fn worker_main(
         }};
     }
 
-    // Capture initial count so the resume-path condition stays stable as
-    // completed_block_count and block_idx are incremented in lockstep.
-    let resume_block_idx = tr_state.completed_block_count;
-    let mut block_idx = resume_block_idx;
-
-    // ── Main training loop ────────────────────────────────────────────────
-    loop {
-        check_cmd!();
-
-        // Get the current block.
-        let block = match if is_resuming && block_idx == resume_block_idx {
-            // Re-read the in-progress block from its start.
-            let mut tmp = BlockSplitter::with_seed(
+    // §34: dispatch on training input type.
+    match input {
+        TrainingInput::Text(dataset) => {
+            let total_bytes = dataset.normalized.len();
+            let resume_block_start = tr_state.current_block_start;
+            let resume_repeat = tr_state.current_block_repeat;
+            let resume_checkpoint_dpcs = tr_state.checkpoint_dpcs;
+            let resume_pre_dpc = tr_state.current_block_pre_dpc;
+            let is_resuming = resume_repeat > 0 && resume_block_start < total_bytes;
+            let mut splitter = BlockSplitter::with_seed(
                 dataset.normalized.clone(),
                 tr_state.block_level,
-                resume_block_start,
+                if is_resuming { resume_block_start } else { tr_state.cursor },
                 tr_state.split_seed,
             );
-            tmp.next_block()
-        } else {
-            splitter.next_block()
-        } {
-            Some(b) => b,
-            None => {
-                tr_state.status = TrainerStatus::Completed;
-                tr_state.model_fingerprint = model.state_fingerprint();
-                tr_state.checkpoint_generation = model.tick; // §32
-                do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx);
-                // §39: transfer model ownership to UI; no disk re-read needed.
-                let _ = ev_tx.send(TrainerEvent::Completed(block_idx, Box::new(model)));
-                return;
-            }
-        };
 
-        // Update splitter cursor to after this block (if not resuming).
-        if !(is_resuming && block_idx == tr_state.completed_block_count) {
-            // Already advanced by next_block above.
-        }
+            // Capture initial count so the resume-path condition stays stable as
+            // completed_block_count and block_idx are incremented in lockstep.
+            let resume_block_idx = tr_state.completed_block_count;
+            let mut block_idx = resume_block_idx;
 
-        // Pre-evaluation.
-        let pre_eval = evaluate_sample_frozen(&model, &block.text);
+            // ── Main training loop ────────────────────────────────────────────────
+            loop {
+                check_cmd!();
 
-        let _ = ev_tx.send(TrainerEvent::BlockStarted(BlockInfo {
-            idx: block_idx,
-            preview: block.text.chars().take(200).collect(),
-            pre_dpc: pre_eval.dpc,
-            pre_accuracy: pre_eval.prediction_accuracy,
-            source_bytes_done: block.start,
-            total_bytes,
-        }));
+                // Get the current block.
+                let block = match if is_resuming && block_idx == resume_block_idx {
+                    // Re-read the in-progress block from its start.
+                    let mut tmp = BlockSplitter::with_seed(
+                        dataset.normalized.clone(),
+                        tr_state.block_level,
+                        resume_block_start,
+                        tr_state.split_seed,
+                    );
+                    tmp.next_block()
+                } else {
+                    splitter.next_block()
+                } {
+                    Some(b) => b,
+                    None => {
+                        tr_state.status = TrainerStatus::Completed;
+                        tr_state.model_fingerprint = model.state_fingerprint();
+                        tr_state.checkpoint_generation = model.tick; // §32
+                        do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx);
+                        // §39: transfer model ownership to UI; no disk re-read needed.
+                        let _ = ev_tx.send(TrainerEvent::Completed(block_idx, Box::new(model)));
+                        return;
+                    }
+                };
 
-        // Save block info to trainer state.
-        tr_state.current_block_start = block.start;
-        tr_state.current_block_end = block.end;
-        tr_state.current_block_pre_dpc = pre_eval.dpc;
+                // Update splitter cursor to after this block (if not resuming).
+                if !(is_resuming && block_idx == tr_state.completed_block_count) {
+                    // Already advanced by next_block above.
+                }
 
-        // Build scheduler — restore if resuming.
-        let mut sched = if is_resuming && block_idx == tr_state.completed_block_count && resume_repeat > 0 {
-            TrainingScheduler::resume(resume_pre_dpc, resume_repeat, resume_checkpoint_dpcs)
-        } else {
-            TrainingScheduler::new(pre_eval.dpc)
-        };
+                // Pre-evaluation.
+                let pre_eval = evaluate_sample_frozen(&model, &block.text);
 
-        // ── Per-block exposure loop ───────────────────────────────────────
-        loop {
-            check_cmd!();
-
-            // First pass = Experience; subsequent passes = Replay (Phase 1).
-            if sched.repeat_count == 0 {
-                model.expose_external(&block.text);
-            } else {
-                model.replay(&block.text);
-            }
-            sched.record_exposure();
-            tr_state.current_block_repeat = sched.repeat_count;
-
-            let _ = ev_tx.send(TrainerEvent::ExposureDone(sched.repeat_count));
-
-            if sched.at_checkpoint() {
-                let eval = evaluate_sample_frozen(&model, &block.text);
-                let outcome = sched.evaluate_checkpoint(eval.dpc);
-
-                tr_state.checkpoint_dpcs = sched.checkpoint_dpcs();
-                tr_state.current_checkpoint = sched.next_checkpoint();
-
-                let _ = ev_tx.send(TrainerEvent::Checkpoint(CheckpointInfo {
-                    checkpoint: sched.repeat_count,
-                    repeat: sched.repeat_count,
-                    dpc: eval.dpc,
-                    accuracy: eval.prediction_accuracy,
+                let _ = ev_tx.send(TrainerEvent::BlockStarted(BlockInfo {
+                    idx: block_idx,
+                    preview: block.text.chars().take(200).collect(),
+                    pre_dpc: pre_eval.dpc,
+                    pre_accuracy: pre_eval.prediction_accuracy,
+                    source_bytes_done: block.start,
+                    total_bytes,
                 }));
 
-                // Save at each checkpoint. §37/§30/§32: failure stops the worker.
+                // Save block info to trainer state.
+                tr_state.current_block_start = block.start;
+                tr_state.current_block_end = block.end;
+                tr_state.current_block_pre_dpc = pre_eval.dpc;
+
+                // Build scheduler — restore if resuming.
+                let mut sched = if is_resuming && block_idx == tr_state.completed_block_count && resume_repeat > 0 {
+                    TrainingScheduler::resume(resume_pre_dpc, resume_repeat, resume_checkpoint_dpcs)
+                } else {
+                    TrainingScheduler::new(pre_eval.dpc)
+                };
+
+                // ── Per-block exposure loop ───────────────────────────────────────
+                loop {
+                    check_cmd!();
+
+                    // First pass = Experience; subsequent passes = Replay (Phase 1).
+                    if sched.repeat_count == 0 {
+                        model.expose_external(&block.text);
+                    } else {
+                        model.replay(&block.text);
+                    }
+                    sched.record_exposure();
+                    tr_state.current_block_repeat = sched.repeat_count;
+
+                    let _ = ev_tx.send(TrainerEvent::ExposureDone(sched.repeat_count));
+
+                    if sched.at_checkpoint() {
+                        let eval = evaluate_sample_frozen(&model, &block.text);
+                        let outcome = sched.evaluate_checkpoint(eval.dpc);
+
+                        tr_state.checkpoint_dpcs = sched.checkpoint_dpcs();
+                        tr_state.current_checkpoint = sched.next_checkpoint();
+
+                        let _ = ev_tx.send(TrainerEvent::Checkpoint(CheckpointInfo {
+                            checkpoint: sched.repeat_count,
+                            repeat: sched.repeat_count,
+                            dpc: eval.dpc,
+                            accuracy: eval.prediction_accuracy,
+                        }));
+
+                        // Save at each checkpoint. §37/§30/§32: failure stops the worker.
+                        tr_state.model_fingerprint = model.state_fingerprint();
+                        tr_state.checkpoint_generation = model.tick; // §32
+                        if !do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx) {
+                            let _ = ev_tx.send(TrainerEvent::Stopped {
+                                model: Box::new(model),
+                                save_result: SaveResult::Failed {
+                                    path: current_model_path.clone(),
+                                    error: "checkpoint save failed".to_owned(),
+                                },
+                            });
+                            return;
+                        }
+                        let _ = ev_tx.send(TrainerEvent::Analytics(Box::new(model_analytics(&model))));
+
+                        if outcome == CheckpointOutcome::Finished {
+                            break;
+                        }
+                    }
+                }
+
+                // Block complete.
+                let repeats_used = sched.repeat_count;
+                tr_state.push_block_result(pre_eval.dpc, repeats_used);
+                tr_state.completed_block_count += 1;
+                tr_state.current_block_repeat = 0;
+                tr_state.cursor = block.end;
+
+                // After the resumed block, advance the main splitter past it.
+                if is_resuming && block_idx == resume_block_idx {
+                    splitter = BlockSplitter::with_cursor(
+                        dataset.normalized.clone(),
+                        tr_state.block_level,
+                        block.end,
+                    );
+                }
+
+                // §25: enforce HOT budget at block completion (low-frequency, not per-exposure).
+                model.enforce_hot_budget(hot_chunks_max);
+
+                let _ = ev_tx.send(TrainerEvent::BlockDone { idx: block_idx, repeats: repeats_used });
+
+                // Check if Block Level should change.
+                let change = decide_level_change(&tr_state.recent_pre_dpc, &tr_state.recent_repeats_used);
+                match change {
+                    syntrail_lm::trainer::adaptive::LevelChange::Upgrade => {
+                        let new_level = tr_state.block_level.upgrade();
+                        if new_level != tr_state.block_level {
+                            tr_state.block_level = new_level;
+                            splitter.set_level(new_level);
+                            let _ = ev_tx.send(TrainerEvent::LevelChanged(new_level));
+                        }
+                    }
+                    syntrail_lm::trainer::adaptive::LevelChange::Downgrade => {
+                        let new_level = tr_state.block_level.downgrade();
+                        if new_level != tr_state.block_level {
+                            tr_state.block_level = new_level;
+                            splitter.set_level(new_level);
+                            let _ = ev_tx.send(TrainerEvent::LevelChanged(new_level));
+                        }
+                    }
+                    syntrail_lm::trainer::adaptive::LevelChange::Keep => {}
+                }
+
+                // Save after each block. §37/§30/§32: failure stops the worker.
                 tr_state.model_fingerprint = model.state_fingerprint();
                 tr_state.checkpoint_generation = model.tick; // §32
                 if !do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx) {
@@ -315,77 +387,140 @@ fn worker_main(
                         model: Box::new(model),
                         save_result: SaveResult::Failed {
                             path: current_model_path.clone(),
-                            error: "checkpoint save failed".to_owned(),
+                            error: "block save failed".to_owned(),
                         },
                     });
                     return;
                 }
-                let _ = ev_tx.send(TrainerEvent::Analytics(Box::new(model_analytics(&model))));
 
-                if outcome == CheckpointOutcome::Finished {
-                    break;
-                }
+                block_idx += 1;
             }
         }
 
-        // Block complete.
-        let repeats_used = sched.repeat_count;
-        tr_state.push_block_result(pre_eval.dpc, repeats_used);
-        tr_state.completed_block_count += 1;
-        tr_state.current_block_repeat = 0;
-        tr_state.cursor = block.end;
+        // §34: supervised training — reuses the 4/8/16/32 adaptive scheduler per sample.
+        TrainingInput::Supervised(supervised) => {
+            let sample_count = supervised.samples.len();
+            let resume_repeat = tr_state.current_block_repeat;
+            let resume_checkpoint_dpcs = tr_state.checkpoint_dpcs;
+            let resume_pre_dpc = tr_state.current_block_pre_dpc;
+            let is_resuming = resume_repeat > 0 && tr_state.cursor < sample_count;
+            let mut sample_idx = tr_state.cursor;
 
-        // After the resumed block, advance the main splitter past it.
-        if is_resuming && block_idx == resume_block_idx {
-            splitter = BlockSplitter::with_cursor(
-                dataset.normalized.clone(),
-                tr_state.block_level,
-                block.end,
-            );
-        }
+            loop {
+                check_cmd!();
 
-        // §25: enforce HOT budget at block completion (low-frequency, not per-exposure).
-        model.enforce_hot_budget(hot_chunks_max);
-
-        let _ = ev_tx.send(TrainerEvent::BlockDone { idx: block_idx, repeats: repeats_used });
-
-        // Check if Block Level should change.
-        let change = decide_level_change(&tr_state.recent_pre_dpc, &tr_state.recent_repeats_used);
-        match change {
-            syntrail_lm::trainer::adaptive::LevelChange::Upgrade => {
-                let new_level = tr_state.block_level.upgrade();
-                if new_level != tr_state.block_level {
-                    tr_state.block_level = new_level;
-                    splitter.set_level(new_level);
-                    let _ = ev_tx.send(TrainerEvent::LevelChanged(new_level));
+                if sample_idx >= sample_count {
+                    tr_state.status = TrainerStatus::Completed;
+                    tr_state.model_fingerprint = model.state_fingerprint();
+                    tr_state.checkpoint_generation = model.tick;
+                    do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx);
+                    let _ = ev_tx.send(TrainerEvent::Completed(sample_idx, Box::new(model)));
+                    return;
                 }
-            }
-            syntrail_lm::trainer::adaptive::LevelChange::Downgrade => {
-                let new_level = tr_state.block_level.downgrade();
-                if new_level != tr_state.block_level {
-                    tr_state.block_level = new_level;
-                    splitter.set_level(new_level);
-                    let _ = ev_tx.send(TrainerEvent::LevelChanged(new_level));
+
+                let sample = &supervised.samples[sample_idx];
+                let pre_eval = evaluate_supervised_pair_frozen(&model, &sample.prompt, &sample.response);
+
+                let _ = ev_tx.send(TrainerEvent::BlockStarted(BlockInfo {
+                    idx: sample_idx,
+                    preview: {
+                        let p: String = sample.prompt.chars().take(100).collect();
+                        let r: String = sample.response.chars().take(100).collect();
+                        format!("{}→{}", p, r)
+                    },
+                    pre_dpc: pre_eval.dpc,
+                    pre_accuracy: pre_eval.prediction_accuracy,
+                    source_bytes_done: sample_idx,
+                    total_bytes: sample_count,
+                }));
+
+                tr_state.current_block_start = sample_idx;
+                tr_state.current_block_end = sample_idx + 1;
+                tr_state.current_block_pre_dpc = pre_eval.dpc;
+
+                let mut sched = if is_resuming && sample_idx == tr_state.cursor && resume_repeat > 0 {
+                    TrainingScheduler::resume(resume_pre_dpc, resume_repeat, resume_checkpoint_dpcs)
+                } else {
+                    TrainingScheduler::new(pre_eval.dpc)
+                };
+
+                // ── Per-sample exposure loop ──────────────────────────────────────
+                loop {
+                    check_cmd!();
+
+                    if sched.repeat_count == 0 {
+                        model.expose_supervised_pair(&sample.prompt, &sample.response);
+                    } else {
+                        model.replay_supervised_pair(&sample.prompt, &sample.response);
+                    }
+                    sched.record_exposure();
+                    tr_state.current_block_repeat = sched.repeat_count;
+
+                    let _ = ev_tx.send(TrainerEvent::ExposureDone(sched.repeat_count));
+
+                    if sched.at_checkpoint() {
+                        let eval = evaluate_supervised_pair_frozen(&model, &sample.prompt, &sample.response);
+                        let outcome = sched.evaluate_checkpoint(eval.dpc);
+
+                        tr_state.checkpoint_dpcs = sched.checkpoint_dpcs();
+                        tr_state.current_checkpoint = sched.next_checkpoint();
+
+                        let _ = ev_tx.send(TrainerEvent::Checkpoint(CheckpointInfo {
+                            checkpoint: sched.repeat_count,
+                            repeat: sched.repeat_count,
+                            dpc: eval.dpc,
+                            accuracy: eval.prediction_accuracy,
+                        }));
+
+                        tr_state.model_fingerprint = model.state_fingerprint();
+                        tr_state.checkpoint_generation = model.tick;
+                        if !do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx) {
+                            let _ = ev_tx.send(TrainerEvent::Stopped {
+                                model: Box::new(model),
+                                save_result: SaveResult::Failed {
+                                    path: current_model_path.clone(),
+                                    error: "checkpoint save failed".to_owned(),
+                                },
+                            });
+                            return;
+                        }
+                        let _ = ev_tx.send(TrainerEvent::Analytics(Box::new(model_analytics(&model))));
+
+                        if outcome == CheckpointOutcome::Finished {
+                            break;
+                        }
+                    }
                 }
+
+                // Sample complete.
+                let repeats_used = sched.repeat_count;
+                tr_state.push_block_result(pre_eval.dpc, repeats_used);
+                tr_state.completed_block_count += 1;
+                tr_state.current_block_repeat = 0;
+                tr_state.cursor = sample_idx + 1;
+
+                // §25: enforce HOT budget.
+                model.enforce_hot_budget(hot_chunks_max);
+
+                let _ = ev_tx.send(TrainerEvent::BlockDone { idx: sample_idx, repeats: repeats_used });
+
+                // Save after each sample. §37/§30/§32: failure stops the worker.
+                tr_state.model_fingerprint = model.state_fingerprint();
+                tr_state.checkpoint_generation = model.tick;
+                if !do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx) {
+                    let _ = ev_tx.send(TrainerEvent::Stopped {
+                        model: Box::new(model),
+                        save_result: SaveResult::Failed {
+                            path: current_model_path.clone(),
+                            error: "block save failed".to_owned(),
+                        },
+                    });
+                    return;
+                }
+
+                sample_idx += 1;
             }
-            syntrail_lm::trainer::adaptive::LevelChange::Keep => {}
         }
-
-        // Save after each block. §37/§30/§32: failure stops the worker.
-        tr_state.model_fingerprint = model.state_fingerprint();
-        tr_state.checkpoint_generation = model.tick; // §32
-        if !do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx) {
-            let _ = ev_tx.send(TrainerEvent::Stopped {
-                model: Box::new(model),
-                save_result: SaveResult::Failed {
-                    path: current_model_path.clone(),
-                    error: "block save failed".to_owned(),
-                },
-            });
-            return;
-        }
-
-        block_idx += 1;
     }
 }
 
@@ -635,14 +770,27 @@ impl TrainerApp {
             Some(m) => m,
             None => { self.status_msg = "No model loaded".to_owned(); return; }
         };
-        let dataset = match self.loaded_dataset.take() {
-            Some(d) => d,
-            None => { self.status_msg = "No dataset loaded".to_owned(); return; }
+
+        // §34: build TrainingInput from whichever dataset type is loaded.
+        let input = if let Some(ds) = self.loaded_dataset.take() {
+            TrainingInput::Text(ds)
+        } else if let Some(sup) = self.loaded_supervised.take() {
+            TrainingInput::Supervised(sup)
+        } else {
+            self.status_msg = "No dataset loaded".to_owned();
+            self.loaded_model = Some(model);
+            return;
         };
 
         let model_fp = model.state_fingerprint();
         let dataset_path = PathBuf::from(&self.dataset_path);
         let model_path = self.doc.path.clone().unwrap_or_else(|| PathBuf::from("model.json"));
+
+        // Extract fingerprint and length without consuming input.
+        let (ds_fingerprint, ds_len) = match &input {
+            TrainingInput::Text(ds) => (ds.fingerprint, ds.normalized.len()),
+            TrainingInput::Supervised(sup) => (sup.fingerprint(), sup.samples.len()),
+        };
 
         let tr_state = if resume {
             match &self.resume_state {
@@ -650,12 +798,15 @@ impl TrainerApp {
                     // §32: read checkpoint_generation from the model file to detect mismatched pairs.
                     let model_gen = syntrail_lm::persistence::load_checkpoint_generation(&model_path)
                         .ok(); // None if file doesn't exist or is legacy
-                    match saved.verify_resume_with_generation(dataset.fingerprint, &model_fp, model_gen) {
+                    match saved.verify_resume_with_generation(ds_fingerprint, &model_fp, model_gen) {
                         Ok(()) => saved.clone(),
                         Err(e) => {
                             self.status_msg = e;
                             self.loaded_model = Some(model);
-                            self.loaded_dataset = Some(dataset);
+                            match input {
+                                TrainingInput::Text(ds) => self.loaded_dataset = Some(ds),
+                                TrainingInput::Supervised(sup) => self.loaded_supervised = Some(sup),
+                            }
                             self.check_ready();
                             return;
                         }
@@ -664,15 +815,20 @@ impl TrainerApp {
                 _ => {
                     self.status_msg = "No valid saved state to resume from.".to_owned();
                     self.loaded_model = Some(model);
-                    self.loaded_dataset = Some(dataset);
+                    match input {
+                        TrainingInput::Text(ds) => self.loaded_dataset = Some(ds),
+                        TrainingInput::Supervised(sup) => self.loaded_supervised = Some(sup),
+                    }
                     self.check_ready();
                     return;
                 }
             }
         } else {
-            let mut ts = TrainerState::new(&dataset_path, dataset.fingerprint, dataset.normalized.len(), &model_path, model_fp);
-            // §17: apply UI start position for new runs (§19: resume always uses saved cursor).
-            ts.cursor = compute_start_cursor(&dataset.normalized, self.start_mode, &self.start_line_str, &self.start_pct_str);
+            let mut ts = TrainerState::new(&dataset_path, ds_fingerprint, ds_len, &model_path, model_fp);
+            // §17: apply UI start position for text runs only; supervised always starts at sample 0.
+            if let TrainingInput::Text(ds) = &input {
+                ts.cursor = compute_start_cursor(&ds.normalized, self.start_mode, &self.start_line_str, &self.start_pct_str);
+            }
             ts
         };
 
@@ -682,7 +838,7 @@ impl TrainerApp {
         let ev_tx2 = ev_tx.clone();
         let hot_chunks_max = self.hot_chunks_max;
         let handle = std::thread::spawn(move || {
-            worker_main(model, dataset, tr_state, model_path, hot_chunks_max, cmd_rx, ev_tx2);
+            worker_main(model, input, tr_state, model_path, hot_chunks_max, cmd_rx, ev_tx2);
         });
 
         self.cmd_tx = Some(cmd_tx);

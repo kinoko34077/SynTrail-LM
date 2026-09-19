@@ -1190,34 +1190,35 @@ fn gen_loop_02_two_state_loop_stops() {
     );
 }
 
-// ── GEN-LOOP-03: EOS stops generation before max_units ───────────────────
+// ── GEN-LOOP-03: SEQUENCE_END stops generation before max_units (§7) ────────
 #[test]
 fn gen_loop_03_eos_stops_generation() {
-    use syntrail_lm::model::EOS_CHAR;
+    use syntrail_lm::model::SEQUENCE_END_CHAR;
     let mut m = ModelState::new();
-    // Heavy EOS training at sentence boundary.
-    for _ in 0..80 { m.expose_with_eos("hello"); }
-    // EOS must have been registered as a primitive by now.
+    // §7: train with expose_with_sequence_end so the model learns to predict
+    // SEQUENCE_END_CHAR at the end of a complete output sequence.
+    for _ in 0..80 { m.expose_with_sequence_end("hello"); }
+    // SEQUENCE_END must be registered as a primitive.
     assert!(
-        m.eos_unit().is_some(),
-        "GEN-LOOP-03: EOS primitive must exist after expose_with_eos"
+        m.sequence_end_unit().is_some(),
+        "GEN-LOOP-03: SEQUENCE_END primitive must exist after expose_with_sequence_end"
     );
-    // Generate from the trained seed; EOS should fire before max_units.
+    // Generate from the trained seed; SEQUENCE_END should fire before max_units.
     let (output, trace) = m.generate_with_trace("hello", "hello", 50, 3);
     assert!(
         trace.stopped_by_eos,
-        "GEN-LOOP-03: EOS must stop generation after heavy training; stopped_by_eos=false, decisions={}",
+        "GEN-LOOP-03: SEQUENCE_END must stop generation after heavy training; stopped_by_eos=false, decisions={}",
         trace.decision_count
     );
-    // EOS character itself must not appear in output.
+    // The sequence-end character itself must not appear in output.
     assert!(
-        !output.contains(EOS_CHAR),
-        "GEN-LOOP-03: EOS char must not appear in output text"
+        !output.contains(SEQUENCE_END_CHAR),
+        "GEN-LOOP-03: SEQUENCE_END char must not appear in output text"
     );
     // Must have stopped before max_units.
     assert!(
         trace.decision_count < 50,
-        "GEN-LOOP-03: generation must end before max_units when EOS fires"
+        "GEN-LOOP-03: generation must end before max_units when SEQUENCE_END fires"
     );
 }
 

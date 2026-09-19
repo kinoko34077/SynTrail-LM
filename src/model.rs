@@ -28,8 +28,14 @@ const SEGMENT_MIN_SCORE: f64 = 0.0;
 const FACTORIZATION_SCALE: f64 = 1.0;
 
 // Generation tunables are in ModelState.gen_config (from GenerationConfig).
-/// P0: EOS marker — ETX character (U+0003).  Training can inject this at semantic boundaries.
-pub const EOS_CHAR: char = '\x03';
+/// §7: Turn-boundary marker (ETX U+0003) — injected after input at conversation turn boundaries.
+/// Teaches the model where one input turn ends; does NOT stop generation.
+pub const TURN_BOUNDARY_CHAR: char = '\x03';
+/// §7: Sequence-end marker (EOT U+0004) — predicting this stops generation.
+/// Inject this when training complete output sequences that have a natural end.
+pub const SEQUENCE_END_CHAR: char = '\x04';
+/// Backward-compatible alias for TURN_BOUNDARY_CHAR.
+pub const EOS_CHAR: char = TURN_BOUNDARY_CHAR;
 
 /// P0: Per-call generation state for cycle detection and no-progress tracking.
 /// §4: also tracks the current identity/representation being generated from.
@@ -338,9 +344,20 @@ impl ModelState {
         None
     }
 
-    /// Return the primitive ID for `EOS_CHAR`, if registered.
+    /// Return the primitive ID for `TURN_BOUNDARY_CHAR`, if registered.
+    pub fn turn_boundary_unit(&self) -> Option<UnitId> {
+        self.primitives.id(TURN_BOUNDARY_CHAR).map(UnitId::primitive)
+    }
+
+    /// Return the primitive ID for `SEQUENCE_END_CHAR`, if registered.
+    pub fn sequence_end_unit(&self) -> Option<UnitId> {
+        self.primitives.id(SEQUENCE_END_CHAR).map(UnitId::primitive)
+    }
+
+    /// Backward-compatible alias for turn_boundary_unit.
+    #[inline]
     pub fn eos_unit(&self) -> Option<UnitId> {
-        self.primitives.id(EOS_CHAR).map(UnitId::primitive)
+        self.turn_boundary_unit()
     }
 
     /// Generate text from `seed_text` without mutating self.
@@ -367,7 +384,9 @@ impl ModelState {
         let mut emitted_units: Vec<UnitId> = Vec::new();
         let mut steps: Vec<DecisionStep> = Vec::new();
         let mut gen_state = GenerationState::new();
-        let eos = self.eos_unit();
+        // §7: generation stops only on SEQUENCE_END_CHAR; TURN_BOUNDARY_CHAR is kept in the
+        // model's vocabulary but does not terminate output (it marks input-turn ends).
+        let eos = self.sequence_end_unit();
         let mut stopped_by_eos = false;
         let mut stopped_by_cycle = false;
 
@@ -472,11 +491,28 @@ impl ModelState {
     /// Like `expose_external`, but appends an EOS marker (`EOS_CHAR`) after the text
     /// so the model can learn to predict sequence end at semantic boundaries.
     ///
-    /// Use only at true semantic boundaries (sentence end, turn end), NOT at
-    /// arbitrary trainer block boundaries.
+    /// §7: Append TURN_BOUNDARY_CHAR and expose.
+    ///
+    /// Use at conversation turn boundaries (end of user input) to teach the model
+    /// where one input turn ends.  Does NOT cause generation to stop.
+    pub fn expose_with_turn_boundary(&mut self, text: &str) {
+        let s = format!("{}{}", text, TURN_BOUNDARY_CHAR);
+        self.expose_external(&s);
+    }
+
+    /// §7: Append SEQUENCE_END_CHAR and expose.
+    ///
+    /// Use when training complete output sequences so the model learns to predict
+    /// the sequence-end marker at the natural end of an output.
+    pub fn expose_with_sequence_end(&mut self, text: &str) {
+        let s = format!("{}{}", text, SEQUENCE_END_CHAR);
+        self.expose_external(&s);
+    }
+
+    /// Backward-compatible alias for expose_with_turn_boundary.
+    #[inline]
     pub fn expose_with_eos(&mut self, text: &str) {
-        let with_eos = format!("{}{}", text, EOS_CHAR);
-        self.expose_external(&with_eos);
+        self.expose_with_turn_boundary(text);
     }
 
     /// Allocate the next trace ID (monotonically increasing).

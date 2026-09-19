@@ -124,6 +124,7 @@ fn worker_main(
     dataset: Dataset,
     mut tr_state: TrainerState,
     model_path: PathBuf,
+    hot_chunks_max: usize,
     cmd_rx: Receiver<TrainerCommand>,
     ev_tx: Sender<TrainerEvent>,
 ) {
@@ -342,6 +343,9 @@ fn worker_main(
             );
         }
 
+        // §25: enforce HOT budget at block completion (low-frequency, not per-exposure).
+        model.enforce_hot_budget(hot_chunks_max);
+
         let _ = ev_tx.send(TrainerEvent::BlockDone { idx: block_idx, repeats: repeats_used });
 
         // Check if Block Level should change.
@@ -502,6 +506,8 @@ struct TrainerApp {
     start_line_str: String,
     /// §17: Percent-mode input (0–100 as string).
     start_pct_str: String,
+    /// §25: HOT chunk cap passed to the worker. 0 = unlimited.
+    hot_chunks_max: usize,
     state: AppState,
     worker: Option<JoinHandle<()>>,
     cmd_tx: Option<Sender<TrainerCommand>>,
@@ -525,6 +531,7 @@ impl TrainerApp {
             start_mode: StartMode::Beginning,
             start_line_str: "1".to_owned(),
             start_pct_str: "0.0".to_owned(),
+            hot_chunks_max: 0,
             state: AppState::Idle,
             worker: None,
             cmd_tx: None,
@@ -642,8 +649,9 @@ impl TrainerApp {
         let (ev_tx, ev_rx) = mpsc::channel();
 
         let ev_tx2 = ev_tx.clone();
+        let hot_chunks_max = self.hot_chunks_max;
         let handle = std::thread::spawn(move || {
-            worker_main(model, dataset, tr_state, model_path, cmd_rx, ev_tx2);
+            worker_main(model, dataset, tr_state, model_path, hot_chunks_max, cmd_rx, ev_tx2);
         });
 
         self.cmd_tx = Some(cmd_tx);
@@ -1068,12 +1076,22 @@ impl eframe::App for TrainerApp {
             }
 
             ui.add_space(4.0);
-            ui.label(format!(
-                "Block Level: {}  ({} lines / {} chars)",
-                self.progress.block_level.label(),
-                self.progress.block_level.target_lines(),
-                self.progress.block_level.max_chars(),
-            ));
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Block Level: {}  ({} lines / {} chars)",
+                    self.progress.block_level.label(),
+                    self.progress.block_level.target_lines(),
+                    self.progress.block_level.max_chars(),
+                ));
+                ui.add_space(16.0);
+                // §25: HOT budget control (disabled while training).
+                ui.label("HOT budget:");
+                ui.add_enabled(!training_active,
+                    egui::DragValue::new(&mut self.hot_chunks_max).speed(100).range(0..=1000000));
+                if self.hot_chunks_max == 0 {
+                    ui.label("(unlimited)");
+                }
+            });
             ui.add_space(4.0);
 
             // ── Control buttons ───────────────────────────────────────────

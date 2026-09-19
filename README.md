@@ -29,7 +29,7 @@ cargo build --release --features gui
 
 | ファイル | 内容 | 備考 |
 |---------|------|------|
-| `model.json` | モデル状態（チャンク・予測エッジ・連想エッジ） | CLI `--model`、GUI で変更可 |
+| `model.stm` | モデル状態（バイナリ・Zstd 圧縮） | デフォルト。`.json`/`.db` も互換 |
 | `history.sqlite` | GUI の会話履歴 | モデルとは独立。削除してもモデルは変わらない |
 | `syntrail.db` | CLI chat コマンドのセッション DB | CLI 専用 |
 | `<dataset>.syntrail-trainer.json` | Trainer の学習進捗 | Pause/Resume に使用 |
@@ -44,7 +44,7 @@ cargo build --release --features gui
 cargo run --release --features gui --bin syntrail-gui
 ```
 
-カレントディレクトリに `model.json` があれば自動で読み込む。なければ空のモデルで起動する。
+カレントディレクトリに `model.stm`（または `model.json`）があれば自動で読み込む。なければ空のモデルで起動する。
 
 ### Windows Native Menu / キーボードショートカット
 
@@ -61,7 +61,7 @@ cargo run --release --features gui --bin syntrail-gui
 
 ```
 ┌─ File ─────────────────────────────────────────────────────────┐  ← Native Menu
-├─ New / Open… / Save / Save As… ─ model.json ─ Gen/Chunk/dpc ─┤  ← Toolbar
+├─ New / Open… / Save / Save As… ─ model.stm ─ Gen/Chunk/dpc ─┤  ← Toolbar
 ├──────────────────────────────┬────────────────────────────────┤
 │                              │ Analytics                      │
 │  チャット履歴（スクロール）    │  Generation  0                 │
@@ -162,8 +162,8 @@ cargo run --release --features gui --bin syntrail-trainer
 
 ### 使い方
 
-1. **Model** — `.json` / `.db` / `.sqlite` を Open またはD&D
-2. **Dataset** — `.txt` ファイルを Open またはD&D（UTF-8 / Shift_JIS 自動判定）
+1. **Model** — `.stm` / `.json` / `.db` / `.sqlite` を Open またはD&D
+2. **Dataset** — `.txt`（テキスト）または `.jsonl`（Supervised）を Open またはD&D
 3. **Start** で学習開始
 
 Windows では `File` メニューと `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S` が使用可能。
@@ -200,10 +200,18 @@ Windows では `File` メニューと `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S` が�
 - **First pass**: `expose_external()` — 新規テキストとして扱う
 - **Subsequent passes**: `replay()` — 内部ルート強化のみ（外部ルートバイアスなし）
 
+### Supervised Learning（.jsonl）
+
+`.jsonl` ファイルを Dataset としてドロップすると Supervised モードで学習する。  
+各行は `{"prompt":"...","response":"..."}` 形式（Alpaca `instruction/output`・ChatML `messages` も可）。
+
+サンプルごとに 4/8/16/32 チェックポイントスケジューラを適用し、prompt→response ペアを `expose_supervised_pair()` で学習。
+
 ### D&D
 
 - Running / Paused 中はモデル/データセットの差し替えをブロックする（状態破壊防止）
-- 複数ファイルの同時ドロップはエラー表示
+- Model + Dataset の同時ドロップに対応（両方が揃った場合のみ受理）
+- 種別が不明または競合する組み合わせはエラー表示
 
 ---
 
@@ -269,8 +277,10 @@ src/
 │   ├── adaptive.rs       Adaptive Block Level
 │   ├── dataset.rs        Dataset（UTF-8 / Shift_JIS 読み込み）
 │   ├── scheduler.rs      TrainingScheduler（checkpoint 判定）
-│   ├── splitter.rs       BlockSplitter
-│   └── state.rs          TrainerState（Pause/Resume 状態）
+│   ├── splitter.rs       BlockSplitter（決定論的ジッター境界）
+│   ├── state.rs          TrainerState（Pause/Resume 状態）
+│   └── supervised.rs     SupervisedDataset / SupervisedSample（JSONL）
+├── codec.rs              UnitId packing SSOT（LEB128 / delta encoding）
 ├── config.rs             Config（hot_budget 含む全チューナブル）
 ├── model.rs              ModelState（merge_right_reuse, enforce_hot_budget）
 ├── transform.rs          TransformStore / TransformKind
@@ -279,8 +289,8 @@ src/
 ├── prediction.rs         PredictionEdge + PredictionStore
 ├── association.rs        AssociationStore（共起 Top-K）
 ├── segmentation.rs       segment() / expand()
-├── eval.rs               evaluate_frozen()
-└── persistence.rs        JSON / SQLite 永続化
+├── eval.rs               evaluate_frozen() / evaluate_supervised_pair_frozen()
+└── persistence.rs        STM binary / JSON / SQLite 永続化
 
 tests/
 └── integration.rs        integration tests
@@ -294,7 +304,7 @@ tests/
 cargo test
 ```
 
-全テスト pass、警告ゼロ（lib warnings 2 件は既存コードの未使用 API）。
+422 テスト pass（237 integration + 185 lib unit）。
 
 ---
 

@@ -43,14 +43,38 @@ fn main() -> eframe::Result<()> {
 
 // ── Worker ────────────────────────────────────────────────────────────────
 
+/// §29: Why a save was requested — controls failure severity and UI state transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveKind {
+    /// User-initiated save while running (recoverable if it fails).
+    Manual,
+    /// User-initiated save-as while running (recoverable if it fails).
+    SaveAs,
+    /// Scheduled checkpoint/block save (fatal if it fails — worker stops).
+    Checkpoint,
+    /// Save triggered by Pause command (failure → ErrorPaused, not Paused).
+    Pause,
+    /// Save triggered by Stop command (fatal, but model is still transferred).
+    Stop,
+}
+
+/// §31: Result of the exit save, carried with TrainerEvent::Stopped.
+#[derive(Debug)]
+enum SaveResult {
+    Saved(PathBuf),
+    Failed { path: PathBuf, error: String },
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 enum TrainerCommand {
     Pause,
     Resume,
     Stop,
-    /// §35: UI requests an immediate save to `path` while training is running.
-    Save(std::path::PathBuf),
+    /// §28: Save to the current canonical model path.
+    Save,
+    /// §28: Save to a new path and make it the new canonical path.
+    SaveAs(std::path::PathBuf),
 }
 
 #[derive(Debug)]
@@ -78,9 +102,13 @@ enum TrainerEvent {
     Checkpoint(CheckpointInfo),
     BlockDone { idx: usize, repeats: u32 },
     LevelChanged(BlockLevel),
-    Saved,
+    /// §29: Save succeeded — carries path and classification.
+    Saved { path: PathBuf, kind: SaveKind },
+    /// §30: Save failed — carries path, operation type, and whether the worker can continue.
+    SaveFailed { path: PathBuf, operation: SaveKind, recoverable: bool },
     Paused,
-    Stopped,
+    /// §31: Worker has exited — carries the latest in-memory model so UI never loses it.
+    Stopped { model: Box<ModelState>, save_result: SaveResult },
     /// §39: carries the finished model so the UI takes ownership without a disk re-read.
     Completed(usize, Box<ModelState>),
     Error(String),
@@ -95,6 +123,8 @@ fn worker_main(
     cmd_rx: Receiver<TrainerCommand>,
     ev_tx: Sender<TrainerEvent>,
 ) {
+    // §28: worker owns the canonical model path; SaveAs updates it here and in tr_state.
+    let mut current_model_path = model_path;
     let total_bytes = dataset.normalized.len();
 
     // Determine starting position.
@@ -118,9 +148,9 @@ fn worker_main(
                     Ok(TrainerCommand::Pause) => {
                         tr_state.status = TrainerStatus::Paused;
                         tr_state.model_fingerprint = model.state_fingerprint();
-                        // Only enter Paused state if save succeeded.
-                        if !do_save(&model, &model_path, &tr_state, &ev_tx) {
-                            // save failed — stay Running; Error already sent by do_save
+                        // §30: Only enter Paused state if save succeeded; failure → ErrorPaused.
+                        if !do_save(&model, &current_model_path, &tr_state, SaveKind::Pause, &ev_tx) {
+                            // save failed — stay Running; SaveFailed already sent
                             break;
                         }
                         let _ = ev_tx.send(TrainerEvent::Paused);
@@ -132,29 +162,45 @@ fn worker_main(
                                     break;
                                 }
                                 Ok(TrainerCommand::Stop) | Err(_) => {
-                                    save_and_exit(&mut model, &model_path, &mut tr_state, &ev_tx);
+                                    save_and_exit(model, &current_model_path, &mut tr_state, &ev_tx);
                                     return;
                                 }
-                                Ok(TrainerCommand::Save(path)) => {
+                                Ok(TrainerCommand::Save) => {
                                     tr_state.model_fingerprint = model.state_fingerprint();
-                                    do_save(&model, &path, &tr_state, &ev_tx);
+                                    do_save(&model, &current_model_path, &tr_state, SaveKind::Manual, &ev_tx);
+                                }
+                                Ok(TrainerCommand::SaveAs(new_path)) => {
+                                    tr_state.model_fingerprint = model.state_fingerprint();
+                                    // §28: update canonical path on confirmed save only
+                                    if do_save(&model, &new_path, &tr_state, SaveKind::SaveAs, &ev_tx) {
+                                        tr_state.model_path = new_path.to_string_lossy().to_string();
+                                        current_model_path = new_path;
+                                    }
                                 }
                                 _ => {}
                             }
                         }
                     }
                     Ok(TrainerCommand::Stop) => {
-                        save_and_exit(&mut model, &model_path, &mut tr_state, &ev_tx);
+                        save_and_exit(model, &current_model_path, &mut tr_state, &ev_tx);
                         return;
                     }
                     Ok(TrainerCommand::Resume) => {}  // already running
-                    Ok(TrainerCommand::Save(path)) => {
-                        // §35: on-demand save while running; failure sends Error but continues.
+                    Ok(TrainerCommand::Save) => {
+                        // §28: on-demand save to current canonical path; failure is recoverable.
                         tr_state.model_fingerprint = model.state_fingerprint();
-                        do_save(&model, &path, &tr_state, &ev_tx);
+                        do_save(&model, &current_model_path, &tr_state, SaveKind::Manual, &ev_tx);
+                    }
+                    Ok(TrainerCommand::SaveAs(new_path)) => {
+                        // §28: on-demand save-as; update canonical path only on success.
+                        tr_state.model_fingerprint = model.state_fingerprint();
+                        if do_save(&model, &new_path, &tr_state, SaveKind::SaveAs, &ev_tx) {
+                            tr_state.model_path = new_path.to_string_lossy().to_string();
+                            current_model_path = new_path;
+                        }
                     }
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => { save_and_exit(&mut model, &model_path, &mut tr_state, &ev_tx); return; }
+                    Err(TryRecvError::Disconnected) => { save_and_exit(model, &current_model_path, &mut tr_state, &ev_tx); return; }
                 }
             }
         }};
@@ -185,7 +231,7 @@ fn worker_main(
             None => {
                 tr_state.status = TrainerStatus::Completed;
                 tr_state.model_fingerprint = model.state_fingerprint();
-                do_save(&model, &model_path, &tr_state, &ev_tx);
+                do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx);
                 // §39: transfer model ownership to UI; no disk re-read needed.
                 let _ = ev_tx.send(TrainerEvent::Completed(block_idx, Box::new(model)));
                 return;
@@ -250,10 +296,16 @@ fn worker_main(
                     accuracy: eval.prediction_accuracy,
                 }));
 
-                // Save at each checkpoint. §37: failure stops the worker.
+                // Save at each checkpoint. §37/§30: failure stops the worker.
                 tr_state.model_fingerprint = model.state_fingerprint();
-                if !do_save(&model, &model_path, &tr_state, &ev_tx) {
-                    let _ = ev_tx.send(TrainerEvent::Stopped);
+                if !do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx) {
+                    let _ = ev_tx.send(TrainerEvent::Stopped {
+                        model: Box::new(model),
+                        save_result: SaveResult::Failed {
+                            path: current_model_path.clone(),
+                            error: "checkpoint save failed".to_owned(),
+                        },
+                    });
                     return;
                 }
                 let _ = ev_tx.send(TrainerEvent::Analytics(Box::new(model_analytics(&model))));
@@ -304,10 +356,16 @@ fn worker_main(
             syntrail_lm::trainer::adaptive::LevelChange::Keep => {}
         }
 
-        // Save after each block. §37: failure stops the worker.
+        // Save after each block. §37/§30: failure stops the worker.
         tr_state.model_fingerprint = model.state_fingerprint();
-        if !do_save(&model, &model_path, &tr_state, &ev_tx) {
-            let _ = ev_tx.send(TrainerEvent::Stopped);
+        if !do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx) {
+            let _ = ev_tx.send(TrainerEvent::Stopped {
+                model: Box::new(model),
+                save_result: SaveResult::Failed {
+                    path: current_model_path.clone(),
+                    error: "block save failed".to_owned(),
+                },
+            });
             return;
         }
 
@@ -315,43 +373,67 @@ fn worker_main(
     }
 }
 
-/// Save model + trainer state atomically; send Saved on success, Error on failure (§110, §111).
+/// §29/§30: Save model + trainer state; send typed Saved/SaveFailed events.
+/// Returns true on success, false on failure (failure event already sent).
 fn do_save(
     model: &ModelState,
     model_path: &PathBuf,
     tr_state: &TrainerState,
+    kind: SaveKind,
     ev_tx: &Sender<TrainerEvent>,
 ) -> bool {
+    let recoverable = matches!(kind, SaveKind::Manual | SaveKind::SaveAs | SaveKind::Pause);
     if let Err(e) = save_model_file(model, model_path) {
-        let _ = ev_tx.send(TrainerEvent::Error(format!("Model save failed: {e}")));
+        let _ = ev_tx.send(TrainerEvent::SaveFailed {
+            path: model_path.clone(),
+            operation: kind,
+            recoverable,
+        });
+        eprintln!("do_save: model save failed ({kind:?}): {e}");
         return false;
     }
     if let Err(e) = tr_state.save(&PathBuf::from(&tr_state.dataset_path)) {
-        let _ = ev_tx.send(TrainerEvent::Error(format!("State save failed: {e}")));
+        let _ = ev_tx.send(TrainerEvent::SaveFailed {
+            path: model_path.clone(),
+            operation: kind,
+            recoverable,
+        });
+        eprintln!("do_save: state save failed ({kind:?}): {e}");
         return false;
     }
-    let _ = ev_tx.send(TrainerEvent::Saved);
+    let _ = ev_tx.send(TrainerEvent::Saved { path: model_path.clone(), kind });
     true
 }
 
-/// Save on worker exit; updates fingerprint, reports errors, sends Stopped (§112).
+/// §31: Save on worker exit; sends Stopped with the in-memory model regardless of save outcome.
 fn save_and_exit(
-    model: &mut ModelState,
-    model_path: &PathBuf,
+    model: ModelState,
+    current_model_path: &PathBuf,
     tr_state: &mut TrainerState,
     ev_tx: &Sender<TrainerEvent>,
 ) {
     tr_state.model_fingerprint = model.state_fingerprint();
-    if let Err(e) = save_model_file(model, model_path) {
+    let save_result = if let Err(e) = save_model_file(&model, current_model_path) {
         eprintln!("save_and_exit: model save failed: {e}");
-        let _ = ev_tx.send(TrainerEvent::Error(format!("Exit save failed: {e}")));
+        let _ = ev_tx.send(TrainerEvent::SaveFailed {
+            path: current_model_path.clone(),
+            operation: SaveKind::Stop,
+            recoverable: false,
+        });
+        SaveResult::Failed { path: current_model_path.clone(), error: e.to_string() }
     } else if let Err(e) = tr_state.save(&PathBuf::from(&tr_state.dataset_path)) {
         eprintln!("save_and_exit: state save failed: {e}");
-        let _ = ev_tx.send(TrainerEvent::Error(format!("Exit save failed: {e}")));
+        let _ = ev_tx.send(TrainerEvent::SaveFailed {
+            path: current_model_path.clone(),
+            operation: SaveKind::Stop,
+            recoverable: false,
+        });
+        SaveResult::Failed { path: current_model_path.clone(), error: e.to_string() }
     } else {
-        let _ = ev_tx.send(TrainerEvent::Saved);
-    }
-    let _ = ev_tx.send(TrainerEvent::Stopped);
+        let _ = ev_tx.send(TrainerEvent::Saved { path: current_model_path.clone(), kind: SaveKind::Stop });
+        SaveResult::Saved(current_model_path.clone())
+    };
+    let _ = ev_tx.send(TrainerEvent::Stopped { model: Box::new(model), save_result });
 }
 
 // ── GUI state ─────────────────────────────────────────────────────────────
@@ -568,28 +650,48 @@ impl TrainerApp {
                 self.progress.block_level = lvl;
                 self.status_msg = format!("Block level changed to {}", lvl.label());
             }
-            TrainerEvent::Saved => {
-                self.status_msg = format!("Saved (block {})", self.progress.block_idx);
+            TrainerEvent::Saved { path, kind } => {
+                // §28: SaveAs confirmed — update canonical path in UI now.
+                if kind == SaveKind::SaveAs {
+                    self.model_path = path.to_string_lossy().to_string();
+                    self.status_msg = format!("Saved As: {}", path.display());
+                } else {
+                    self.status_msg = format!("Saved (block {})", self.progress.block_idx);
+                }
+            }
+            TrainerEvent::SaveFailed { path, operation, recoverable } => {
+                let op_name = match operation {
+                    SaveKind::Manual | SaveKind::SaveAs => "Save",
+                    SaveKind::Checkpoint => "Checkpoint save",
+                    SaveKind::Pause => "Pause save",
+                    SaveKind::Stop => "Stop save",
+                };
+                self.status_msg = format!("{op_name} failed: {}", path.display());
+                // §30: Pause failure → ErrorPaused (worker stayed Running).
+                if operation == SaveKind::Pause {
+                    self.state = AppState::ErrorPaused(format!("{op_name} failed"));
+                }
+                // Non-recoverable: a Stopped event will follow — no state change here.
+                let _ = recoverable;
             }
             TrainerEvent::Paused => {
                 self.state = AppState::Paused;
                 self.status_msg = "Paused and saved.".to_owned();
             }
-            TrainerEvent::Stopped => {
-                // Worker has exited; reclaim resources and return to Ready.
+            TrainerEvent::Stopped { model, save_result } => {
+                // §31: Worker has exited — take in-memory model; no disk re-read needed.
                 if let Some(h) = self.worker.take() { let _ = h.join(); }
                 self.cmd_tx = None;
                 self.event_rx = None;
-                // Re-instate loaded objects from model_path so UI is consistent.
-                let model_path = PathBuf::from(&self.model_path);
-                if let Ok(m) = syntrail_lm::app::load_model_file(&model_path) {
-                    self.loaded_model = Some(m);
-                }
+                self.loaded_model = Some(*model);
                 self.check_ready();
-                if self.status_msg.starts_with("Error") {
+                if self.status_msg.starts_with("Error") || self.status_msg.contains("failed") {
                     // keep error message
                 } else {
-                    self.status_msg = "Stopped and saved.".to_owned();
+                    self.status_msg = match &save_result {
+                        SaveResult::Saved(_) => "Stopped and saved.".to_owned(),
+                        SaveResult::Failed { error, .. } => format!("Stopped (save failed: {error})"),
+                    };
                 }
             }
             TrainerEvent::Completed(n, trained_model) => {
@@ -665,8 +767,8 @@ impl eframe::App for TrainerApp {
                     FileCommand::Save => {
                         let p = PathBuf::from(&self.model_path);
                         if training_active_menu {
-                            // §35: delegate save to worker while training is running.
-                            self.send_cmd(TrainerCommand::Save(p.clone()));
+                            // §28: delegate save to worker; path stays canonical until SavedAs confirmed.
+                            self.send_cmd(TrainerCommand::Save);
                             self.status_msg = format!("Save requested: {}", p.display());
                         } else if let Some(m) = &self.loaded_model {
                             match save_model_file(m, &p) {
@@ -682,10 +784,10 @@ impl eframe::App for TrainerApp {
                             .save_file()
                         {
                             if training_active_menu {
-                                // §35: delegate save to worker; update path for future saves.
-                                self.model_path = p.to_string_lossy().to_string();
-                                self.send_cmd(TrainerCommand::Save(p.clone()));
-                                self.status_msg = format!("Save requested: {}", p.display());
+                                // §28: delegate SaveAs to worker; do NOT update model_path yet.
+                                // UI path updates only on receiving Saved { kind: SaveAs }.
+                                self.send_cmd(TrainerCommand::SaveAs(p.clone()));
+                                self.status_msg = format!("Save As requested: {}", p.display());
                             } else if let Some(m) = &self.loaded_model {
                                 match save_model_file(m, &p) {
                                     Ok(()) => {

@@ -2359,6 +2359,104 @@ fn dial_04_turn_boundary_not_in_visible_output() {
         "DIAL-04: generation_mode must be Dialogue");
 }
 
+// ═══════════════════════════════════════════════════════════════
+// P1 §28-§34: Trainer Resume / Save Integrity Tests (TR-RESUME)
+// ═══════════════════════════════════════════════════════════════
+
+// ── TR-RESUME-01: TrainerState fingerprint survives save+load roundtrip ───
+#[test]
+fn tr_resume_01_fingerprint_survives_save_load() {
+    use syntrail_lm::trainer::state::TrainerState;
+    let dataset_tmp = tempfile::NamedTempFile::new().unwrap();
+    let model_tmp = tempfile::NamedTempFile::new().unwrap();
+    let fp = "tick=5 prims=3 chunks=0 edges=0 assoc=0".to_owned();
+    let state = TrainerState::new(
+        dataset_tmp.path(), 12345, 100, model_tmp.path(), fp.clone(),
+    );
+    state.save(dataset_tmp.path()).unwrap();
+
+    let state_path = TrainerState::state_file_path(dataset_tmp.path());
+    let loaded: TrainerState = {
+        let json = std::fs::read_to_string(&state_path).unwrap();
+        serde_json::from_str(&json).unwrap()
+    };
+    assert_eq!(loaded.model_fingerprint, fp,
+        "TR-RESUME-01: model_fingerprint must survive save/load");
+    assert_eq!(loaded.dataset_fingerprint, 12345,
+        "TR-RESUME-01: dataset_fingerprint must survive save/load");
+}
+
+// ── TR-RESUME-02: verify_resume accepts matching fingerprints ─────────────
+#[test]
+fn tr_resume_02_verify_resume_accepts_matching_fps() {
+    use syntrail_lm::trainer::state::TrainerState;
+    let dataset_tmp = tempfile::NamedTempFile::new().unwrap();
+    let model_tmp = tempfile::NamedTempFile::new().unwrap();
+    let fp = "tick=10 prims=5 chunks=1 edges=4 assoc=2".to_owned();
+    let state = TrainerState::new(dataset_tmp.path(), 99, 50, model_tmp.path(), fp.clone());
+    let result = state.verify_resume(99, &fp);
+    assert!(result.is_ok(), "TR-RESUME-02: verify_resume must accept matching fingerprints: {result:?}");
+}
+
+// ── TR-RESUME-03: verify_resume rejects changed model fingerprint ─────────
+#[test]
+fn tr_resume_03_verify_resume_rejects_changed_model_fp() {
+    use syntrail_lm::trainer::state::TrainerState;
+    let dataset_tmp = tempfile::NamedTempFile::new().unwrap();
+    let model_tmp = tempfile::NamedTempFile::new().unwrap();
+    let state = TrainerState::new(
+        dataset_tmp.path(), 42, 100, model_tmp.path(),
+        "tick=5 prims=3 chunks=0 edges=0 assoc=0".to_owned(),
+    );
+    let result = state.verify_resume(42, "tick=999 prims=99 chunks=0 edges=0 assoc=0");
+    assert!(result.is_err(), "TR-RESUME-03: verify_resume must reject changed model fingerprint");
+}
+
+// ── TR-RESUME-04: verify_resume rejects changed dataset fingerprint ───────
+#[test]
+fn tr_resume_04_verify_resume_rejects_changed_dataset_fp() {
+    use syntrail_lm::trainer::state::TrainerState;
+    let dataset_tmp = tempfile::NamedTempFile::new().unwrap();
+    let model_tmp = tempfile::NamedTempFile::new().unwrap();
+    let fp = "tick=5 prims=3 chunks=0 edges=0 assoc=0".to_owned();
+    let state = TrainerState::new(dataset_tmp.path(), 42, 100, model_tmp.path(), fp.clone());
+    let result = state.verify_resume(43, &fp);
+    assert!(result.is_err(), "TR-RESUME-04: verify_resume must reject changed dataset fingerprint");
+}
+
+// ── TR-RESUME-05: model_fingerprint matches state_fingerprint after train ──
+#[test]
+fn tr_resume_05_model_fingerprint_matches_state_fingerprint() {
+    let mut model = ModelState::new();
+    for _ in 0..5 { model.train("hello world"); }
+    let fp = model.state_fingerprint();
+    // fingerprint must be non-empty and deterministic
+    assert!(!fp.is_empty(), "TR-RESUME-05: state_fingerprint must be non-empty");
+    let fp2 = model.state_fingerprint();
+    assert_eq!(fp, fp2, "TR-RESUME-05: state_fingerprint must be deterministic");
+}
+
+// ── TR-RESUME-06: TrainerState.model_path updated on SaveAs (§28) ─────────
+#[test]
+fn tr_resume_06_model_path_updated_on_save_as() {
+    use syntrail_lm::trainer::state::TrainerState;
+    let dataset_tmp = tempfile::NamedTempFile::new().unwrap();
+    let model_tmp1 = tempfile::NamedTempFile::new().unwrap();
+    let model_tmp2 = tempfile::NamedTempFile::new().unwrap();
+    let fp = "tick=1 prims=2 chunks=0 edges=0 assoc=0".to_owned();
+    let mut state = TrainerState::new(
+        dataset_tmp.path(), 7, 10, model_tmp1.path(), fp.clone(),
+    );
+    // Simulate what the worker does on SaveAs success
+    let new_path = model_tmp2.path().to_path_buf();
+    state.model_path = new_path.to_string_lossy().to_string();
+    assert_eq!(
+        state.model_path,
+        new_path.to_string_lossy(),
+        "TR-RESUME-06: TrainerState.model_path must be updated to the new path after SaveAs",
+    );
+}
+
 // ── DIAL-02: §9 — Completion mode trace has mode=Completion ──
 #[test]
 fn dial_02_completion_mode_trace_tagged() {

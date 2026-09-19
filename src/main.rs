@@ -40,7 +40,7 @@ const USAGE: &str = "\
 Usage: syntrail <command> [options]
 
 Commands:
-  train      --input <file> [--model <path>] [--hot-budget N]
+  train      --input <file> [--model <path>] [--hot-budget N]   (default: model.stm)
   generate   --seed <text>  [--model <path>] [--max-units N]
   inspect    [--model <path>] [--storage]
   evaluate   --input <file> [--model <path>]           (frozen — read-only)
@@ -52,7 +52,7 @@ Commands:
   history    [--limit N] [--db <path>]
 ";
 
-fn default_model_path() -> PathBuf { PathBuf::from("model.json") }
+fn default_model_path() -> PathBuf { PathBuf::from("model.stm") }
 fn default_db_path() -> String { "syntrail.db".to_string() }
 
 fn load_model(path: &Path) -> ModelState {

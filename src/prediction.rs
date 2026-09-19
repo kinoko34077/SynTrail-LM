@@ -97,10 +97,12 @@ impl PredictionEdge {
     }
 
     pub fn score(&self) -> f64 {
-        let strength_norm = (self.usage_strength / 100.0).min(1.0);
-        let pos_value = (self.feedback_value / 10.0).min(1.0);
+        let practice = (self.usage_strength / 100.0).min(1.0);
+        // §8: external evidence distinguishes real-world observation from Replay practice.
+        let external = (self.external_route_evidence / 100.0).min(1.0);
+        let positive = (self.feedback_value / 10.0).min(1.0);
         let avoid_norm = (self.avoidance / 10.0).min(1.0);
-        self.confidence() + strength_norm + pos_value - avoid_norm
+        self.confidence() + practice + external + positive - avoid_norm
     }
 
     /// §9: Decomposed score for debugging — "why did this route win?"
@@ -110,7 +112,7 @@ impl PredictionEdge {
         let external = (self.external_route_evidence / 100.0).min(1.0);
         let positive = (self.feedback_value / 10.0).min(1.0);
         let avoidance = (self.avoidance / 10.0).min(1.0);
-        let total = self.confidence() + practice + positive - avoidance;
+        let total = self.confidence() + practice + external + positive - avoidance;
         RouteScoreBreakdown { practice, external, positive, avoidance, prompt_support: 0.0, cycle_penalty: 0.0, total }
     }
 }

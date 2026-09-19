@@ -3098,6 +3098,62 @@ fn score_diag_01_route_score_breakdown_fields() {
     assert!(bd2.positive > 0.0, "SCORE-DIAG-01: positive must be positive after feedback");
 }
 
+// ── GEN-SCORE tests (§8) ──────────────────────────────────────────────────
+
+#[test]
+fn gen_score_01_external_evidence_raises_score() {
+    // GEN-SCORE-01: all else equal, more external_route_evidence → higher score.
+    use syntrail_lm::prediction::PredictionEdge;
+    let ctx = syntrail_lm::units::UnitId::primitive(10);
+    let nxt = syntrail_lm::units::UnitId::primitive(11);
+
+    let mut edge_low = PredictionEdge::new(ctx, nxt);
+    edge_low.record_usage_at(1); // one experience observation
+    edge_low.external_route_evidence = 1.0;
+
+    let mut edge_high = edge_low.clone();
+    edge_high.external_route_evidence = 50.0; // more external evidence
+
+    assert!(
+        edge_high.score() > edge_low.score(),
+        "GEN-SCORE-01: higher external_route_evidence must yield higher score (got {} vs {})",
+        edge_high.score(), edge_low.score()
+    );
+}
+
+#[test]
+fn gen_score_02_practice_alone_capped() {
+    // GEN-SCORE-02: practice component is bounded (replay alone can't exceed 1.0 contribution).
+    use syntrail_lm::prediction::PredictionEdge;
+    let ctx = syntrail_lm::units::UnitId::primitive(10);
+    let nxt = syntrail_lm::units::UnitId::primitive(11);
+
+    let mut edge = PredictionEdge::new(ctx, nxt);
+    // Simulate massive Replay: very large usage_strength, zero external evidence.
+    edge.record_usage_at(1);
+    edge.usage_strength = 10_000.0; // far above the 100.0 normalization cap
+    edge.external_route_evidence = 0.0;
+
+    let bd = edge.score_breakdown();
+    assert!(bd.practice <= 1.0,
+        "GEN-SCORE-02: practice component must be capped at 1.0 (got {})", bd.practice);
+}
+
+#[test]
+fn gen_score_03_score_uses_external_evidence_after_load() {
+    // GEN-SCORE-03: generation ranking based on external evidence is preserved through save/load.
+    use syntrail_lm::persistence::{save_binary, load_binary};
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.expose_external("hello world"); }
+    let tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    save_binary(&m, tmp.path()).unwrap();
+    let out_orig = m.generate("hello", 10);
+    let mut loaded = load_binary(tmp.path()).unwrap();
+    let out_loaded = loaded.generate("hello", 10);
+    assert_eq!(out_orig, out_loaded,
+        "GEN-SCORE-03: loaded model must produce same output (external evidence preserved through STM round-trip)");
+}
+
 // ── DB-OPEN tests (§3) ────────────────────────────────────────────────────
 
 #[test]

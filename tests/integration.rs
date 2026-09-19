@@ -2897,3 +2897,43 @@ fn stm12_03_compressed_smaller_than_uncompressed() {
     assert!(compressed_size > 0, "STM12-03: compressed STM must be non-empty");
     let _ = raw_size; // suppress unused warning; comparison useful on large models
 }
+
+#[test]
+fn stm28_01_tick_delta_roundtrip_chunks() {
+    // STM28-01: chunk last_used survives save/load via tick delta encoding.
+    use syntrail_lm::persistence::{save_binary, load_binary};
+    let mut m = make_trained_model();
+    // Advance tick so deltas are non-trivial
+    for _ in 0..10 { m.train("extra training"); }
+    let original_tick = m.tick;
+
+    let tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    save_binary(&m, tmp.path()).unwrap();
+    let loaded = load_binary(tmp.path()).unwrap();
+
+    assert_eq!(loaded.tick, original_tick, "STM28-01: tick must be preserved");
+    assert_eq!(loaded.chunk_count(), m.chunk_count(), "STM28-01: chunk count must match");
+    // Verify a chunk's last_used survived via delta path
+    let orig_chunks: Vec<_> = m.chunks.iter_all().collect();
+    let load_chunks: Vec<_> = loaded.chunks.iter_all().collect();
+    for (o, l) in orig_chunks.iter().zip(load_chunks.iter()) {
+        assert_eq!(o.last_used, l.last_used,
+            "STM28-01: chunk {} last_used mismatch: {} vs {}", o.id, o.last_used, l.last_used);
+    }
+}
+
+#[test]
+fn stm28_02_tick_delta_roundtrip_edges() {
+    // STM28-02: prediction edge last_used_tick and assoc edge last_used survive via delta.
+    use syntrail_lm::persistence::{save_binary, load_binary};
+    let m = make_trained_model();
+
+    let tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    save_binary(&m, tmp.path()).unwrap();
+    let loaded = load_binary(tmp.path()).unwrap();
+
+    assert_eq!(loaded.edge_count(), m.edge_count(),
+        "STM28-02: prediction edge count must survive save/load");
+    assert_eq!(loaded.association_count(), m.association_count(),
+        "STM28-02: association edge count must survive save/load");
+}

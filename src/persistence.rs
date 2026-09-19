@@ -85,6 +85,10 @@ struct ChunkDto {
     /// v0.4: 0=Hot (default), 1=Sleep
     #[serde(default)]
     residency: u8,
+    /// §28: ticks-since-last-use delta (0 = use raw last_used for legacy compat).
+    /// Encoded as (model.tick - last_used) + 1; 0 means "not set or last_used==0".
+    #[serde(default)]
+    last_used_delta: u32,
 }
 
 impl From<&Chunk> for ChunkDto {
@@ -101,6 +105,7 @@ impl From<&Chunk> for ChunkDto {
             feedback_value: c.feedback_value as f32,
             feedback_count: c.feedback_count,
             residency: match c.residency { Residency::Hot => 0, Residency::Sleep => 1 },
+            last_used_delta: 0, // set by to_snapshot(); 0 = use raw last_used
         }
     }
 }
@@ -146,6 +151,9 @@ struct PredEdgeEntryDto {
     avoidance: f32,
     #[serde(default)]
     last_used_tick: u64,
+    /// §28: ticks-since-last-use delta (0 = use raw last_used_tick for legacy compat).
+    #[serde(default)]
+    last_used_tick_delta: u32,
     #[serde(default)]
     external_route_evidence: f32,
 }
@@ -157,6 +165,9 @@ struct AssocEdgeEntryDto {
     strength: f64,
     use_count: u32,
     last_used: u64,
+    /// §28: ticks-since-last-use delta (0 = use raw last_used for legacy compat).
+    #[serde(default)]
+    last_used_delta: u32,
 }
 
 /// Phase B: Representation Lineage entry DTO.
@@ -517,18 +528,52 @@ pub fn load_auto(path: &Path) -> std::io::Result<ModelState> {
     }
 }
 
+/// §28: Encode an absolute tick as a delta from model_tick.
+/// Returns 0 when `actual == 0` (never-used sentinel); otherwise (model_tick - actual) + 1.
+/// Saturates at u32::MAX - 1 so the +1 never wraps.
+#[inline]
+fn encode_tick_delta(actual: u64, model_tick: u64) -> u32 {
+    if actual == 0 { return 0; }
+    model_tick.saturating_sub(actual).min(u32::MAX as u64 - 1) as u32 + 1
+}
+
+/// §28: Decode a delta back to an absolute tick.
+/// `delta > 0`: `snap_tick - (delta - 1)`. `delta == 0`: use legacy `raw` value.
+#[inline]
+fn decode_tick_delta(delta: u32, snap_tick: u64, raw: u64) -> u64 {
+    if delta > 0 { snap_tick.saturating_sub(delta as u64 - 1) } else { raw }
+}
+
 pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
     let primitives: Vec<(u32, u32)> = (1..=(model.primitives.len() as u32))
         .filter_map(|id| model.primitives.scalar(id).map(|c| (id, c as u32)))
         .collect();
 
-    let chunks: Vec<ChunkDto> = model.chunks.iter_all().map(ChunkDto::from).collect();
+    let model_tick = model.tick;
+    let chunks: Vec<ChunkDto> = model.chunks.iter_all().map(|c| {
+        let delta = encode_tick_delta(c.last_used, model_tick);
+        ChunkDto {
+            id: c.id,
+            left: c.left.into(),
+            right: c.right.into(),
+            tier: c.tier.into(),
+            use_count: c.use_count,
+            usage_strength: c.usage_strength as f32,
+            last_used: if delta > 0 { 0 } else { c.last_used },
+            last_used_delta: delta,
+            expanded_length: c.expanded_length,
+            feedback_value: c.feedback_value as f32,
+            feedback_count: c.feedback_count,
+            residency: match c.residency { Residency::Hot => 0, Residency::Sleep => 1 },
+        }
+    }).collect();
 
     // §25: source-grouped prediction edges — context appears once per group.
     let prediction_edges: Vec<PredictionEdgeDto> = Vec::new(); // deprecated; new saves use groups
     let mut pred_groups: std::collections::HashMap<UnitId, Vec<PredEdgeEntryDto>> =
         std::collections::HashMap::new();
     for e in model.predictions.iter_all() {
+        let delta = encode_tick_delta(e.last_used_tick, model_tick);
         pred_groups.entry(e.context).or_default().push(PredEdgeEntryDto {
             next_unit: e.next_unit.into(),
             use_count: e.use_count,
@@ -536,7 +581,8 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
             feedback_value: e.feedback_value as f32,
             feedback_count: e.feedback_count,
             avoidance: e.avoidance as f32,
-            last_used_tick: e.last_used_tick,
+            last_used_tick: if delta > 0 { 0 } else { e.last_used_tick },
+            last_used_tick_delta: delta,
             external_route_evidence: e.external_route_evidence as f32,
         });
     }
@@ -558,11 +604,13 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
     let mut assoc_groups: std::collections::HashMap<UnitId, Vec<AssocEdgeEntryDto>> =
         std::collections::HashMap::new();
     for e in model.associations.iter_all() {
+        let delta = encode_tick_delta(e.last_used, model_tick);
         assoc_groups.entry(e.source).or_default().push(AssocEdgeEntryDto {
             target: e.target.into(),
             strength: e.strength,
             use_count: e.use_count,
-            last_used: e.last_used,
+            last_used: if delta > 0 { 0 } else { e.last_used },
+            last_used_delta: delta,
         });
     }
     let mut association_edge_groups: Vec<(UnitIdDto, Vec<AssocEdgeEntryDto>)> =
@@ -658,7 +706,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         chunk.tier = dto.tier.into();
         chunk.use_count = dto.use_count;
         chunk.usage_strength = dto.usage_strength as f64; // Phase 17: f32 → f64
-        chunk.last_used = dto.last_used;
+        chunk.last_used = decode_tick_delta(dto.last_used_delta, snap.tick, dto.last_used);
         chunk.feedback_value = dto.feedback_value as f64;
         chunk.feedback_count = dto.feedback_count;
         // Phase 8: use registry demote() so hot_pair_to_id stays consistent.
@@ -679,7 +727,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
                 edge.feedback_value = e.feedback_value as f64;
                 edge.feedback_count = e.feedback_count;
                 edge.avoidance = e.avoidance as f64;
-                edge.last_used_tick = e.last_used_tick;
+                edge.last_used_tick = decode_tick_delta(e.last_used_tick_delta, snap.tick, e.last_used_tick);
                 edge.external_route_evidence = e.external_route_evidence as f64;
             }
         }
@@ -710,7 +758,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
                 target: e.target.into(),
                 strength: e.strength,
                 use_count: e.use_count,
-                last_used: e.last_used,
+                last_used: decode_tick_delta(e.last_used_delta, snap.tick, e.last_used),
             })
         }).collect()
     } else {

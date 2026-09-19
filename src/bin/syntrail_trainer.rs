@@ -378,6 +378,10 @@ enum AppState {
     Ready { model_loaded: bool, dataset_loaded: bool },
     Running,
     Paused,
+    /// §40: Stop was sent; waiting for the worker to confirm with Stopped.
+    Stopping,
+    /// §40: Worker hit a non-fatal error and paused; user can Resume or Stop.
+    ErrorPaused(String),
     Completed(usize),
     Error(String),
 }
@@ -598,7 +602,13 @@ impl TrainerApp {
                 self.status_msg = format!("Training complete — {} blocks processed.", n);
             }
             TrainerEvent::Error(e) => {
-                self.state = AppState::Error(e.clone());
+                // §40: error while running → ErrorPaused (worker already paused or stopped);
+                // error in other states → terminal Error.
+                if matches!(&self.state, AppState::Running | AppState::Stopping) {
+                    self.state = AppState::ErrorPaused(e.clone());
+                } else {
+                    self.state = AppState::Error(e.clone());
+                }
                 self.status_msg = format!("Error: {e}");
             }
             TrainerEvent::Analytics(a) => {
@@ -618,7 +628,7 @@ impl eframe::App for TrainerApp {
         #[cfg(all(target_os = "windows", feature = "gui"))]
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            let training_active_menu = matches!(&self.state, AppState::Running | AppState::Paused);
+            let training_active_menu = matches!(&self.state, AppState::Running | AppState::Paused | AppState::Stopping | AppState::ErrorPaused(_));
             if let Ok(handle) = _frame.window_handle() {
                 if let RawWindowHandle::Win32(h) = handle.as_raw() {
                     let hwnd = h.hwnd.get() as isize;
@@ -698,7 +708,7 @@ impl eframe::App for TrainerApp {
         }
 
         // D&D — routed via desktop::drop::route_drop (§108).
-        let training_active = matches!(&self.state, AppState::Running | AppState::Paused);
+        let training_active = matches!(&self.state, AppState::Running | AppState::Paused | AppState::Stopping | AppState::ErrorPaused(_));
         let dropped: Vec<_> = ctx.input(|i| {
             i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
         });
@@ -746,7 +756,7 @@ impl eframe::App for TrainerApp {
             ui.separator();
 
             // ── File selection — read-only display during training (§116) ──
-            let file_ops_enabled = !matches!(&self.state, AppState::Running | AppState::Paused);
+            let file_ops_enabled = !matches!(&self.state, AppState::Running | AppState::Paused | AppState::Stopping);
             ui.horizontal(|ui| {
                 ui.label("Model:");
                 // Read-only display; Open is the only way to change path (§116)
@@ -813,8 +823,19 @@ impl eframe::App for TrainerApp {
                     self.state = AppState::Running;
                     self.status_msg = "Resumed.".to_owned();
                 }
-                if ui.add_enabled(is_running || is_paused, egui::Button::new("Stop")).clicked() {
+                let is_stopping = matches!(&self.state, AppState::Stopping);
+                let is_error_paused = matches!(&self.state, AppState::ErrorPaused(_));
+                // Resume from error-pause: try to continue.
+                if ui.add_enabled(is_error_paused, egui::Button::new("Resume")).clicked() {
+                    self.send_cmd(TrainerCommand::Resume);
+                    self.state = AppState::Running;
+                    self.status_msg = "Resumed after error.".to_owned();
+                }
+                if ui.add_enabled((is_running || is_paused || is_error_paused) && !is_stopping,
+                                  egui::Button::new("Stop")).clicked() {
                     self.send_cmd(TrainerCommand::Stop);
+                    self.state = AppState::Stopping; // §40
+                    self.status_msg = "Stopping…".to_owned();
                 }
             });
 

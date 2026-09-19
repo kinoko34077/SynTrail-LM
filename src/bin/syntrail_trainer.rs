@@ -153,12 +153,13 @@ fn worker_main(
                         tr_state.status = TrainerStatus::Paused;
                         tr_state.model_fingerprint = model.state_fingerprint();
                         tr_state.checkpoint_generation = model.tick; // §32
-                        // §30: Only enter Paused state if save succeeded; failure → ErrorPaused.
-                        if !do_save(&model, &current_model_path, &tr_state, SaveKind::Pause, &ev_tx) {
-                            // save failed — stay Running; SaveFailed already sent
-                            break;
+                        // §4: always enter command-wait after Pause regardless of save result.
+                        // On success: send Paused → UI stays Paused.
+                        // On failure: SaveFailed already sent → UI transitions to ErrorPaused.
+                        // Both paths wait for Resume or Stop.
+                        if do_save(&model, &current_model_path, &tr_state, SaveKind::Pause, &ev_tx) {
+                            let _ = ev_tx.send(TrainerEvent::Paused);
                         }
-                        let _ = ev_tx.send(TrainerEvent::Paused);
                         // Wait for Resume or Stop.
                         loop {
                             match cmd_rx.recv() {

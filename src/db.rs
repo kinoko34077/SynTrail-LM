@@ -285,6 +285,7 @@ impl Database {
             route_source,
             score: row.score,
             route_kind: route_kind_from_i64(row.route_kind),
+            representation_id: None, // not persisted in DB schema; loaded as None
         }
     }
 }
@@ -326,10 +327,12 @@ pub struct StepRow {
 
 fn route_kind_to_i64(k: RouteKind) -> i64 {
     match k {
-        RouteKind::Direct       => 0,
-        RouteKind::RepFallback  => 1,
-        RouteKind::RecallBridge => 2,
-        RouteKind::Generalize   => 3,
+        RouteKind::Direct             => 0,
+        RouteKind::RepFallback        => 1,
+        RouteKind::RecallBridge       => 2,
+        RouteKind::Generalize         => 3,
+        RouteKind::StructuralFallback => 4,
+        RouteKind::PrimitiveFallback  => 5,
     }
 }
 
@@ -338,6 +341,8 @@ fn route_kind_from_i64(v: i64) -> RouteKind {
         1 => RouteKind::RepFallback,
         2 => RouteKind::RecallBridge,
         3 => RouteKind::Generalize,
+        4 => RouteKind::StructuralFallback,
+        5 => RouteKind::PrimitiveFallback,
         _ => RouteKind::Direct,
     }
 }
@@ -358,6 +363,7 @@ mod tests {
             route_source: ctx,
             score: 0.9,
             route_kind: crate::trace::RouteKind::Direct,
+            representation_id: None,
         };
         TurnTrace::new(id, 1, "seed".into(), "input".into(), "output".into(), String::new(), vec![step], 1000)
     }

@@ -8,12 +8,26 @@ pub type TraceId = u64;
 pub enum RouteKind {
     /// Direct prediction from the generation context.
     Direct,
-    /// Prediction via representation predecessor chain.
+    /// Prediction via representation predecessor chain (§6).
     RepFallback,
+    /// Prediction from structural lineage decomposition (one-level).
+    StructuralFallback,
+    /// Prediction from full primitive decomposition.
+    PrimitiveFallback,
     /// Prediction from an association recall bridge (cycle escape).
     RecallBridge,
     /// Prediction via generalize() association bridge (cycle escape).
     Generalize,
+}
+
+/// §9: Distinguishes Completion (seed → continuation) from Dialogue (turn → response).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GenerationMode {
+    /// Seed is prefixed to the output (CLI / programmatic use).
+    #[default]
+    Completion,
+    /// Input is a conversation turn; emitted_text is the response only (Session::turn).
+    Dialogue,
 }
 
 /// One model decision during generation: the unit that was selected at a
@@ -29,11 +43,14 @@ pub struct DecisionStep {
     pub context: UnitId,
     /// The actual source context used for the prediction edge (may differ from
     /// `context` when a fallback or bridge route was used).
+    /// Feedback MUST be applied to this edge (route_source → unit), not context → unit.
     pub route_source: UnitId,
     /// Score of the chosen prediction edge.
     pub score: f64,
     /// How this prediction was obtained (for feedback credit assignment).
     pub route_kind: RouteKind,
+    /// §4/§6: Which Representation provided the fallback route, if any (RepFallback only).
+    pub representation_id: Option<u32>,
 }
 
 /// Complete trace of one generation call.
@@ -61,6 +78,8 @@ pub struct TurnTrace {
     pub stopped_by_eos: bool,
     /// True if generation stopped because a cycle was detected.
     pub stopped_by_cycle: bool,
+    /// §9: Which generation mode was active.
+    pub generation_mode: GenerationMode,
 }
 
 impl TurnTrace {
@@ -87,6 +106,7 @@ impl TurnTrace {
             created_at,
             stopped_by_eos: false,
             stopped_by_cycle: false,
+            generation_mode: GenerationMode::Completion,
         }
     }
 }

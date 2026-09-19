@@ -16,7 +16,7 @@ use crate::relation::{RelationKind, RelationStore};
 use crate::primitives::PrimitiveRegistry;
 use crate::representation::{RepId, RepresentationStore};
 use crate::segmentation::{expand, segment};
-use crate::trace::{DecisionStep, RouteKind, TraceId, TurnTrace, now_secs};
+use crate::trace::{DecisionStep, GenerationMode, RouteKind, TraceId, TurnTrace, now_secs};
 use crate::units::UnitId;
 
 const MERGE_THRESHOLD: u32 = 4;
@@ -93,6 +93,18 @@ impl GenerationState {
 
 impl Default for GenerationState {
     fn default() -> Self { Self::new() }
+}
+
+/// §4: Full selection provenance returned by pick_next_unit().
+/// Transferred directly to DecisionStep; no route information is inferred after the fact.
+pub struct NextChoice {
+    pub unit: UnitId,
+    pub score: f64,
+    /// The prediction edge source (may differ from generation context on fallback paths).
+    pub route_source: UnitId,
+    pub route_kind: RouteKind,
+    /// Which Representation provided this route (RepFallback only).
+    pub representation_id: Option<RepId>,
 }
 
 /// Running counters for the primary metric.
@@ -277,10 +289,13 @@ impl ModelState {
 
     // ── Frozen generation (P0: cycle detection, seed/output separation, Top-K) ──
 
-    /// P0: pick the best next unit for `context`, applying cycle penalty and lineage fallback.
-    /// §3: records rep confidence feedback (success/failure) as we walk the predecessor chain.
-    /// §4: updates gen_state.current_identity and current_rep to reflect active context.
-    fn pick_next_unit(&mut self, context: UnitId, state: &mut GenerationState) -> Option<(UnitId, f64)> {
+    /// §2/§4: Pick the best next unit for `context`, returning full provenance.
+    ///
+    /// §2 — Frozen Generation: this method MUST NOT modify ModelState learning state.
+    ///   record_success()/record_failure() must NOT be called here; use the Learning Phase instead.
+    /// §4 — NextChoice: all route provenance (source, kind, rep_id) is captured here
+    ///   and transferred directly to DecisionStep — never inferred after the fact.
+    fn pick_next_unit(&mut self, context: UnitId, state: &mut GenerationState) -> Option<NextChoice> {
         // Direct prediction — top-K with cycle penalty.
         let candidates = self.predictions.top_k_with_score(context, self.gen_config.route_top_k);
         if !candidates.is_empty() {
@@ -290,26 +305,31 @@ impl ModelState {
                     (unit, score * factor)
                 })
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            if let Some(r @ (_, s)) = best {
-                if s > 0.0 {
-                    // §4: direct hit — identity from context primitives, no specific rep.
+            if let Some((unit, score)) = best {
+                if score > 0.0 {
+                    // §4: update gen_state context tracking (gen_state mutation is allowed).
                     let prim_ids_direct: Vec<_> = self.lineage.decompose_to_primitives(context)
                         .iter().filter_map(|u| u.as_primitive()).collect();
                     state.current_identity = if prim_ids_direct.is_empty() { None }
                         else { self.identities.find_identity(&prim_ids_direct) };
                     state.current_rep = None;
-                    return Some(r);
+                    return Some(NextChoice {
+                        unit, score,
+                        route_source: context,
+                        route_kind: RouteKind::Direct,
+                        representation_id: None,
+                    });
                 }
             }
         }
 
-        // Representation predecessor chain (§5 + §3 + §4): start from preferred Rn,
-        // walk Rn → R(n-1) → … → R0 before falling to structural lineage.
-        // Phase 1: collect the chain and find the winning rep (immutable borrow).
+        // Representation predecessor chain (§5/§6): start from preferred Rn,
+        // walk Rn → R(n-1) → … → R0.
+        // §2: NO record_success/record_failure — Frozen Generation.
         let prim_units = self.lineage.decompose_to_primitives(context);
         let prim_ids: Vec<_> = prim_units.iter().filter_map(|u| u.as_primitive()).collect();
+        let mut rep_route_source: Option<UnitId> = None;
         let mut rep_result: Option<(UnitId, f64)> = None;
-        let mut failed_reps: Vec<RepId> = Vec::new();
         let mut winning_rep: Option<RepId> = None;
         let mut winning_identity: Option<IdentityId> = None;
         if !prim_ids.is_empty() {
@@ -324,11 +344,12 @@ impl ModelState {
                                 if let Some(r) = self.predictions.top1_with_score(u) {
                                     winning_rep = Some(rep_id);
                                     rep_result = Some(r);
+                                    rep_route_source = Some(u);
                                     break 'chain;
                                 }
                             }
                         }
-                        failed_reps.push(rep_id);
+                        // §2: do NOT call record_failure() here — Frozen Generation.
                         rep_id_opt = rep.predecessor_rep_id;
                     } else {
                         break;
@@ -336,32 +357,46 @@ impl ModelState {
                 }
             }
         }
-        // Phase 2: apply confidence updates and §4 identity/rep tracking.
-        for rid in failed_reps {
-            if let Some(e) = self.representations.get_mut(rid) { e.record_failure(); }
-        }
-        if let Some(rid) = winning_rep {
-            if let Some(e) = self.representations.get_mut(rid) { e.record_success(); }
+        if let (Some((unit, score)), Some(route_source), Some(rep_id)) =
+            (rep_result, rep_route_source, winning_rep)
+        {
+            // §4: update gen_state identity/rep tracking (gen_state mutation is allowed).
             state.current_identity = winning_identity;
-            state.current_rep = winning_rep;
+            state.current_rep = Some(rep_id);
+            // §2: do NOT call record_success() — Frozen Generation.
+            return Some(NextChoice {
+                unit, score,
+                route_source,
+                route_kind: RouteKind::RepFallback,
+                representation_id: Some(rep_id),
+            });
         }
-        if rep_result.is_some() { return rep_result; }
 
-        // Lineage fallback — one-level structural decomposition.
+        // Structural lineage fallback — one-level decomposition.
         let one_level = self.lineage.decompose_one(context);
         if one_level.len() > 1 || one_level.first() != Some(&context) {
             for &u in one_level.iter().rev() {
-                if let Some(r) = self.predictions.top1_with_score(u) {
-                    return Some(r);
+                if let Some((unit, score)) = self.predictions.top1_with_score(u) {
+                    return Some(NextChoice {
+                        unit, score,
+                        route_source: u,
+                        route_kind: RouteKind::StructuralFallback,
+                        representation_id: None,
+                    });
                 }
             }
         }
 
-        // Full primitive decomposition.
+        // Full primitive decomposition fallback.
         for &u in prim_units.iter().rev() {
             if u != context {
-                if let Some(r) = self.predictions.top1_with_score(u) {
-                    return Some(r);
+                if let Some((unit, score)) = self.predictions.top1_with_score(u) {
+                    return Some(NextChoice {
+                        unit, score,
+                        route_source: u,
+                        route_kind: RouteKind::PrimitiveFallback,
+                        representation_id: None,
+                    });
                 }
             }
         }
@@ -400,6 +435,18 @@ impl ModelState {
         max_units: usize,
         trace_id: TraceId,
     ) -> (String, TurnTrace) {
+        self.generate_with_trace_mode(seed_text, input_text, max_units, trace_id, GenerationMode::Completion)
+    }
+
+    /// §9: Generation with explicit mode (Completion or Dialogue).
+    pub fn generate_with_trace_mode(
+        &mut self,
+        seed_text: &str,
+        input_text: &str,
+        max_units: usize,
+        trace_id: TraceId,
+        mode: GenerationMode,
+    ) -> (String, TurnTrace) {
         let prim_ids: Vec<u32> = seed_text.chars()
             .filter_map(|c| self.primitives.id(c))
             .collect();
@@ -408,9 +455,10 @@ impl ModelState {
         let mut emitted_units: Vec<UnitId> = Vec::new();
         let mut steps: Vec<DecisionStep> = Vec::new();
         let mut gen_state = GenerationState::new();
-        // §7: generation stops only on SEQUENCE_END_CHAR; TURN_BOUNDARY_CHAR is kept in the
-        // model's vocabulary but does not terminate output (it marks input-turn ends).
+        // §7: generation stops only on SEQUENCE_END_CHAR.
+        // §10: TURN_BOUNDARY_CHAR is suppressed from visible output and causes a state transition.
         let eos = self.sequence_end_unit();
+        let turn_boundary = self.turn_boundary_unit();
         let mut stopped_by_eos = false;
         let mut stopped_by_cycle = false;
 
@@ -422,12 +470,18 @@ impl ModelState {
 
             match self.pick_next_unit(context, &mut gen_state) {
                 None => break,
-                Some((next, score)) => {
+                Some(choice) => {
+                    let next = choice.unit;
                     if eos == Some(next) {
                         stopped_by_eos = true;
                         break;
                     }
-                    // Cycle confirmed — escalate through fallback chain (§10).
+                    // §10: TURN_BOUNDARY is an internal state transition — suppress from output.
+                    if turn_boundary == Some(next) {
+                        // Do not add to emitted_units or steps; continue generation.
+                        continue;
+                    }
+                    // Cycle confirmed — escalate through fallback chain.
                     if gen_state.is_recent_route(context, next) {
                         // 1. Recall: find associations, try prediction from each associate.
                         let mut escaped = false;
@@ -440,6 +494,7 @@ impl ModelState {
                                         step_index, unit: alt, context,
                                         route_source: assoc, score: alt_score,
                                         route_kind: RouteKind::RecallBridge,
+                                        representation_id: None,
                                     });
                                     gen_state.push_route(context, alt);
                                     gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
@@ -460,6 +515,7 @@ impl ModelState {
                                     step_index, unit: alt, context,
                                     route_source: context, score: alt_score,
                                     route_kind: RouteKind::Generalize,
+                                    representation_id: None,
                                 });
                                 gen_state.push_route(context, alt);
                                 gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
@@ -475,10 +531,15 @@ impl ModelState {
                         stopped_by_cycle = true;
                         break;
                     }
+                    // §4: use NextChoice provenance directly; never infer route after the fact.
                     steps.push(DecisionStep {
-                        step_index, unit: next, context,
-                        route_source: context, score,
-                        route_kind: RouteKind::Direct,
+                        step_index,
+                        unit: next,
+                        context,
+                        route_source: choice.route_source,
+                        score: choice.score,
+                        route_kind: choice.route_kind,
+                        representation_id: choice.representation_id,
                     });
                     gen_state.push_route(context, next);
                     gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
@@ -491,15 +552,20 @@ impl ModelState {
             }
         }
 
-        // Completion-mode output: seed + emitted.
+        // §10: strip TURN_BOUNDARY from visible text — it is an internal state transition,
+        // never a surface character. Suppression at the unit level handles pure primitives;
+        // stripping at decode time handles TURN_BOUNDARY embedded inside expanded chunks.
+        let expanded_emit = expand(&emitted_units, &self.chunks, &self.primitives);
+        let emitted_text = self.primitives.decode(&expanded_emit)
+            .unwrap_or_default()
+            .replace(TURN_BOUNDARY_CHAR, "");
+
         let mut all_units = context_units.clone();
         all_units.extend_from_slice(&emitted_units);
         let expanded_all = expand(&all_units, &self.chunks, &self.primitives);
-        let output = self.primitives.decode(&expanded_all).unwrap_or_default();
-
-        // Emitted-only text for Dialogue mode.
-        let expanded_emit = expand(&emitted_units, &self.chunks, &self.primitives);
-        let emitted_text = self.primitives.decode(&expanded_emit).unwrap_or_default();
+        let output = self.primitives.decode(&expanded_all)
+            .unwrap_or_default()
+            .replace(TURN_BOUNDARY_CHAR, "");
 
         let mut trace = TurnTrace::new(
             trace_id,
@@ -513,6 +579,7 @@ impl ModelState {
         );
         trace.stopped_by_eos = stopped_by_eos;
         trace.stopped_by_cycle = stopped_by_cycle;
+        trace.generation_mode = mode;
 
         (output, trace)
     }
@@ -569,8 +636,10 @@ impl ModelState {
         credits: &[f64],
         decay: f64,
     ) {
+        // §5: Feedback MUST target the actual prediction edge (route_source → unit),
+        // not the generation context → unit, which may be a different edge or non-existent.
         for (step, &r) in trace.decision_steps.iter().zip(credits.iter()) {
-            self.predictions.apply_feedback_to_edge(step.context, step.unit, r, decay);
+            self.predictions.apply_feedback_to_edge(step.route_source, step.unit, r, decay);
             if let Some(cid) = step.unit.as_chunk() {
                 if let Some(chunk) = self.chunks.get_mut(cid) {
                     chunk.apply_feedback(r, decay);

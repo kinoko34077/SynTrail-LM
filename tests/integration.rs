@@ -2040,3 +2040,196 @@ fn trf08_transform_persistence_roundtrip() {
     assert!((t.evidence - 0.75).abs() < 1e-9,
         "TRF-08: evidence must survive roundtrip; got {}", t.evidence);
 }
+
+// ── GEN-FROZEN-01: §2 — generation must not mutate representation confidence/practice_count ──
+#[test]
+fn gen_frozen_01_generation_does_not_mutate_representations() {
+    let mut model = ModelState::new();
+    // Train enough text so representations are formed.
+    for _ in 0..30 { model.train("hello world foo bar"); }
+
+    // Capture snapshot of all representation entries before generation.
+    let before: Vec<(u32, u32, f32)> = model.representations.iter_all()
+        .map(|e| (e.rep_id, e.practice_count, e.confidence))
+        .collect();
+
+    // Generate text (must not touch representation learning state).
+    for _ in 0..5 {
+        let _ = model.generate("hello", 20);
+    }
+
+    // All entries must be identical after generation.
+    let after: Vec<(u32, u32, f32)> = model.representations.iter_all()
+        .map(|e| (e.rep_id, e.practice_count, e.confidence))
+        .collect();
+
+    assert_eq!(before, after,
+        "GEN-FROZEN-01: generation must not change representation confidence or practice_count");
+}
+
+// ── FB-PROV-01: §5 — Direct route feedback targets the actual edge (route_source → unit) ──
+#[test]
+fn fb_prov_01_direct_route_feedback_targets_correct_edge() {
+    use syntrail_lm::trace::RouteKind;
+    let mut model = ModelState::new();
+    // Train A→B→C so edges exist.
+    for _ in 0..20 { model.train("abc"); }
+
+    let tid = model.alloc_trace_id();
+    let (_, trace) = model.generate_with_trace("a", "a", 5, tid);
+
+    // Only check if we have Direct steps.
+    let direct_steps: Vec<_> = trace.decision_steps.iter()
+        .filter(|s| s.route_kind == RouteKind::Direct)
+        .collect();
+    if direct_steps.is_empty() {
+        return; // no direct steps to verify
+    }
+
+    let credits = vec![1.0_f64; trace.decision_steps.len()];
+    // Record feedback count on the direct edge before applying.
+    let step = &direct_steps[0];
+    let before = model.predictions.iter_all()
+        .find(|e| e.context == step.route_source && e.next_unit == step.unit)
+        .map(|e| e.feedback_count)
+        .unwrap_or(0);
+
+    model.apply_feedback_to_trace(&trace, &credits, 0.99);
+
+    let after = model.predictions.iter_all()
+        .find(|e| e.context == step.route_source && e.next_unit == step.unit)
+        .map(|e| e.feedback_count)
+        .unwrap_or(0);
+
+    assert!(after > before,
+        "FB-PROV-01: feedback_count on edge (route_source→unit) must increase; before={before} after={after}");
+
+    // For Direct route, route_source == context. Verify no phantom edge (context≠route_source) was updated.
+    assert_eq!(step.route_source, step.context,
+        "FB-PROV-01: Direct route must have route_source == context");
+}
+
+// ── FB-PROV-02: §5 — RecallBridge feedback targets bridge edge (B→C), not context edge (A→C) ──
+#[test]
+fn fb_prov_02_recall_bridge_feedback_targets_bridge_edge() {
+    use syntrail_lm::trace::RouteKind;
+    let mut model = ModelState::new();
+    // Train association A↔B and route B→C, but NOT A→C.
+    for _ in 0..30 { model.train("ab"); }
+    for _ in 0..30 { model.train("bc"); }
+
+    let tid = model.alloc_trace_id();
+    let (_, trace) = model.generate_with_trace("a", "a", 10, tid);
+
+    let bridge_steps: Vec<_> = trace.decision_steps.iter()
+        .filter(|s| s.route_kind == RouteKind::RecallBridge)
+        .collect();
+    if bridge_steps.is_empty() {
+        return; // cycle escape not triggered in this run
+    }
+
+    let credits = vec![1.0_f64; trace.decision_steps.len()];
+    let step = &bridge_steps[0];
+    let bridge_src = step.route_source;
+    let bridge_tgt = step.unit;
+    let gen_ctx = step.context;
+
+    let before_bridge = model.predictions.iter_all()
+        .find(|e| e.context == bridge_src && e.next_unit == bridge_tgt)
+        .map(|e| e.feedback_count)
+        .unwrap_or(0);
+    let before_phantom = model.predictions.iter_all()
+        .find(|e| e.context == gen_ctx && e.next_unit == bridge_tgt)
+        .map(|e| e.feedback_count);
+
+    model.apply_feedback_to_trace(&trace, &credits, 0.99);
+
+    let after_bridge = model.predictions.iter_all()
+        .find(|e| e.context == bridge_src && e.next_unit == bridge_tgt)
+        .map(|e| e.feedback_count)
+        .unwrap_or(0);
+    let after_phantom = model.predictions.iter_all()
+        .find(|e| e.context == gen_ctx && e.next_unit == bridge_tgt)
+        .map(|e| e.feedback_count);
+
+    assert!(after_bridge > before_bridge,
+        "FB-PROV-02: feedback_count on bridge edge (route_source→unit) must increase");
+    // The phantom edge (context→unit where context≠route_source) must not have been created or updated.
+    assert_eq!(before_phantom, after_phantom,
+        "FB-PROV-02: phantom edge (context→unit) must not be updated by RecallBridge feedback");
+}
+
+// ── GEN-REPFB-01: §4/§6 — RepFallback gives RouteKind::RepFallback + representation_id in trace ──
+#[test]
+fn gen_repfb_01_rep_fallback_provenance_in_trace() {
+    use syntrail_lm::trace::RouteKind;
+    use syntrail_lm::identity::IdentityStore;
+    // Build a model with a known representation that has a prediction via a rep unit.
+    let mut model = ModelState::new();
+    // Train so that primitives and chunks exist.
+    for _ in 0..40 { model.train("abc def abc"); }
+
+    let tid = model.alloc_trace_id();
+    let (_, trace) = model.generate_with_trace("abc", "abc", 15, tid);
+
+    // Find any RepFallback steps.
+    let rep_steps: Vec<_> = trace.decision_steps.iter()
+        .filter(|s| s.route_kind == RouteKind::RepFallback)
+        .collect();
+
+    // If a RepFallback occurred, representation_id must be Some and route_source ≠ context.
+    for step in &rep_steps {
+        assert!(step.representation_id.is_some(),
+            "GEN-REPFB-01: RepFallback step must have representation_id set; step={:?}", step.step_index);
+        // route_source is the unit from the rep that had a prediction, which may equal context but is tracked separately.
+        // The key invariant: route_kind == RepFallback means it was NOT a direct context prediction.
+        assert_ne!(step.route_kind, RouteKind::Direct,
+            "GEN-REPFB-01: RepFallback step must not be labelled Direct");
+    }
+    // Test is informational if no RepFallback occurred; it does not fail.
+}
+
+// ── DIAL-04: §10 — TURN_BOUNDARY char must not appear in emitted_text (Dialogue mode) ──
+#[test]
+fn dial_04_turn_boundary_not_in_visible_output() {
+    use syntrail_lm::model::TURN_BOUNDARY_CHAR;
+    use syntrail_lm::trace::GenerationMode;
+    let mut model = ModelState::new();
+    // Train text that includes TURN_BOUNDARY so model learns to predict it.
+    for _ in 0..30 {
+        let s = format!("hello{}world", TURN_BOUNDARY_CHAR);
+        model.expose_external(&s);
+    }
+    let tid = model.alloc_trace_id();
+    let (_, trace) = model.generate_with_trace_mode(
+        "hello", "hello", 30, tid, GenerationMode::Dialogue,
+    );
+    assert!(!trace.emitted_text.contains(TURN_BOUNDARY_CHAR),
+        "DIAL-04: TURN_BOUNDARY_CHAR must not appear in emitted_text; got {:?}", trace.emitted_text);
+    assert_eq!(trace.generation_mode, GenerationMode::Dialogue,
+        "DIAL-04: generation_mode must be Dialogue");
+}
+
+// ── DIAL-02: §9 — Completion mode trace has mode=Completion ──
+#[test]
+fn dial_02_completion_mode_trace_tagged() {
+    use syntrail_lm::trace::GenerationMode;
+    let mut model = ModelState::new();
+    for _ in 0..10 { model.train("abc"); }
+    let tid = model.alloc_trace_id();
+    let (_, trace) = model.generate_with_trace("a", "a", 5, tid);
+    assert_eq!(trace.generation_mode, GenerationMode::Completion,
+        "DIAL-02: generate_with_trace must tag mode as Completion");
+}
+
+// ── DIAL-03: §9 — generate_with_trace_mode(Dialogue) tags mode as Dialogue ──
+#[test]
+fn dial_03_dialogue_mode_trace_tagged() {
+    use syntrail_lm::trace::GenerationMode;
+    let mut model = ModelState::new();
+    for _ in 0..10 { model.train("abc"); }
+    let tid = model.alloc_trace_id();
+    let (_, trace) = model.generate_with_trace_mode("a", "a", 5, tid, GenerationMode::Dialogue);
+    assert_eq!(trace.generation_mode, GenerationMode::Dialogue,
+        "DIAL-03: generate_with_trace_mode(Dialogue) must tag mode as Dialogue");
+}

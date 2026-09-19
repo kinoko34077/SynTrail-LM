@@ -12,7 +12,7 @@ use crate::db::{Database, TurnRow};
 use crate::feedback::{distribute, FeedbackEvent, FeedbackSign, FeedbackSource};
 use crate::model::ModelState;
 use crate::persistence;
-use crate::trace::{TurnTrace, now_secs};
+use crate::trace::{GenerationMode, TurnTrace, now_secs};
 
 pub struct Session {
     pub model: ModelState,
@@ -62,7 +62,10 @@ impl Session {
         let trace_id = self.model.alloc_trace_id();
         let max_units = self.config.default_max_units;
 
-        let (_output, trace) = self.model.generate_with_trace(input, input, max_units, trace_id);
+        // §9: Session::turn() always uses Dialogue mode.
+        let (_output, trace) = self.model.generate_with_trace_mode(
+            input, input, max_units, trace_id, GenerationMode::Dialogue,
+        );
 
         // Expose input with EOS at turn boundary — teaches model to predict sequence end.
         self.model.expose_with_eos(input);

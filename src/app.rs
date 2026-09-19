@@ -16,9 +16,11 @@ use crate::trace::now_secs;
 
 // ── Shared free functions (used by both AppHandle and Trainer) ────────────
 
-/// Extension-aware save: `.db`/`.sqlite` → snapshot row; anything else → JSON.
+/// Extension-aware save: `.stm` → binary; `.db`/`.sqlite` → snapshot row; anything else → JSON.
 pub fn save_model_file(model: &ModelState, path: &Path) -> Result<(), Box<dyn Error>> {
-    match path.extension().and_then(|e| e.to_str()) {
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("stm") => { persistence::save_binary(model, path)?; }
         Some("db") | Some("sqlite") => {
             let db = Database::open(&path.to_string_lossy())?;
             let snap = persistence::to_snapshot(model);
@@ -31,9 +33,11 @@ pub fn save_model_file(model: &ModelState, path: &Path) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-/// Extension-aware load: `.db`/`.sqlite` → latest snapshot; anything else → JSON.
+/// Extension-aware load: `.stm` → binary; `.db`/`.sqlite` → latest snapshot; anything else → JSON.
 pub fn load_model_file(path: &Path) -> Result<ModelState, Box<dyn Error>> {
-    match path.extension().and_then(|e| e.to_str()) {
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("stm") => Ok(persistence::load_binary(path)?),
         Some("db") | Some("sqlite") => {
             let db = Database::open(&path.to_string_lossy())?;
             let json = db.load_latest_snapshot_json()?

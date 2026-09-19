@@ -1803,6 +1803,20 @@ fn trf06_composed_does_not_merge() {
         "TRF-06: composed transform must not merge endpoints");
 }
 
+// ── MFILE-01: §21/§22 — save_model_file/.stm roundtrip ───────────────────
+#[test]
+fn mfile01_stm_roundtrip() {
+    use syntrail_lm::app::{save_model_file, load_model_file};
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.expose_external("hello world"); }
+    let tick_before = m.tick;
+    let f = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    save_model_file(&m, f.path()).unwrap();
+    let loaded = load_model_file(f.path()).unwrap();
+    assert_eq!(loaded.tick, tick_before,
+        "MFILE-01: .stm roundtrip must preserve model tick");
+}
+
 // ── DIAL-01: §8 — session.turn() returns dialogue output (emitted only) ────
 #[test]
 fn dial01_session_turn_returns_emitted_not_completion() {

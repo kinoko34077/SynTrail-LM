@@ -1,8 +1,8 @@
 # 現在の実装状態
 
-最終確認: 2026-09-19 (§8 SQLite BLOB pass)  
+最終確認: 2026-09-19 (§16/§17 STM v3 pass)  
 crate version: 0.5.0  
-integration tests: 157 (+ 219 unit tests = 376 total)
+integration tests: 162 (+ 219 unit tests = 381 total)
 
 ---
 
@@ -61,6 +61,9 @@ integration tests: 157 (+ 219 unit tests = 376 total)
 - **Lineage deduplication removed** (lineage_entries=[] in new saves; reconstructed from chunks) ← §19
 - **Source-grouped Prediction/Association storage** (context/source once per group) ← §25/§26
 - **SQLite BLOB snapshots** (bincode BLOB in blob_data column; legacy JSON fallback) ← §8
+- **STM v2: varint bincode** (STM container v2; bincode DefaultOptions varint_encoding) ← §27
+- **Tick delta encoding** (last_used/last_used_tick as u32 delta from model.tick) ← §28
+- **STM v3: packed UnitId + implicit IDs** (UnitIdDto = varint u32, no chunk.id/rep_id) ← §16/§17
 
 ---
 

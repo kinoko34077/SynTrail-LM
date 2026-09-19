@@ -1,8 +1,8 @@
 # 現在の実装状態
 
-最終確認: 2026-09-19  
+最終確認: 2026-09-19 (§50 accuracy pass)  
 crate version: 0.5.0  
-integration tests: 111 (+ 219 unit tests = 330 total)
+integration tests: 149 (+ 219 unit tests = 368 total)
 
 ---
 
@@ -46,6 +46,13 @@ integration tests: 111 (+ 219 unit tests = 330 total)
 - **Adaptive Trainer** (S/M/L/XL block, 4→8→16→32 repeat, Pause/Resume/Stop/ErrorPaused)
 - **DocumentState** (path + dirty flag; wired into AppHandle; save_model errors on no-path)
 - **.stm binary dispatch** (save_model_file / load_model_file)
+- **RelationStore derived** (rebuild_relations() on load; not persisted) ← §26
+- **Content→Identity direct index** (unit_to_identity HashMap, O(1) UnitId→IdentityId) ← §7
+- **Generalization real tests** (GEN-01..04: no direct edge, association bridge path) ← §48
+- **Desktop dialogs SSOT** (desktop::dialogs — all dialog calls unified, §35)
+- **Trainer Dirty Guard** (model_dirty, Save/Discard/Cancel before New/Open) ← §41
+- **TrainerMenu / OpenDataset** (trainer-specific native menu, FileCommand::OpenDataset) ← §39
+- **Native Menu as primary File UI** (toolbar file buttons hidden on Windows) ← §38
 
 ---
 
@@ -56,7 +63,7 @@ integration tests: 111 (+ 219 unit tests = 330 total)
 | P2 | Phase G: RelationStore canonical化 (方針A/B選択, §18) |
 | P3 | Phase H: MemoryBudgetConfig, Global Active Budget (§19-§20) |
 | P4 | Phase I: Core/Overlay physical split final |
-| P4 | Phase J: Generalization real unseen tests (GEN-01..04) |
+| ~~P4~~ | Phase J: Generalization real unseen tests (GEN-01..04) — ✅ §48 |
 | P4 | Phase A残: docs/spec §64 8ファイル構成 + §65 template |
 | P5 | save_auto/load_auto が通常save経路に未統合 |
 | P5 | codec.rs が binary snapshot に未接続 |
@@ -110,7 +117,7 @@ integration tests: 111 (+ 219 unit tests = 330 total)
 | G | RelationStore canonical化 | 未着手 |
 | H | Memory Budget | 未着手 |
 | I | Core/Overlay physical split | 未着手 |
-| J | Generalization real tests | 未着手 |
+| J | Generalization real tests (GEN-01..04) | ✅ §48 |
 
 ### Desktop UI Phases (§136)
 
@@ -125,3 +132,7 @@ integration tests: 111 (+ 219 unit tests = 330 total)
 | UI-7 | Native Menu本実装 (Chat GUI, NativeMenu::build/attach/poll) | ✅ 完了 |
 | UI-8 | Trainer Native Menu + File操作統合 | ✅ 完了 |
 | UI-9 | README最終更新 + docs/spec更新 | ✅ 完了 |
+| §35 | Desktop dialogs SSOT (dialogs.rs) | ✅ 完了 |
+| §38 | Native Menu primary File UI (toolbar hidden on Windows) | ✅ 完了 |
+| §39 | TrainerMenu + OpenDataset command | ✅ 完了 |
+| §41 | Trainer Dirty Save/Discard/Cancel guard | ✅ 完了 |

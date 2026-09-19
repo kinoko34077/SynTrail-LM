@@ -1,9 +1,8 @@
 # 現在の実装状態
 
 最終確認: 2026-09-19  
-main HEAD: 8f66f40 (P0/P1/P2 generation path + UI wiring)  
 crate version: 0.5.0  
-integration tests: 100 (+ 219 unit tests)
+integration tests: 111 (+ 219 unit tests = 330 total)
 
 ---
 
@@ -18,8 +17,8 @@ integration tests: 100 (+ 219 unit tests)
 - PredictionStore (Route)
 - AssociationStore (Top-K, Adjacency相当)
 - Feedback / Avoidance (Context-dependent)
-- Frozen generation (with Trace, EOS, cycle detection) ← Phase D (P0)
-- **EOS turn learning** (session.turn() calls expose_with_eos at turn boundary)
+- **Frozen generation** (with Trace, TURN_BOUNDARY/SEQUENCE_END分離, cycle detection, no-progress stagnation) ← Phase D (P0/§7/§12)
+- **EOS turn learning** (session.turn(): expose_with_turn_boundary + returns emitted_text)
 - **Representation preferred fallback** (pick_next_unit: RepresentationStore.preferred() before lineage)
 - **Cycle fallback chain** (Recall → Generalize → stop, instead of immediate break)
 - Frozen Eval (evaluate_frozen, evaluate_sample_frozen)
@@ -43,8 +42,10 @@ integration tests: 100 (+ 219 unit tests)
 - **Fixed Point / Packing** (f32 in DTOs) ← Phase 17
 - **Variable-bit ID / Region Encoding** (LEB128 + zigzag delta codec) ← Phase 18
 - **Generalization / Novel Search** (generalize() + novel_candidates()) ← Phase 20
-- **Chat GUI** (eframe/egui)
-- **Adaptive Trainer** (S/M/L/XL block, 4→8→16→32 repeat, Pause/Resume)
+- **Chat GUI** (eframe/egui; DocumentState dirty tracking, New Model / New Conversation)
+- **Adaptive Trainer** (S/M/L/XL block, 4→8→16→32 repeat, Pause/Resume/Stop/ErrorPaused)
+- **DocumentState** (path + dirty flag; wired into AppHandle; save_model errors on no-path)
+- **.stm binary dispatch** (save_model_file / load_model_file)
 
 ---
 
@@ -81,7 +82,7 @@ integration tests: 100 (+ 219 unit tests)
 | ~~P1~~ | `send_message()` | raw input trimが先行 (§100) | ✅ UI-5 |
 | ~~P1~~ | `last_output_len` (bytes) | 表示がバイト数 (§101) | ✅ UI-5 |
 | P2 | Analytics | N turnごと更新で不一致表示 (§102) | 未 |
-| P2 | New操作 | New Model / New Conversation 意味不明確 (§103) | 未 |
+| ~~P2~~ | New操作 | New Model / New Conversation 意味不明確 (§103) | ✅ §26/§27 |
 
 ### 共通 (Architecture)
 

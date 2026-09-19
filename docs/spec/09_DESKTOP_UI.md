@@ -13,10 +13,13 @@ Chat GUI / Trainer / 将来のTeacher等に共通するOS/Desktop操作を各bin
 ```
 src/desktop/
     mod.rs
-    file_ops.rs      FileKind, FileDialogSpec, ModelFileService
-    dialogs.rs       open_model_dialog, save_model_dialog, open_dataset_dialog
-    drop.rs          DropRouter, DroppedFile → FileCommand
+    file_ops.rs      FileKind, FileCommand
+    dialogs.rs       open_model_dialog, save_model_dialog, open_dataset_dialog,
+                     confirm_discard_dialog, confirm_save_discard_cancel_dialog
+    drop.rs          route_drop(), AcceptedKinds, DropResult → FileCommand
     fonts.rs         setup_fonts() (CJK font candidates)
+    platform/
+        windows.rs   NativeMenu (Chat), TrainerMenu (Trainer)
 ```
 
 ---
@@ -43,9 +46,12 @@ pub enum FileKind {
 ```rust
 pub enum FileCommand {
     New,
-    Open(PathBuf),
+    NewConversation,   // Chat GUIのみ — 会話履歴リセット、モデル保持
+    Open,
+    OpenDataset,       // Trainer専用 — テキストデータセット選択 (§39)
     Save,
-    SaveAs(PathBuf),
+    SaveAs,
+    LoadPath(PathBuf), // D&D / 最近使ったファイル用
 }
 ```
 
@@ -80,39 +86,51 @@ GUI → ModelFileService → persistence::save / load
 
 ---
 
-## Dirty State (§87)
+## Dirty State (§87, §41)
 
-```rust
-pub struct DocumentState {
-    pub path: Option<PathBuf>,
-    pub dirty: bool,
-}
-```
+**Chat GUI** は `DocumentState { path, dirty }` で管理。
 
-- モデル変更時: `dirty = true`
-- 保存成功: `dirty = false`
-- 新規作成: `path = None, dirty = false`
-- New / Open / Exit 時に dirty なら Save / Discard / Cancel を選べる設計
+**Trainer** は `model_dirty: bool` フィールドで管理 (§41):
+- 停止時の最終 save が失敗した場合: `model_dirty = true`
+- `TrainerEvent::Saved` 受信時: `model_dirty = false`
+- `TrainerEvent::Completed` 受信時: `model_dirty = false`
+- New / Open 前に dirty なら `confirm_save_discard_cancel_dialog()` を表示:
+  - **Save**: 保存して続行
+  - **Discard**: 保存せず続行
+  - **Cancel**: 操作を中断
 
 ---
 
-## Windows Native Menu (§88〜90)
+## Windows Native Menu (§88〜90, §39)
 
-最低限のメニュー構成:
-
+Chat GUI (NativeMenu):
 ```
 File
-  New
-  Open...         Ctrl+N / Ctrl+O
+  New Model       Ctrl+N
+  New Conversation Ctrl+Shift+N
+  Open...         Ctrl+O
   Save            Ctrl+S
   Save As...      Ctrl+Shift+S
   ────────────
   Exit
 ```
 
-Native Menu event → `AppCommand::File(FileCommand)` → common file service → App-specific state update。
+Trainer (TrainerMenu — §39):
+```
+File
+  New Session     Ctrl+N
+  Open Model...   Ctrl+O
+  Open Dataset... Ctrl+Shift+O
+  Save            Ctrl+S
+  Save As...      Ctrl+Shift+S
+  ────────────
+  Exit
+```
+
+Native Menu event → `FileCommand` → App-specific handler。
 
 Windows 固有コードは `desktop/platform/windows.rs` へ隔離。
+非 Windows では egui toolbar ボタンが fallback として機能する (§38)。
 
 ---
 

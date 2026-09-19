@@ -350,11 +350,19 @@ pub fn load_checkpoint_generation(path: &Path) -> std::io::Result<u64> {
         Some("db") | Some("sqlite") => {
             let db = Database::open(&path.to_string_lossy())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            let json = db.load_latest_snapshot_json()
+            // §8: prefer blob_data; fall back to json_blob for legacy rows.
+            let snapshot: ModelSnapshot = if let Some(blob) = db.load_latest_snapshot_blob()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no snapshot in DB"))?;
-            let snapshot: ModelSnapshot = serde_json::from_str(&json)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            {
+                bincode::deserialize(&blob)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            } else {
+                let json = db.load_latest_snapshot_json()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no snapshot in DB"))?;
+                serde_json::from_str(&json)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            };
             Ok(snapshot.checkpoint_generation)
         }
         _ => {

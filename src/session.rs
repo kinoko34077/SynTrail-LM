@@ -12,6 +12,7 @@ use crate::db::{Database, TurnRow};
 use crate::feedback::{distribute, FeedbackEvent, FeedbackSign, FeedbackSource};
 use crate::model::ModelState;
 use crate::persistence;
+use bincode;
 use crate::trace::{GenerationMode, TurnTrace, now_secs};
 
 pub struct Session {
@@ -139,19 +140,19 @@ impl Session {
 
     // ── Snapshot ─────────────────────────────────────────────────────────
 
-    /// Save the current model state to the DB; returns snapshot_id.
+    /// §8: Save the current model state to the DB as a bincode BLOB; returns snapshot_id.
     pub fn snapshot_to_db(
         &self,
         turn_id: Option<i64>,
     ) -> Result<i64, Box<dyn std::error::Error>> {
         let snap = persistence::to_snapshot(&self.model);
-        let json = serde_json::to_string(&snap)?;
+        let blob = bincode::serialize(&snap)?;
         let fp = self.model.state_fingerprint();
-        let sid = self.db.insert_snapshot(
+        let sid = self.db.insert_snapshot_blob(
             turn_id,
             self.model.tick,
             &fp,
-            &json,
+            &blob,
             now_secs(),
         )?;
         Ok(sid)
@@ -162,13 +163,18 @@ impl Session {
         persistence::save(&self.model, path)
     }
 
-    /// Restore model state from a snapshot_id in the DB.
+    /// §8: Restore model state from a snapshot_id in the DB.
+    /// Prefers blob_data (bincode); falls back to json_blob for legacy rows.
     pub fn restore_from_db(
         &mut self,
         snapshot_id: i64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let json = self.db.load_snapshot_json(snapshot_id)?;
-        let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
+        let snap: persistence::ModelSnapshot = if let Some(blob) = self.db.load_snapshot_blob(snapshot_id)? {
+            bincode::deserialize(&blob)?
+        } else {
+            let json = self.db.load_snapshot_json(snapshot_id)?;
+            serde_json::from_str(&json)?
+        };
         self.model = persistence::from_snapshot(snap);
         Ok(())
     }
@@ -258,7 +264,8 @@ mod tests {
         for _ in 0..20 { s.model.train("hello world"); }
         s.turn("a").unwrap();
         s.turn("b").unwrap(); // snapshot should fire here
-        let latest = s.db.load_latest_snapshot_json().unwrap();
+        // §8: new snapshots use blob_data; verify via load_latest_snapshot_blob
+        let latest = s.db.load_latest_snapshot_blob().unwrap();
         assert!(latest.is_some(), "auto-snapshot should have fired at turn 2");
     }
 }

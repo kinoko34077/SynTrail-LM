@@ -7,6 +7,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use bincode;
 use crate::db::{Database, TurnRow};
 use crate::feedback::{FeedbackSign, FeedbackSource};
 use crate::model::ModelState;
@@ -51,9 +52,9 @@ pub fn save_model_file(model: &ModelState, path: &Path) -> Result<(), Box<dyn Er
         Some("db") | Some("sqlite") => {
             let db = Database::open(&path.to_string_lossy())?;
             let snap = persistence::to_snapshot(model);
-            let json = serde_json::to_string(&snap)?;
+            let blob = bincode::serialize(&snap)?;
             let fp = model.state_fingerprint();
-            db.insert_snapshot(None, model.tick, &fp, &json, now_secs())?;
+            db.insert_snapshot_blob(None, model.tick, &fp, &blob, now_secs())?;
         }
         _ => { persistence::save(model, path)?; }
     }
@@ -69,9 +70,9 @@ pub fn save_model_file_with_generation(model: &ModelState, path: &Path, generati
             let db = Database::open(&path.to_string_lossy())?;
             let mut snap = persistence::to_snapshot(model);
             snap.checkpoint_generation = generation;
-            let json = serde_json::to_string(&snap)?;
+            let blob = bincode::serialize(&snap)?;
             let fp = model.state_fingerprint();
-            db.insert_snapshot(None, model.tick, &fp, &json, now_secs())?;
+            db.insert_snapshot_blob(None, model.tick, &fp, &blob, now_secs())?;
         }
         _ => { persistence::save_with_generation(model, path, generation)?; }
     }
@@ -79,16 +80,23 @@ pub fn save_model_file_with_generation(model: &ModelState, path: &Path, generati
 }
 
 /// Extension-aware load: `.stm` → binary; `.db`/`.sqlite` → latest snapshot; anything else → JSON.
+/// §8: DB load prefers blob_data (bincode) over json_blob for new-format rows.
 pub fn load_model_file(path: &Path) -> Result<ModelState, Box<dyn Error>> {
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     match ext.as_deref() {
         Some("stm") => Ok(persistence::load_binary(path)?),
         Some("db") | Some("sqlite") => {
             let db = Database::open(&path.to_string_lossy())?;
-            let json = db.load_latest_snapshot_json()?
-                .ok_or("no snapshot found in database")?;
-            let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
-            Ok(persistence::from_snapshot(snap))
+            // Prefer BLOB (bincode); fall back to JSON for legacy rows.
+            if let Some(blob) = db.load_latest_snapshot_blob()? {
+                let snap: persistence::ModelSnapshot = bincode::deserialize(&blob)?;
+                Ok(persistence::from_snapshot(snap))
+            } else {
+                let json = db.load_latest_snapshot_json()?
+                    .ok_or("no snapshot found in database")?;
+                let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
+                Ok(persistence::from_snapshot(snap))
+            }
         }
         _ => Ok(persistence::load(path)?),
     }

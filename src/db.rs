@@ -41,6 +41,13 @@ impl Database {
         );
     }
 
+    fn migrate_snapshot_blob(&self) {
+        // §8: add blob_data column to snapshots for binary snapshot storage.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE snapshots ADD COLUMN blob_data BLOB;"
+        );
+    }
+
     fn create_tables(&self) -> Result<()> {
         self.conn.execute_batch("
             PRAGMA journal_mode=WAL;
@@ -92,6 +99,7 @@ impl Database {
             );
         ")?;
         self.migrate_trace_steps();
+        self.migrate_snapshot_blob();
         Ok(())
     }
 
@@ -186,7 +194,32 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// §8: Store a model snapshot as a binary BLOB (bincode); returns the new snapshot_id.
+    /// Writes NULL to json_blob (kept for schema compat with old readers).
+    pub fn insert_snapshot_blob(
+        &self,
+        turn_id: Option<i64>,
+        state_tick: u64,
+        fingerprint: &str,
+        blob: &[u8],
+        created_at: u64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO snapshots (turn_id, state_tick, fingerprint, json_blob, blob_data, created_at)
+             VALUES (?1, ?2, ?3, '', ?4, ?5)",
+            params![
+                turn_id,
+                state_tick as i64,
+                fingerprint,
+                blob,
+                created_at as i64,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Load the JSON blob for a snapshot by ID.
+    /// §8: Returns the JSON text. Use load_snapshot_blob for binary.
     pub fn load_snapshot_json(&self, snapshot_id: i64) -> Result<String> {
         self.conn.query_row(
             "SELECT json_blob FROM snapshots WHERE snapshot_id = ?1",
@@ -195,14 +228,44 @@ impl Database {
         )
     }
 
+    /// §8: Load the binary blob for a snapshot by ID, if present.
+    pub fn load_snapshot_blob(&self, snapshot_id: i64) -> Result<Option<Vec<u8>>> {
+        self.conn.query_row(
+            "SELECT blob_data FROM snapshots WHERE snapshot_id = ?1",
+            params![snapshot_id],
+            |row| row.get(0),
+        )
+    }
+
     /// Load the most recent snapshot JSON blob.
+    /// §8: Prefers blob_data when present; falls back to json_blob for legacy rows.
+    /// Returns (json_or_none, blob_or_none) — caller picks the non-None one.
     pub fn load_latest_snapshot_json(&self) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT json_blob FROM snapshots ORDER BY snapshot_id DESC LIMIT 1"
+            "SELECT json_blob, blob_data FROM snapshots ORDER BY snapshot_id DESC LIMIT 1"
         )?;
         let mut rows = stmt.query([])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(row.get(0)?))
+            let blob: Option<Vec<u8>> = row.get(1)?;
+            if blob.is_some() {
+                // blob row: json_blob is empty string; signal to caller via None
+                Ok(None)
+            } else {
+                Ok(Some(row.get(0)?))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// §8: Load the most recent snapshot as binary blob, if it was stored as BLOB.
+    pub fn load_latest_snapshot_blob(&self) -> Result<Option<Vec<u8>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT blob_data FROM snapshots ORDER BY snapshot_id DESC LIMIT 1"
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(row.get(0)?)
         } else {
             Ok(None)
         }

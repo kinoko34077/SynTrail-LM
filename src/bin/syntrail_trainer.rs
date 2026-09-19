@@ -482,9 +482,24 @@ enum AppState {
     Error(String),
 }
 
+/// §17: How the user chooses a start position for new training runs.
+#[derive(Default, Clone, Copy, PartialEq)]
+enum StartMode {
+    #[default]
+    Beginning,
+    Line,
+    Percent,
+}
+
 struct TrainerApp {
     doc: DocumentState,
     dataset_path: String,
+    /// §17: new-training start position mode.
+    start_mode: StartMode,
+    /// §17: Line-mode input (1-based line number as string).
+    start_line_str: String,
+    /// §17: Percent-mode input (0–100 as string).
+    start_pct_str: String,
     state: AppState,
     worker: Option<JoinHandle<()>>,
     cmd_tx: Option<Sender<TrainerCommand>>,
@@ -505,6 +520,9 @@ impl TrainerApp {
         Self {
             doc: DocumentState::from_path(PathBuf::from("model.json")),
             dataset_path: String::new(),
+            start_mode: StartMode::Beginning,
+            start_line_str: "1".to_owned(),
+            start_pct_str: "0.0".to_owned(),
             state: AppState::Idle,
             worker: None,
             cmd_tx: None,
@@ -612,7 +630,10 @@ impl TrainerApp {
                 }
             }
         } else {
-            TrainerState::new(&dataset_path, dataset.fingerprint, dataset.normalized.len(), &model_path, model_fp)
+            let mut ts = TrainerState::new(&dataset_path, dataset.fingerprint, dataset.normalized.len(), &model_path, model_fp);
+            // §17: apply UI start position for new runs (§19: resume always uses saved cursor).
+            ts.cursor = compute_start_cursor(&dataset.normalized, self.start_mode, &self.start_line_str, &self.start_pct_str);
+            ts
         };
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -1007,6 +1028,43 @@ impl eframe::App for TrainerApp {
                 }
             });
 
+            // §17/§18: Start Position selector + preview (new training only, hidden while training).
+            let dataset_loaded = matches!(&self.state, AppState::Ready { dataset_loaded: true, .. })
+                || matches!(&self.state, AppState::Idle);
+            if dataset_loaded && !training_active {
+                ui.horizontal(|ui| {
+                    ui.label("Start:");
+                    ui.selectable_value(&mut self.start_mode, StartMode::Beginning, "Beginning");
+                    ui.selectable_value(&mut self.start_mode, StartMode::Line, "Line");
+                    ui.selectable_value(&mut self.start_mode, StartMode::Percent, "Percent");
+                    match self.start_mode {
+                        StartMode::Line => {
+                            ui.add(egui::TextEdit::singleline(&mut self.start_line_str).desired_width(70.0));
+                        }
+                        StartMode::Percent => {
+                            ui.add(egui::TextEdit::singleline(&mut self.start_pct_str).desired_width(60.0));
+                            ui.label("%");
+                        }
+                        StartMode::Beginning => {}
+                    }
+                });
+                // §18: show line / % and first few lines after start position.
+                if let Some(ds) = &self.loaded_dataset {
+                    let cursor = compute_start_cursor(&ds.normalized, self.start_mode, &self.start_line_str, &self.start_pct_str);
+                    let line_num = ds.normalized[..cursor].chars().filter(|&c| c == '\n').count() + 1;
+                    let pct = if ds.normalized.is_empty() { 0.0 } else { cursor as f64 / ds.normalized.len() as f64 * 100.0 };
+                    let first_lines: Vec<&str> = ds.normalized[cursor..].lines().take(3).collect();
+                    let preview_str = first_lines.join("\n");
+                    ui.label(egui::RichText::new(format!("→ Line {} ({:.1}%)", line_num, pct)).small());
+                    if !preview_str.is_empty() {
+                        egui::ScrollArea::vertical().id_salt("start_preview").max_height(48.0).show(ui, |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(&preview_str).monospace().small()).wrap());
+                        });
+                    }
+                }
+                ui.add_space(4.0);
+            }
+
             ui.add_space(4.0);
             ui.label(format!(
                 "Block Level: {}  ({} lines / {} chars)",
@@ -1096,6 +1154,39 @@ impl eframe::App for TrainerApp {
         // Keep refreshing while running so events are processed promptly.
         if matches!(&self.state, AppState::Running) {
             ctx.request_repaint_after(Duration::from_millis(80));
+        }
+    }
+}
+
+// ── §17: Start Position helpers ───────────────────────────────────────────
+
+/// Snap `byte_pos` back to the start of its containing line.
+fn snap_to_line_start(source: &str, byte_pos: usize) -> usize {
+    let pos = byte_pos.min(source.len());
+    match source[..pos].rfind('\n') {
+        Some(nl) => nl + 1,
+        None => 0,
+    }
+}
+
+/// Compute a byte cursor into `source` from the user-selected start mode.
+/// Always returns a valid UTF-8 line boundary.
+fn compute_start_cursor(source: &str, mode: StartMode, line_str: &str, pct_str: &str) -> usize {
+    match mode {
+        StartMode::Beginning => 0,
+        StartMode::Line => {
+            let n: usize = line_str.trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
+            let mut byte_pos = 0usize;
+            for (i, line) in source.split('\n').enumerate() {
+                if i == n { break; }
+                byte_pos += line.len() + 1;
+            }
+            byte_pos.min(source.len())
+        }
+        StartMode::Percent => {
+            let pct = pct_str.trim().parse::<f64>().unwrap_or(0.0).clamp(0.0, 100.0);
+            let raw = (pct / 100.0 * source.len() as f64) as usize;
+            snap_to_line_start(source, raw)
         }
     }
 }

@@ -893,6 +893,7 @@ impl ModelState {
         transforms: crate::transform::TransformStore,
         tick: u64,
         merge_candidates: HashMap<(UnitId, UnitId), u32>,
+        merge_right_reuse: HashMap<UnitId, std::collections::HashSet<UnitId>>,
         metrics: Metrics,
         next_trace_id: TraceId,
     ) -> Self {
@@ -908,7 +909,7 @@ impl ModelState {
             transforms,
             tick,
             merge_candidates,
-            merge_right_reuse: HashMap::new(), // not persisted; rebuilt during training
+            merge_right_reuse,
             metrics,
             next_trace_id,
             gen_config: GenerationConfig::default(),

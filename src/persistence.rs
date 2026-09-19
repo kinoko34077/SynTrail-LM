@@ -274,6 +274,10 @@ pub struct ModelSnapshot {
     /// §19: Transform entries (directed Identity relations).
     #[serde(default)]
     transforms: Vec<TransformEntryDto>,
+    /// §22: Factorization right-reuse map: (right_unit, [left_units...]).
+    /// Restoring this avoids factorization pressure starting from zero after a load.
+    #[serde(default)]
+    merge_right_reuse: Vec<(UnitIdDto, Vec<UnitIdDto>)>,
     /// §32: Links this model snapshot to the trainer state saved in the same operation.
     #[serde(default)]
     pub checkpoint_generation: u64,
@@ -415,6 +419,15 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         })
         .collect();
 
+    // §22: serialize merge_right_reuse so factorization pressure survives reload.
+    let merge_right_reuse: Vec<(UnitIdDto, Vec<UnitIdDto>)> = model
+        .merge_right_reuse
+        .iter()
+        .map(|(right, lefts)| {
+            (UnitIdDto::from(*right), lefts.iter().map(|l| UnitIdDto::from(*l)).collect())
+        })
+        .collect();
+
     ModelSnapshot {
         version: "0.5".to_owned(),
         tick: model.tick,
@@ -433,6 +446,7 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         identity_parent,
         representation_entries,
         transforms,
+        merge_right_reuse,
         checkpoint_generation: 0,
     }
 }
@@ -547,6 +561,18 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         transforms.restore_entry(dto.source, dto.target, kind, dto.value, dto.evidence);
     }
 
+    // §22: restore merge_right_reuse so factorization pressure is correct after load.
+    use std::collections::HashSet;
+    let merge_right_reuse: std::collections::HashMap<crate::units::UnitId, HashSet<crate::units::UnitId>> =
+        snap.merge_right_reuse
+            .into_iter()
+            .map(|(right_dto, lefts_dto)| {
+                let right = crate::units::UnitId::from(right_dto);
+                let lefts: HashSet<_> = lefts_dto.into_iter().map(crate::units::UnitId::from).collect();
+                (right, lefts)
+            })
+            .collect();
+
     ModelState::from_parts(
         primitives,
         chunks,
@@ -559,6 +585,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         transforms,
         snap.tick,
         merge_candidates,
+        merge_right_reuse,
         Metrics {
             total_decisions: snap.metrics.total_decisions,
             total_characters: snap.metrics.total_characters,

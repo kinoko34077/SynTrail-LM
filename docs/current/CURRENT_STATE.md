@@ -1,9 +1,9 @@
 # 現在の実装状態
 
-最終確認: 2026-09-18  
-main HEAD: 5abba20 (Desktop UI全フェーズ完了)  
+最終確認: 2026-09-19  
+main HEAD: 8f66f40 (P0/P1/P2 generation path + UI wiring)  
 crate version: 0.5.0  
-integration tests: 100
+integration tests: 100 (+ 219 unit tests)
 
 ---
 
@@ -19,6 +19,9 @@ integration tests: 100
 - AssociationStore (Top-K, Adjacency相当)
 - Feedback / Avoidance (Context-dependent)
 - Frozen generation (with Trace, EOS, cycle detection) ← Phase D (P0)
+- **EOS turn learning** (session.turn() calls expose_with_eos at turn boundary)
+- **Representation preferred fallback** (pick_next_unit: RepresentationStore.preferred() before lineage)
+- **Cycle fallback chain** (Recall → Generalize → stop, instead of immediate break)
 - Frozen Eval (evaluate_frozen, evaluate_sample_frozen)
 - History DB (SQLite)
 - Snapshot (JSON / SQLite)
@@ -85,6 +88,7 @@ integration tests: 100
 | 優先 | 内容 | 状態 |
 |------|------|------|
 | ~~P1~~ | `desktop/` 共通層 (FileKind/FileCommand/DropRouter/fonts) (§78/§82/§95/§122) | ✅ UI-2 |
+| ~~P2~~ | route_drop() + fonts::setup_fonts() を両GUIに接続 | ✅ P2修正 |
 | ~~P2~~ | Windows Native Menu (§88-94) | ✅ UI-6/7/8 |
 | ~~P2~~ | Keyboard shortcuts Ctrl+N/O/S/Shift+S (§92) | ✅ UI-6/7/8 |
 | ~~P2~~ | Chat/Trainer の setup_fonts を desktop::fonts::setup_fonts に切り替え | ✅ P2修正 |

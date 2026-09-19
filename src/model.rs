@@ -243,21 +243,29 @@ impl ModelState {
             }
         }
 
-        // Preferred-representation fallback (P1): use RepresentationStore's best
-        // segmentation for this context's identity, which may differ from the
-        // structural lineage decomposition.
+        // Representation predecessor chain (§5): start from preferred Rn,
+        // walk Rn → R(n-1) → … → R0 before falling to structural lineage.
         let prim_units = self.lineage.decompose_to_primitives(context);
         let prim_ids: Vec<_> = prim_units.iter().filter_map(|u| u.as_primitive()).collect();
         if !prim_ids.is_empty() {
             if let Some(id) = self.identities.find_identity(&prim_ids) {
-                if let Some(rep) = self.representations.preferred(id) {
-                    // rep.units gives the preferred segmentation; try from last unit.
-                    for &u in rep.units.iter().rev() {
-                        if u != context {
-                            if let Some(r) = self.predictions.top1_with_score(u) {
-                                return Some(r);
+                // Start from the preferred representation; walk predecessors on miss.
+                let preferred_id = self.representations.preferred(id).map(|r| r.rep_id);
+                let mut rep_id_opt = preferred_id;
+                while let Some(rep_id) = rep_id_opt {
+                    if let Some(rep) = self.representations.get(rep_id) {
+                        // Try prediction from the last unit of this representation.
+                        for &u in rep.units.iter().rev() {
+                            if u != context {
+                                if let Some(r) = self.predictions.top1_with_score(u) {
+                                    return Some(r);
+                                }
                             }
                         }
+                        // This rep failed; walk to predecessor.
+                        rep_id_opt = rep.predecessor_rep_id;
+                    } else {
+                        break;
                     }
                 }
             }

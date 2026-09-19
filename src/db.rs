@@ -90,7 +90,8 @@ impl Database {
             params![
                 trace.trace_id as i64,
                 trace.input_text,
-                trace.output_text,
+                // Store emitted-only text (dialogue output) not full seed+emitted.
+                trace.emitted_text,
                 trace.decision_count as i64,
                 trace.state_before_tick as i64,
                 trace.created_at as i64,

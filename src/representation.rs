@@ -97,19 +97,9 @@ pub struct RepresentationStore {
     entries: Vec<RepresentationEntry>,
     /// identity_id → list of rep_ids in acquisition order (oldest first).
     by_identity: HashMap<IdentityId, Vec<RepId>>,
-    /// (identity_id, units_fingerprint) → rep_id — deduplication key.
-    by_key: HashMap<(IdentityId, u64), RepId>,
-}
-
-fn fingerprint_units(units: &[UnitId]) -> u64 {
-    // FNV-1a variant over the compact tagged representation.
-    let mut h: u64 = 0xcbf29ce484222325;
-    for u in units {
-        let bits = u.raw() as u64 | ((u.is_chunk() as u64) << 32);
-        h ^= bits;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+    /// Canonical dedup key: (identity_id, exact unit sequence) → rep_id.
+    /// Exact equality, not hash, to avoid false dedup on collision.
+    by_key: HashMap<(IdentityId, Vec<UnitId>), RepId>,
 }
 
 impl RepresentationStore {
@@ -127,7 +117,7 @@ impl RepresentationStore {
         units: Vec<UnitId>,
         acquired_at: u64,
     ) -> (RepId, bool) {
-        let key = (identity_id, fingerprint_units(&units));
+        let key = (identity_id, units.clone());
         if let Some(&existing) = self.by_key.get(&key) {
             return (existing, false);
         }
@@ -215,13 +205,13 @@ impl RepresentationStore {
     /// predecessor indices remain valid.
     pub fn from_bulk(entries: Vec<RepresentationEntry>) -> Self {
         let mut by_identity: HashMap<IdentityId, Vec<RepId>> = HashMap::new();
-        let mut by_key: HashMap<(IdentityId, u64), RepId> = HashMap::new();
+        let mut by_key: HashMap<(IdentityId, Vec<UnitId>), RepId> = HashMap::new();
         for e in &entries {
             by_identity
                 .entry(e.identity_id)
                 .or_default()
                 .push(e.rep_id);
-            by_key.insert((e.identity_id, fingerprint_units(&e.units)), e.rep_id);
+            by_key.insert((e.identity_id, e.units.clone()), e.rep_id);
         }
         Self { entries, by_identity, by_key }
     }

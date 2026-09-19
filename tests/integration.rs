@@ -1106,17 +1106,39 @@ fn gn01_generalize_via_association() {
     assert!(m.generalize(ua).is_some(), "GN-01: generalize should find prediction for 'a'");
 }
 
-// ── GN-02: novel_candidates() returns analogy results ────────────────────
+// ── GN-02: novel_candidates() returns analogy results (must be non-empty) ──
 #[test]
 fn gn02_novel_candidates_nonempty() {
     let mut m = ModelState::new();
-    for _ in 0..20 { m.train("abc"); }
-    for _ in 0..20 { m.train("abd"); }
+    // "abc" and "abd" share prefix "ab"; 'a' has associations to both 'b','c','d'.
+    for _ in 0..40 { m.train("abc"); }
+    for _ in 0..40 { m.train("abd"); }
     let p_a = m.primitives.id('a').unwrap();
     let ua = UnitId::primitive(p_a);
     let candidates = m.novel_candidates(ua, 5);
-    // May be empty if not enough training, but should not panic.
-    let _ = candidates;
+    assert!(
+        !candidates.is_empty(),
+        "GN-02: novel_candidates must find analogy results for 'a' after training 'abc'/'abd'"
+    );
+}
+
+// ── GN-04: generalize uses association bridge when no direct route ─────────
+#[test]
+fn gn04_generalize_uses_association_bridge() {
+    let mut m = ModelState::new();
+    // Train "ba" a few times → b→a route, b↔a associated; 'a' gets NO outgoing route.
+    for _ in 0..5 { m.train("ba"); }
+    // Train "bc" heavily → strong b→c route.
+    for _ in 0..40 { m.train("bc"); }
+    let pa = m.primitives.id('a').unwrap();
+    let ua = UnitId::primitive(pa);
+    // 'a' has no direct outgoing prediction; generalize must use association bridge.
+    // a is associated with b (from "ba"), b has strong route to c.
+    let result = m.generalize(ua);
+    assert!(
+        result.is_some(),
+        "GN-04: generalize must find a result via association bridge when 'a' has no direct route"
+    );
 }
 
 // ── GN-03: novel_candidates() respects limit ─────────────────────────────
@@ -1173,15 +1195,30 @@ fn gen_loop_02_two_state_loop_stops() {
 fn gen_loop_03_eos_stops_generation() {
     use syntrail_lm::model::EOS_CHAR;
     let mut m = ModelState::new();
-    // Train with EOS at sentence boundary.
-    for _ in 0..20 { m.expose_with_eos("hello"); }
-    // The model should now predict EOS after "hello" with non-trivial probability.
-    // Generate and check that EOS fired OR generation terminated early.
-    let (_, trace) = m.generate_with_trace("hello", "hello", 50, 3);
-    // EOS learning may or may not have taken hold depending on segmentation,
-    // but stopped_by_eos should be plausible — at minimum no panic.
-    let _ = EOS_CHAR; // just confirm the constant is accessible
-    let _ = trace;    // no panic is the minimum requirement
+    // Heavy EOS training at sentence boundary.
+    for _ in 0..80 { m.expose_with_eos("hello"); }
+    // EOS must have been registered as a primitive by now.
+    assert!(
+        m.eos_unit().is_some(),
+        "GEN-LOOP-03: EOS primitive must exist after expose_with_eos"
+    );
+    // Generate from the trained seed; EOS should fire before max_units.
+    let (output, trace) = m.generate_with_trace("hello", "hello", 50, 3);
+    assert!(
+        trace.stopped_by_eos,
+        "GEN-LOOP-03: EOS must stop generation after heavy training; stopped_by_eos=false, decisions={}",
+        trace.decision_count
+    );
+    // EOS character itself must not appear in output.
+    assert!(
+        !output.contains(EOS_CHAR),
+        "GEN-LOOP-03: EOS char must not appear in output text"
+    );
+    // Must have stopped before max_units.
+    assert!(
+        trace.decision_count < 50,
+        "GEN-LOOP-03: generation must end before max_units when EOS fires"
+    );
 }
 
 // ── GEN-LOOP-04: emitted_text excludes seed ───────────────────────────────
@@ -1329,24 +1366,59 @@ fn rep05_replay_acquires_new_representation() {
     let id_ab = m.identities.find_identity(&prim_ids_ab).expect("identity must exist");
     let reps_after_expose = m.representations.for_identity(id_ab).len();
 
-    // Now train until chunk "ab" forms.
-    for _ in 0..20 { m.expose_external("ab"); }
+    // Train until chunk "ab" definitely forms (adjacency threshold is low).
+    for _ in 0..80 { m.expose_external("ab"); }
 
-    // At this point segmentation may still be [P(a), P(b)] or [C(ab)].
-    // Force replay to trigger re-segmentation with the chunk.
-    for _ in 0..5 { m.replay("ab"); }
+    // Force replay to trigger re-segmentation with the newly formed chunk.
+    for _ in 0..10 { m.replay("ab"); }
 
     // If a chunk formed and segmentation changed, a new representation was registered.
     let reps_after_replay = m.representations.for_identity(id_ab).len();
 
-    if m.chunk_count() > 0 {
-        // Chunk formed — new segmentation should produce a new representation.
-        assert!(
-            reps_after_replay >= reps_after_expose,
-            "REP-05: representation count must not decrease after Replay+chunk formation; before={reps_after_expose} after={reps_after_replay}"
-        );
-    }
-    // At minimum: no panic, and legacy models don't get synthetic history.
+    // Chunk must have formed after 40 expose calls on a 2-char string.
+    assert!(m.chunk_count() > 0, "REP-05: chunk must form after heavy training on 'ab'");
+    // New segmentation via chunk MUST produce a new representation (strictly more than before).
+    assert!(
+        reps_after_replay > reps_after_expose,
+        "REP-05: representation count must strictly increase when chunk forms; before={reps_after_expose} after={reps_after_replay}"
+    );
+}
+
+// ── REP-03-INTEGRATION: predecessor chain used in generation ─────────────
+#[test]
+fn rep03_integration_predecessor_used_in_generation() {
+    // Build a fixture where the preferred Rep Rn fails but R(n-1) has a route.
+    // Train "ab" until chunk forms → R0=[P(a),P(b)], R1=[C(ab)].
+    // The preferred representation R1 contains the chunk unit C(ab).
+    // If R1 has no outgoing prediction but R0's unit P(b) does → fallback to R0.
+    let mut m = ModelState::new();
+    for _ in 0..80 { m.train("ab"); }
+    for _ in 0..80 { m.train("bc"); }
+    // "b" should have a route to "c".
+    // After chunk "ab" forms, the preferred rep of identity "ab" is [C(ab)].
+    // C(ab) likely has no route yet (only "bc" trained C-to-something).
+    // The predecessor rep [P(a), P(b)] includes P(b) which routes to P(c).
+    // generate_with_trace with seed="ab" should produce something (not empty).
+    let (_, trace) = m.generate_with_trace("ab", "ab", 10, 99);
+    assert!(
+        trace.decision_count > 0,
+        "REP-03-INTEGRATION: generation from 'ab' must produce decisions via predecessor chain"
+    );
+}
+
+// ── REP-04: All reps fail → reaches primitive decomposition ──────────────
+#[test]
+fn rep04_all_reps_fail_reaches_primitive() {
+    // Completely novel context: a unit that has representations but no routes.
+    // We test that generation doesn't panic (reaches graceful end via primitives).
+    let mut m = ModelState::new();
+    // Train "bc" so P(b) has route P(b)→P(c).
+    for _ in 0..40 { m.train("bc"); }
+    // "a" has no chunk, no route, no representation.
+    let (_, trace) = m.generate_with_trace("a", "a", 5, 99);
+    // Should not panic; either produces output via primitives or stops.
+    // decision_count may be 0 if no route found — that's acceptable; no panic is required.
+    let _ = trace;
 }
 
 // ── REP-07: Legacy Migration — no fake history ───────────────────────────
@@ -1447,19 +1519,24 @@ fn exp04_practice_confidence_grows_during_replay() {
     );
 }
 
-// ── EXP-05: Replay can acquire new Representation (alias of REP-05 via EXP)
+// ── EXP-05: Replay acquires new Representation when chunk forms ────────────
 #[test]
-fn exp05_replay_can_acquire_new_representation() {
+fn exp05_replay_acquires_new_representation() {
     let mut m = ModelState::new();
+    // First observation establishes R0 = [P(a), P(b)].
     m.expose_external("ab");
-    for _ in 0..20 { m.expose_external("ab"); }
-    let reps_before = m.representations.entry_count();
-    for _ in 0..20 { m.replay("ab"); }
-    let reps_after = m.representations.entry_count();
-    // Representations can only grow or stay the same.
+    let prim_ids = m.primitives.encode_existing("ab");
+    let id_ab = m.identities.find_identity(&prim_ids).expect("identity must exist");
+    let reps_before = m.representations.for_identity(id_ab).len();
+    // Train enough for chunk "ab" to form.
+    for _ in 0..80 { m.expose_external("ab"); }
+    assert!(m.chunk_count() > 0, "EXP-05: chunk must form before replay test");
+    // Replay re-segments with the new chunk → new Representation.
+    for _ in 0..10 { m.replay("ab"); }
+    let reps_after = m.representations.for_identity(id_ab).len();
     assert!(
-        reps_after >= reps_before,
-        "EXP-05: representation count must not decrease after Replay; before={reps_before} after={reps_after}"
+        reps_after > reps_before,
+        "EXP-05: Replay must acquire new Representation when chunk changes segmentation; before={reps_before} after={reps_after}"
     );
 }
 

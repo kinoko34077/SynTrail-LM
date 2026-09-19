@@ -2732,3 +2732,33 @@ fn cidx_03_identity_index_survives_roundtrip() {
         .collect();
     assert_eq!(before, after, "CIDX-03: unit identity index must match after save/load");
 }
+
+// ── DROP-01/02: route_drop combo and rejection (§43) ───────────────────────
+
+#[test]
+fn drop43_01_model_and_dataset_combo() {
+    use std::path::PathBuf;
+    use syntrail_lm::desktop::drop::{route_drop, AcceptedKinds, DropResult};
+
+    let model   = PathBuf::from("model.json");
+    let dataset = PathBuf::from("text.txt");
+    let result  = route_drop(vec![model, dataset], &AcceptedKinds::trainer());
+    assert!(
+        matches!(result, DropResult::ModelAndDataset { .. }),
+        "DROP-01: model+dataset combo should yield ModelAndDataset"
+    );
+}
+
+#[test]
+fn drop43_02_two_models_is_multiple_files() {
+    use std::path::PathBuf;
+    use syntrail_lm::desktop::drop::{route_drop, AcceptedKinds, DropResult};
+
+    let a = PathBuf::from("a.json");
+    let b = PathBuf::from("b.json");
+    let result = route_drop(vec![a, b], &AcceptedKinds::trainer());
+    assert!(
+        matches!(result, DropResult::MultipleFiles),
+        "DROP-02: two model files should yield MultipleFiles"
+    );
+}

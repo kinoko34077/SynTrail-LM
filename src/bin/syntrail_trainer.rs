@@ -897,8 +897,15 @@ impl eframe::App for TrainerApp {
                             }
                         }
                     }
+                    DropResult::ModelAndDataset { model, dataset } => {
+                        // §43: load both in one drop.
+                        self.model_path = model.to_string_lossy().to_string();
+                        self.dataset_path = dataset.to_string_lossy().to_string();
+                        self.try_load_model();
+                        self.try_load_dataset();
+                    }
                     DropResult::MultipleFiles => {
-                        self.status_msg = "Drop one file at a time.".to_owned();
+                        self.status_msg = "Drop one file at a time (or one model + one dataset together).".to_owned();
                     }
                     DropResult::Unsupported(p) => {
                         self.status_msg = format!(

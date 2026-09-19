@@ -162,7 +162,11 @@ impl ModelState {
         let identity_id = self.identities.intern_identity(&prim_ids);
         self.identities.intern_view(&segmented, identity_id);
         // Phase B: register this segmentation as a Representation for the Identity.
-        self.representations.intern(identity_id, segmented.clone(), tick);
+        // §3: re-encountering a known representation is a recognition success.
+        let (rep_id, is_new) = self.representations.intern(identity_id, segmented.clone(), tick);
+        if !is_new {
+            if let Some(e) = self.representations.get_mut(rep_id) { e.record_success(); }
+        }
 
         self.consider_merges(&segmented, tick);
     }
@@ -209,7 +213,11 @@ impl ModelState {
         self.identities.intern_view(&segmented, identity_id);
         // Phase B: Replay can acquire a new Representation (e.g., when a chunk has
         // just formed and segmentation changes). external_occurrence is NOT updated.
-        self.representations.intern(identity_id, segmented.clone(), tick);
+        // §3: repeated segmentation during Replay is a recognition success.
+        let (rep_id, is_new) = self.representations.intern(identity_id, segmented.clone(), tick);
+        if !is_new {
+            if let Some(e) = self.representations.get_mut(rep_id) { e.record_success(); }
+        }
 
         self.consider_merges(&segmented, tick);
     }
@@ -230,7 +238,8 @@ impl ModelState {
     // ── Frozen generation (P0: cycle detection, seed/output separation, Top-K) ──
 
     /// P0: pick the best next unit for `context`, applying cycle penalty and lineage fallback.
-    fn pick_next_unit(&self, context: UnitId, state: &GenerationState) -> Option<(UnitId, f64)> {
+    /// §3: records rep confidence feedback (success/failure) as we walk the predecessor chain.
+    fn pick_next_unit(&mut self, context: UnitId, state: &GenerationState) -> Option<(UnitId, f64)> {
         // Direct prediction — top-K with cycle penalty.
         let candidates = self.predictions.top_k_with_score(context, self.gen_config.route_top_k);
         if !candidates.is_empty() {
@@ -245,26 +254,30 @@ impl ModelState {
             }
         }
 
-        // Representation predecessor chain (§5): start from preferred Rn,
+        // Representation predecessor chain (§5 + §3): start from preferred Rn,
         // walk Rn → R(n-1) → … → R0 before falling to structural lineage.
+        // Phase 1: collect the chain and find the winning rep (immutable borrow).
         let prim_units = self.lineage.decompose_to_primitives(context);
         let prim_ids: Vec<_> = prim_units.iter().filter_map(|u| u.as_primitive()).collect();
+        let mut rep_result: Option<(UnitId, f64)> = None;
+        let mut failed_reps: Vec<crate::representation::RepId> = Vec::new();
+        let mut winning_rep: Option<crate::representation::RepId> = None;
         if !prim_ids.is_empty() {
             if let Some(id) = self.identities.find_identity(&prim_ids) {
-                // Start from the preferred representation; walk predecessors on miss.
                 let preferred_id = self.representations.preferred(id).map(|r| r.rep_id);
                 let mut rep_id_opt = preferred_id;
-                while let Some(rep_id) = rep_id_opt {
+                'chain: while let Some(rep_id) = rep_id_opt {
                     if let Some(rep) = self.representations.get(rep_id) {
-                        // Try prediction from the last unit of this representation.
                         for &u in rep.units.iter().rev() {
                             if u != context {
                                 if let Some(r) = self.predictions.top1_with_score(u) {
-                                    return Some(r);
+                                    winning_rep = Some(rep_id);
+                                    rep_result = Some(r);
+                                    break 'chain;
                                 }
                             }
                         }
-                        // This rep failed; walk to predecessor.
+                        failed_reps.push(rep_id);
                         rep_id_opt = rep.predecessor_rep_id;
                     } else {
                         break;
@@ -272,6 +285,14 @@ impl ModelState {
                 }
             }
         }
+        // Phase 2: apply confidence updates now that borrows are released.
+        for rid in failed_reps {
+            if let Some(e) = self.representations.get_mut(rid) { e.record_failure(); }
+        }
+        if let Some(rid) = winning_rep {
+            if let Some(e) = self.representations.get_mut(rid) { e.record_success(); }
+        }
+        if rep_result.is_some() { return rep_result; }
 
         // Lineage fallback — one-level structural decomposition.
         let one_level = self.lineage.decompose_one(context);
@@ -309,7 +330,7 @@ impl ModelState {
     /// - EOS: stops if the predicted next unit is the EOS primitive.
     /// - `trace.emitted_text` contains only the generated (non-seed) text.
     pub fn generate_with_trace(
-        &self,
+        &mut self,
         seed_text: &str,
         input_text: &str,
         max_units: usize,
@@ -420,7 +441,7 @@ impl ModelState {
     }
 
     /// Convenience: generate without a trace.
-    pub fn generate(&self, seed_text: &str, max_units: usize) -> String {
+    pub fn generate(&mut self, seed_text: &str, max_units: usize) -> String {
         let (output, _) = self.generate_with_trace(seed_text, seed_text, max_units, 0);
         output
     }
@@ -797,7 +818,7 @@ mod tests {
 
     #[test]
     fn test_generate_empty_seed_with_no_training() {
-        let m = ModelState::new();
+        let mut m = ModelState::new();
         let out = m.generate("", 10);
         assert_eq!(out, "");
     }

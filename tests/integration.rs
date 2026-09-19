@@ -308,7 +308,7 @@ fn t02_trace_records_decisions() {
 #[test]
 fn t03_no_decisions_for_seed_only() {
     // If model has no edges for the last seed unit, decision_count = 0
-    let m = ModelState::new();
+    let mut m = ModelState::new();
     let (_, trace) = m.generate_with_trace("z", "z", 5, 1);
     assert_eq!(trace.decision_count, 0, "T-03: decisions expected 0 for untrained model");
 }
@@ -1419,6 +1419,33 @@ fn rep04_all_reps_fail_reaches_primitive() {
     // Should not panic; either produces output via primitives or stops.
     // decision_count may be 0 if no route found — that's acceptable; no panic is required.
     let _ = trace;
+}
+
+// ── REP-06: §3 — rep confidence grows on repeated recognition ────────────
+#[test]
+fn rep06_confidence_grows_on_repeated_recognition() {
+    let mut m = ModelState::new();
+    // First expose: acquires the representation (is_new=true, no success recorded).
+    m.expose("ab");
+    let conf_after_first = {
+        let id = m.identities.find_identity(
+            &m.primitives.encode("ab").iter().copied().collect::<Vec<_>>()
+        ).expect("identity must exist");
+        m.representations.preferred(id).expect("rep must exist").confidence
+    };
+    // Second expose: same segmentation → is_new=false → record_success().
+    m.expose("ab");
+    let conf_after_second = {
+        let id = m.identities.find_identity(
+            &m.primitives.encode("ab").iter().copied().collect::<Vec<_>>()
+        ).unwrap();
+        m.representations.preferred(id).unwrap().confidence
+    };
+    assert!(
+        conf_after_second > conf_after_first,
+        "REP-06: confidence must rise after repeated recognition: {} → {}",
+        conf_after_first, conf_after_second
+    );
 }
 
 // ── REP-07: Legacy Migration — no fake history ───────────────────────────

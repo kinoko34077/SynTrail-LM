@@ -129,7 +129,7 @@ fn cmd_generate(args: &[String]) {
     let max_units: usize = flag_value(args, "--max-units")
         .and_then(|v| v.parse().ok()).unwrap_or(50);
     let model_path = flag_path(args, "--model").unwrap_or_else(default_model_path);
-    let model = load_model(&model_path);
+    let mut model = load_model(&model_path);
     let output = model.generate(&seed, max_units);
     println!("{output}");
 }

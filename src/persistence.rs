@@ -515,10 +515,10 @@ mod tests {
 
     #[test]
     fn test_generate_nonempty_after_load() {
-        let model = trained_model();
+        let mut model = trained_model();
         let file = NamedTempFile::new().unwrap();
         save(&model, file.path()).unwrap();
-        let loaded = load(file.path()).unwrap();
+        let mut loaded = load(file.path()).unwrap();
         let out1 = model.generate("hel", 5);
         let out2 = loaded.generate("hel", 5);
         assert!(!out1.is_empty());

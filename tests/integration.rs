@@ -1220,6 +1220,41 @@ fn gen_loop_03_eos_stops_generation() {
         trace.decision_count < 50,
         "GEN-LOOP-03: generation must end before max_units when SEQUENCE_END fires"
     );
+    // emitted_text also must not contain the sequence-end char.
+    assert!(
+        !trace.emitted_text.contains(SEQUENCE_END_CHAR),
+        "GEN-LOOP-03: SEQUENCE_END char must not appear in emitted_text"
+    );
+}
+
+// ── GEN-LOOP-08: §9 — TURN_BOUNDARY does NOT stop generation ─────────────
+#[test]
+fn gen_loop_08_turn_boundary_does_not_stop_generation() {
+    use syntrail_lm::model::SEQUENCE_END_CHAR;
+    let mut m = ModelState::new();
+    // Train using turn boundary (not sequence end) so model learns turn boundaries.
+    for _ in 0..60 { m.expose_with_turn_boundary("hello world"); }
+    // TURN_BOUNDARY must be registered, SEQUENCE_END must NOT be (wasn't exposed).
+    assert!(
+        m.turn_boundary_unit().is_some(),
+        "GEN-LOOP-08: TURN_BOUNDARY primitive must exist after expose_with_turn_boundary"
+    );
+    assert!(
+        m.sequence_end_unit().is_none(),
+        "GEN-LOOP-08: SEQUENCE_END must not be registered when only turn-boundary was trained"
+    );
+    // Generation must NOT stop with stopped_by_eos because SEQUENCE_END was never trained.
+    let (output, trace) = m.generate_with_trace("hello", "hello", 50, 8);
+    assert!(
+        !trace.stopped_by_eos,
+        "GEN-LOOP-08: TURN_BOUNDARY must not trigger stopped_by_eos; decisions={}",
+        trace.decision_count
+    );
+    // SEQUENCE_END char must never appear in output.
+    assert!(
+        !output.contains(SEQUENCE_END_CHAR),
+        "GEN-LOOP-08: SEQUENCE_END char must not appear in output"
+    );
 }
 
 // ── GEN-LOOP-04: emitted_text excludes seed ───────────────────────────────

@@ -3031,6 +3031,73 @@ fn stm_version_07_unknown_version_rejected() {
         "STM-VERSION-02: error must mention the version: {}", msg);
 }
 
+// ── GEN-COLLAPSE / SCORE-DIAG fixtures (§5/§9) ────────────────────────────
+
+#[test]
+fn gen_collapse_01_different_prompts_yield_different_outputs() {
+    // GEN-COLLAPSE-01: model with distinct routes for distinct contexts.
+    // Dialogue mode must not reduce all prompts to the same output.
+    let mut m = ModelState::new();
+    for _ in 0..30 { m.train("apple followed by banana"); }
+    for _ in 0..30 { m.train("zebra followed by xylophone"); }
+    let (out1, _) = m.generate_with_trace("apple", "apple", 10, 0);
+    let (out2, _) = m.generate_with_trace("zebra", "zebra", 10, 0);
+    assert_ne!(out1, out2,
+        "GEN-COLLAPSE-01: distinct prompts must yield distinct outputs when model has divergent routes");
+}
+
+#[test]
+fn gen_collapse_02_cycle_stops_before_max_units() {
+    // GEN-COLLAPSE-02: existing cycle detection stops generation before max_units.
+    let mut m = ModelState::new();
+    for _ in 0..50 { m.train("aaaa"); }
+    let max = 30;
+    let (_, trace) = m.generate_with_trace("a", "a", max, 0);
+    assert!(trace.decision_count < max,
+        "GEN-COLLAPSE-02: cycle detection must stop before max_units (got {}, max {})",
+        trace.decision_count, max);
+}
+
+#[test]
+fn gen_collapse_03_frozen_generation_no_state_mutation() {
+    // GEN-COLLAPSE-03: Generation is frozen — model learning state must not change.
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.train("hello world"); }
+    let tick_before = m.tick;
+    let chunk_count_before = m.chunk_count();
+    m.generate_with_trace("hello", "hello", 20, 0);
+    assert_eq!(m.tick, tick_before,
+        "GEN-COLLAPSE-03: generation must not change model.tick");
+    assert_eq!(m.chunk_count(), chunk_count_before,
+        "GEN-COLLAPSE-03: generation must not create new chunks");
+}
+
+#[test]
+fn score_diag_01_route_score_breakdown_fields() {
+    // SCORE-DIAG-01: RouteScoreBreakdown.total must match PredictionEdge::score().
+    use syntrail_lm::prediction::PredictionEdge;
+    let ctx = syntrail_lm::units::UnitId::primitive(1);
+    let next = syntrail_lm::units::UnitId::primitive(2);
+    let edge = PredictionEdge::new(ctx, next);
+
+    // Unobserved edge: all fields zero, total = 0.
+    let bd = edge.score_breakdown();
+    assert_eq!(bd.total, edge.score(), "SCORE-DIAG-01: breakdown.total must match score() on empty edge");
+    assert_eq!(bd.practice, 0.0, "SCORE-DIAG-01: practice must be 0 on new edge");
+    assert_eq!(bd.external, 0.0, "SCORE-DIAG-01: external must be 0 on new edge");
+
+    // After usage and positive feedback.
+    let mut edge2 = PredictionEdge::new(ctx, next);
+    edge2.record_usage_at(1);
+    edge2.apply_feedback(5.0, 0.9);
+    let bd2 = edge2.score_breakdown();
+    assert!((bd2.total - edge2.score()).abs() < 1e-12,
+        "SCORE-DIAG-01: breakdown.total must match score() after update (got {}, expected {})",
+        bd2.total, edge2.score());
+    assert!(bd2.practice > 0.0, "SCORE-DIAG-01: practice must be positive after use");
+    assert!(bd2.positive > 0.0, "SCORE-DIAG-01: positive must be positive after feedback");
+}
+
 // ── DB-OPEN tests (§3) ────────────────────────────────────────────────────
 
 #[test]

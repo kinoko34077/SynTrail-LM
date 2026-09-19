@@ -102,6 +102,38 @@ impl PredictionEdge {
         let avoid_norm = (self.avoidance / 10.0).min(1.0);
         self.confidence() + strength_norm + pos_value - avoid_norm
     }
+
+    /// §9: Decomposed score for debugging — "why did this route win?"
+    /// `cycle_penalty` and `prompt_support` are filled in by the caller when applicable.
+    pub fn score_breakdown(&self) -> RouteScoreBreakdown {
+        let practice = (self.usage_strength / 100.0).min(1.0);
+        let external = (self.external_route_evidence / 100.0).min(1.0);
+        let positive = (self.feedback_value / 10.0).min(1.0);
+        let avoidance = (self.avoidance / 10.0).min(1.0);
+        let total = self.confidence() + practice + positive - avoidance;
+        RouteScoreBreakdown { practice, external, positive, avoidance, prompt_support: 0.0, cycle_penalty: 0.0, total }
+    }
+}
+
+/// §9: Decomposed route score for inspection and test verification.
+/// `cycle_penalty` and `prompt_support` are set by the generation caller; all other
+/// fields are computed directly from the edge at the time score_breakdown() is called.
+#[derive(Debug, Clone, Default)]
+pub struct RouteScoreBreakdown {
+    /// Practice confidence contribution (usage_strength normalized).
+    pub practice: f64,
+    /// External route evidence contribution (external_route_evidence normalized).
+    pub external: f64,
+    /// Positive feedback contribution.
+    pub positive: f64,
+    /// Avoidance penalty (subtracted).
+    pub avoidance: f64,
+    /// Prompt-context support (filled by Dialogue-mode scorer when implemented).
+    pub prompt_support: f64,
+    /// Cycle penalty applied by the generation loop (filled by caller).
+    pub cycle_penalty: f64,
+    /// Final score = confidence + practice + positive − avoidance − cycle_penalty + prompt_support.
+    pub total: f64,
 }
 
 /// Stores all prediction edges.

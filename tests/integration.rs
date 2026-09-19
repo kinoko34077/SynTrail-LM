@@ -2436,6 +2436,27 @@ fn tr_resume_05_model_fingerprint_matches_state_fingerprint() {
     assert_eq!(fp, fp2, "TR-RESUME-05: state_fingerprint must be deterministic");
 }
 
+// ── REL-PERSIST-01: §26 — RelationStore rebuilt from canonical stores after load ──
+#[test]
+fn rel_persist_01_relation_store_rebuilt_after_load() {
+    use syntrail_lm::relation::RelationKind;
+    let mut m = ModelState::new();
+    for _ in 0..10 { m.train("abcd"); }
+
+    // Before save: RelationStore should have route edges.
+    let route_count_before = m.relations.iter_kind(RelationKind::Route).count();
+    assert!(route_count_before > 0, "REL-PERSIST-01: relations must be non-empty after training");
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    persistence::save(&m, tmp.path()).unwrap();
+    let loaded = persistence::load(tmp.path()).unwrap();
+
+    // After load: RelationStore must be rebuilt with same route count.
+    let route_count_after = loaded.relations.iter_kind(RelationKind::Route).count();
+    assert_eq!(route_count_after, route_count_before,
+        "REL-PERSIST-01: RelationStore route edge count must match after load (rebuilt from PredictionStore)");
+}
+
 // ── FAC-PERSIST-01: §22 — merge_right_reuse survives save/load roundtrip ────
 #[test]
 fn fac_persist_01_merge_right_reuse_survives_roundtrip() {

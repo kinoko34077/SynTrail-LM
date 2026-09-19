@@ -881,6 +881,25 @@ impl ModelState {
         self.merge_candidates.iter()
     }
 
+    /// §26: RelationStore is derived — rebuild it from canonical stores after load.
+    pub fn rebuild_relations(&mut self) {
+        self.relations = crate::relation::RelationStore::new();
+        // Route edges from PredictionStore.
+        for edge in self.predictions.iter_all() {
+            self.relations.observe(edge.context, edge.next_unit, RelationKind::Route, edge.usage_strength);
+        }
+        // Adjacency edges from AssociationStore (both directions already stored).
+        for edge in self.associations.iter_all() {
+            self.relations.observe(edge.source, edge.target, RelationKind::Adjacency, edge.strength);
+        }
+        // DerivedFrom edges from LineageStore (each chunk ← left, right).
+        for (chunk_id, left, right) in self.lineage.all_entries() {
+            let chunk_unit = UnitId::chunk(chunk_id);
+            self.relations.record_derivation(left, chunk_unit);
+            self.relations.record_derivation(right, chunk_unit);
+        }
+    }
+
     pub fn from_parts(
         primitives: PrimitiveRegistry,
         chunks: ChunkRegistry,

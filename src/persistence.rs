@@ -524,7 +524,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         .collect();
     let lineage = LineageStore::from_bulk(lineage_bulk);
 
-    // Phase 7: RelationStore is derived from other stores; rebuilt on use after load.
+    // §26: RelationStore is derived — create empty; rebuild_relations() below fills it.
     let relations = RelationStore::new();
 
     // Phase B: restore Representation Lineage.
@@ -573,7 +573,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
             })
             .collect();
 
-    ModelState::from_parts(
+    let mut model = ModelState::from_parts(
         primitives,
         chunks,
         predictions,
@@ -591,7 +591,10 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
             total_characters: snap.metrics.total_characters,
         },
         snap.next_trace_id,
-    )
+    );
+    // §26: rebuild RelationStore from canonical stores (Predictions, Associations, Lineage).
+    model.rebuild_relations();
+    model
 }
 
 #[cfg(test)]

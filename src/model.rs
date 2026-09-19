@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use crate::association::AssociationStore;
 use crate::chunks::ChunkRegistry;
+use crate::config::GenerationConfig;
 use crate::identity::IdentityStore;
 use crate::lineage::LineageStore;
 use crate::prediction::PredictionStore;
@@ -26,12 +27,7 @@ const SEGMENT_MIN_SCORE: f64 = 0.0;
 /// High right-reuse (e.g., `は` appearing in 犬は/猫は/私は) resists merge.
 const FACTORIZATION_SCALE: f64 = 1.0;
 
-/// P0 Generation: top-K route candidates per step.
-const ROUTE_TOP_K: usize = 5;
-/// P0 Generation: score multiplier applied to a route that appears in recent_routes.
-const CYCLE_PENALTY: f64 = 0.05;
-/// P0 Generation: ring-buffer depth for cycle detection.
-const RECENT_ROUTES_MAX: usize = 8;
+// Generation tunables are in ModelState.gen_config (from GenerationConfig).
 /// P0: EOS marker — ETX character (U+0003).  Training can inject this at semantic boundaries.
 pub const EOS_CHAR: char = '\x03';
 
@@ -51,11 +47,15 @@ impl GenerationState {
     }
 
     pub fn push_route(&mut self, context: crate::units::UnitId, next: crate::units::UnitId) {
-        if self.recent_routes.len() >= RECENT_ROUTES_MAX {
-            self.recent_routes.pop_front();
-        }
+        // max is checked by callers using model.gen_config.recent_routes_max
         self.recent_routes.push_back((context, next));
         self.step_count += 1;
+    }
+
+    pub fn trim_recent_routes(&mut self, max: usize) {
+        while self.recent_routes.len() > max {
+            self.recent_routes.pop_front();
+        }
     }
 }
 
@@ -104,6 +104,8 @@ pub struct ModelState {
     pub metrics: Metrics,
     /// Monotonically increasing trace ID counter.
     pub(crate) next_trace_id: TraceId,
+    /// Generation tunables (§13).
+    pub gen_config: GenerationConfig,
 }
 
 impl ModelState {
@@ -230,11 +232,11 @@ impl ModelState {
     /// P0: pick the best next unit for `context`, applying cycle penalty and lineage fallback.
     fn pick_next_unit(&self, context: UnitId, state: &GenerationState) -> Option<(UnitId, f64)> {
         // Direct prediction — top-K with cycle penalty.
-        let candidates = self.predictions.top_k_with_score(context, ROUTE_TOP_K);
+        let candidates = self.predictions.top_k_with_score(context, self.gen_config.route_top_k);
         if !candidates.is_empty() {
             let best = candidates.into_iter()
                 .map(|(unit, score)| {
-                    let factor = if state.is_recent_route(context, unit) { CYCLE_PENALTY } else { 1.0 };
+                    let factor = if state.is_recent_route(context, unit) { self.gen_config.cycle_penalty } else { 1.0 };
                     (unit, score * factor)
                 })
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -353,6 +355,7 @@ impl ModelState {
                                         route_kind: RouteKind::RecallBridge,
                                     });
                                     gen_state.push_route(context, alt);
+                                    gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
                                     emitted_units.push(alt);
                                     escaped = true;
                                     break;
@@ -369,6 +372,7 @@ impl ModelState {
                                     route_kind: RouteKind::Generalize,
                                 });
                                 gen_state.push_route(context, alt);
+                                gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
                                 emitted_units.push(alt);
                                 continue;
                             }
@@ -383,6 +387,7 @@ impl ModelState {
                         route_kind: RouteKind::Direct,
                     });
                     gen_state.push_route(context, next);
+                    gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
                     emitted_units.push(next);
                 }
             }
@@ -717,6 +722,7 @@ impl ModelState {
             merge_right_reuse: HashMap::new(), // not persisted; rebuilt during training
             metrics,
             next_trace_id,
+            gen_config: GenerationConfig::default(),
         }
     }
 }

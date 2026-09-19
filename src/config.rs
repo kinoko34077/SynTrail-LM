@@ -1,3 +1,24 @@
+/// Generation-specific tunables (§13 — moved from model.rs constants).
+#[derive(Debug, Clone)]
+pub struct GenerationConfig {
+    /// Top-K route candidates per step.
+    pub route_top_k: usize,
+    /// Score multiplier for a route that appears in recent_routes.
+    pub cycle_penalty: f64,
+    /// Ring-buffer depth for cycle detection.
+    pub recent_routes_max: usize,
+}
+
+impl Default for GenerationConfig {
+    fn default() -> Self {
+        Self {
+            route_top_k: 5,
+            cycle_penalty: 0.05,
+            recent_routes_max: 8,
+        }
+    }
+}
+
 /// Runtime configuration (§31).
 /// All tunables are here — never hardcode them in business logic.
 #[derive(Debug, Clone)]
@@ -21,8 +42,8 @@ pub struct Config {
     pub association_decay: f64,
     /// Decay for the avoidance field (§19).
     pub avoidance_decay: f64,
-    /// Max recall results returned by model.recall().
-    pub route_top_k: usize,
+    /// Generation tunables (route_top_k, cycle_penalty, recent_routes_max).
+    pub generation: GenerationConfig,
     // ── v0.4 Residency (§10, §41) ──────────────────────────────────────────
     /// Maximum number of HOT chunks. 0 = unlimited.
     pub hot_budget: usize,
@@ -47,7 +68,7 @@ impl Config {
             association_top_k: 32,
             association_decay: 0.99,
             avoidance_decay: 0.99,
-            route_top_k: 8,
+            generation: GenerationConfig::default(),
             hot_budget: 0,
         }
     }

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use syntrail_lm::app::{load_model_file, model_analytics, save_model_file, Analytics};
 use syntrail_lm::desktop::file_ops::FileCommand;
+use syntrail_lm::desktop::fonts::setup_fonts;
 use syntrail_lm::eval::evaluate_sample_frozen;
 use syntrail_lm::model::ModelState;
 use syntrail_lm::trainer::adaptive::{decide_level_change, BlockLevel};
@@ -37,24 +38,6 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(TrainerApp::new()))
         }),
     )
-}
-
-fn setup_fonts(ctx: &egui::Context) {
-    let candidates: &[&str] = &[
-        r"C:\Windows\Fonts\YuGothR.ttc",
-        r"C:\Windows\Fonts\meiryo.ttc",
-        r"C:\Windows\Fonts\msgothic.ttc",
-        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    ];
-    if let Some(data) = candidates.iter().find_map(|p| std::fs::read(p).ok()) {
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(data));
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push("cjk".to_owned());
-        }
-        ctx.set_fonts(fonts);
-    }
 }
 
 // ── Worker ────────────────────────────────────────────────────────────────

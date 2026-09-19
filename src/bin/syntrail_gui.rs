@@ -6,6 +6,7 @@ use eframe::egui;
 use std::path::PathBuf;
 use syntrail_lm::app::{Analytics, AppHandle};
 use syntrail_lm::db::TurnRow;
+use syntrail_lm::desktop::fonts::setup_fonts;
 use syntrail_lm::feedback::FeedbackSign;
 
 #[cfg(all(target_os = "windows", feature = "gui"))]
@@ -31,30 +32,6 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(SynTrailApp::new()))
         }),
     )
-}
-
-// ── Font setup (Japanese / CJK) ───────────────────────────────────────────
-
-fn setup_fonts(ctx: &egui::Context) {
-    let candidates: &[&str] = &[
-        r"C:\Windows\Fonts\YuGothR.ttc",
-        r"C:\Windows\Fonts\meiryo.ttc",
-        r"C:\Windows\Fonts\msgothic.ttc",
-        r"C:\Windows\Fonts\msmincho.ttc",
-        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/takao-gothic/TakaoPGothic.ttf",
-    ];
-    let Some(data) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
-        return;
-    };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(data));
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push("cjk".to_owned());
-    }
-    ctx.set_fonts(fonts);
 }
 
 // ── File dialogs ──────────────────────────────────────────────────────────

@@ -87,7 +87,7 @@ integration tests: 100
 | ~~P1~~ | `desktop/` 共通層 (FileKind/FileCommand/DropRouter/fonts) (§78/§82/§95/§122) | ✅ UI-2 |
 | ~~P2~~ | Windows Native Menu (§88-94) | ✅ UI-6/7/8 |
 | ~~P2~~ | Keyboard shortcuts Ctrl+N/O/S/Shift+S (§92) | ✅ UI-6/7/8 |
-| P2 | Chat/Trainer の setup_fonts を desktop::fonts::setup_fonts に切り替え | 未 |
+| ~~P2~~ | Chat/Trainer の setup_fonts を desktop::fonts::setup_fonts に切り替え | ✅ P2修正 |
 
 ---
 

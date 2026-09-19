@@ -3335,3 +3335,81 @@ fn gen_surface_04_no_escape_terminates_cleanly() {
     assert!(emitted_len < 100,
         "GEN-SURFACE-04: surface repeat must cause early termination (steps={emitted_len})");
 }
+
+// ── GEN-RANK tests (§12) — Feedback ranking effectiveness ─────────────────
+
+#[test]
+fn gen_rank_01_positive_feedback_lifts_weaker_route() {
+    // GEN-RANK-01: applying positive feedback to a route that initially ranks lower
+    // must lift it above the originally-dominant route.
+    use syntrail_lm::prediction::PredictionStore;
+    use syntrail_lm::units::UnitId;
+    let ctx = UnitId::primitive(1);
+    let u_dominant = UnitId::primitive(2);  // trained more — initially top
+    let u_candidate = UnitId::primitive(3); // trained less — initially second
+
+    let mut store = PredictionStore::new();
+    for _ in 0..30 { store.observe(ctx, u_dominant); }
+    for _ in 0..10 { store.observe(ctx, u_candidate); }
+
+    assert_eq!(store.top1(ctx), Some(u_dominant),
+        "GEN-RANK-01 setup: dominant route must start at top");
+
+    // Apply positive feedback to the weaker candidate — feedback_value accumulates.
+    // After 8 rounds with decay=0.9: value ≈ Σ 0.9^k for k=0..7 ≈ 5.7, positive≈0.57.
+    // The dominant route's practice advantage is min(30-decayed/100, 1) < 0.3; +0.57 beats it.
+    for _ in 0..8 { store.apply_feedback_to_edge(ctx, u_candidate, 1.0, 0.9); }
+
+    assert_eq!(store.top1(ctx), Some(u_candidate),
+        "GEN-RANK-01: positive feedback must lift weaker route above dominant route");
+}
+
+#[test]
+fn gen_rank_02_negative_feedback_demotes_dominant_route() {
+    // GEN-RANK-02: heavy negative feedback (avoidance) must demote the dominant route
+    // below a previously-weaker competitor.
+    use syntrail_lm::prediction::PredictionStore;
+    use syntrail_lm::units::UnitId;
+    let ctx = UnitId::primitive(1);
+    let u_dominant = UnitId::primitive(2);
+    let u_alternative = UnitId::primitive(3);
+
+    let mut store = PredictionStore::new();
+    for _ in 0..30 { store.observe(ctx, u_dominant); }
+    for _ in 0..10 { store.observe(ctx, u_alternative); }
+
+    assert_eq!(store.top1(ctx), Some(u_dominant),
+        "GEN-RANK-02 setup: dominant route must start at top");
+
+    // Apply heavy negative feedback — avoidance converges toward 10 (avoid_norm → 1.0).
+    // After 20 applications with decay=0.9, avoidance ≈ 9.5 → avoid_norm ≈ 0.95.
+    // Dominant score drops from ≈1.3 to ≈0.35, below alternative ≈1.1.
+    for _ in 0..20 { store.apply_feedback_to_edge(ctx, u_dominant, -1.0, 0.9); }
+
+    assert_eq!(store.top1(ctx), Some(u_alternative),
+        "GEN-RANK-02: heavy avoidance must demote dominant route below alternative");
+}
+
+#[test]
+fn gen_rank_03_feedback_affects_generation_output() {
+    // GEN-RANK-03: feedback changes must propagate into actual route selection during generation.
+    use syntrail_lm::units::UnitId;
+    let mut m = ModelState::new();
+    // Train two continuations from the same context.
+    for _ in 0..30 { m.train("ab"); }  // a→b strongly
+    for _ in 0..10 { m.train("ac"); }  // a→c weakly
+
+    let pa = m.primitives.id('a').map(UnitId::primitive).unwrap();
+    let pb = m.primitives.id('b').map(UnitId::primitive).unwrap();
+
+    // Initially 'b' should be top from context 'a'.
+    assert_eq!(m.predictions.top1(pa), Some(pb),
+        "GEN-RANK-03 setup: 'b' must be top prediction from 'a' before feedback");
+
+    // Heavily penalize the a→b route.
+    for _ in 0..20 { m.predictions.apply_feedback_to_edge(pa, pb, -1.0, 0.9); }
+
+    // After avoidance, 'b' must no longer be the top prediction.
+    assert_ne!(m.predictions.top1(pa), Some(pb),
+        "GEN-RANK-03: after heavy avoidance, 'b' must no longer be top prediction from 'a'");
+}

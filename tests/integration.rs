@@ -1268,6 +1268,22 @@ fn gen_loop_06_trace_fields_after_cycle() {
     );
 }
 
+// ── GEN-LOOP-07: §12 no-progress stops generation (stagnation window) ────────
+#[test]
+fn gen_loop_07_no_progress_stops_generation() {
+    // Train only "ab" — model gets a→b and b→a (via association) or just a→b loop.
+    // With heavy training the cycle a→b→a is detected by route repetition,
+    // but even if escape routes create a wider 2-unit loop, §12 must terminate.
+    let mut m = ModelState::new();
+    for _ in 0..40 { m.expose_external("ab"); }
+    let (_, trace) = m.generate_with_trace("a", "a", 200, 77);
+    assert!(
+        trace.decision_count < 200,
+        "GEN-LOOP-07: §12 no-progress detection must stop generation before max_units, got {}",
+        trace.decision_count
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Phase B: Representation Lineage Tests (REP-01 through REP-07)
 // ═══════════════════════════════════════════════════════════════

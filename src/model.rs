@@ -39,9 +39,12 @@ pub const EOS_CHAR: char = TURN_BOUNDARY_CHAR;
 
 /// P0: Per-call generation state for cycle detection and no-progress tracking.
 /// §4: also tracks the current identity/representation being generated from.
+/// §12: last_emitted window for no-progress detection beyond route repetition.
 pub struct GenerationState {
     pub step_count: usize,
     recent_routes: std::collections::VecDeque<(crate::units::UnitId, crate::units::UnitId)>,
+    /// §12: ring buffer of recent emitted units for stagnation detection.
+    last_emitted: std::collections::VecDeque<crate::units::UnitId>,
     /// Identity of the current context unit (updated each step).
     pub current_identity: Option<IdentityId>,
     /// Representation active at the current step (the one whose predecessor chain was used).
@@ -53,9 +56,25 @@ impl GenerationState {
         Self {
             step_count: 0,
             recent_routes: std::collections::VecDeque::new(),
+            last_emitted: std::collections::VecDeque::new(),
             current_identity: None,
             current_rep: None,
         }
+    }
+
+    /// §12: Record an emitted unit in the stagnation window.
+    /// Returns true if no-progress is detected (≤2 distinct units in last 2*max window).
+    pub fn record_emitted(&mut self, unit: crate::units::UnitId, max: usize) -> bool {
+        let window = max.max(2) * 2;
+        self.last_emitted.push_back(unit);
+        if self.last_emitted.len() > window {
+            self.last_emitted.pop_front();
+        }
+        if self.last_emitted.len() < window {
+            return false; // window not yet full
+        }
+        let distinct: std::collections::HashSet<_> = self.last_emitted.iter().collect();
+        distinct.len() <= 2
     }
 
     pub fn is_recent_route(&self, context: crate::units::UnitId, next: crate::units::UnitId) -> bool {
@@ -420,6 +439,9 @@ impl ModelState {
                                     gen_state.push_route(context, alt);
                                     gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
                                     emitted_units.push(alt);
+                                    if gen_state.record_emitted(alt, self.gen_config.recent_routes_max) {
+                                        stopped_by_cycle = true;
+                                    }
                                     escaped = true;
                                     break;
                                 }
@@ -437,6 +459,10 @@ impl ModelState {
                                 gen_state.push_route(context, alt);
                                 gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
                                 emitted_units.push(alt);
+                                if gen_state.record_emitted(alt, self.gen_config.recent_routes_max) {
+                                    stopped_by_cycle = true;
+                                    break;
+                                }
                                 continue;
                             }
                         }
@@ -452,6 +478,10 @@ impl ModelState {
                     gen_state.push_route(context, next);
                     gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
                     emitted_units.push(next);
+                    if gen_state.record_emitted(next, self.gen_config.recent_routes_max) {
+                        stopped_by_cycle = true;
+                        break;
+                    }
                 }
             }
         }

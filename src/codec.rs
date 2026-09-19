@@ -57,18 +57,30 @@ pub fn leb128_decode(bytes: &[u8], pos: usize) -> Option<(u64, usize)> {
 
 // ── UnitId packing ────────────────────────────────────────────────────────
 
-/// Pack a `UnitId` into a single u64 for encoding:
+/// §44: Canonical packing rule (SSOT): bit 0 = is_chunk, bits 1+ = raw id.
+///
+/// Pack a `UnitId` into a u32 for bincode serialization (persistence).
+pub fn pack_unit_id(u: UnitId) -> u32 {
+    (u.raw() << 1) | (u.is_chunk() as u32)
+}
+
+/// §44: Unpack a `UnitId` from a u32 packed by `pack_unit_id`.
+pub fn unpack_unit_id(v: u32) -> UnitId {
+    let is_chunk = (v & 1) != 0;
+    let raw = v >> 1;
+    if is_chunk { UnitId::chunk(raw) } else { UnitId::primitive(raw) }
+}
+
+/// Pack a `UnitId` into a single u64 for LEB128 encoding:
 ///   bit 0 = is_chunk flag (1 = chunk, 0 = primitive)
 ///   bits 1..63 = raw id
 pub fn unit_id_to_u64(u: UnitId) -> u64 {
-    ((u.raw() as u64) << 1) | (u.is_chunk() as u64)
+    pack_unit_id(u) as u64
 }
 
 /// Unpack a `UnitId` from a packed u64.
 pub fn unit_id_from_u64(v: u64) -> UnitId {
-    let is_chunk = (v & 1) != 0;
-    let raw = (v >> 1) as u32;
-    if is_chunk { UnitId::chunk(raw) } else { UnitId::primitive(raw) }
+    unpack_unit_id(v as u32)
 }
 
 /// Encode a single UnitId as LEB128.

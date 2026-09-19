@@ -27,6 +27,7 @@ use crate::representation::{RepresentationEntry, RepresentationStore};
 use crate::tier::Tier;
 use crate::trace::TraceId;
 use crate::transform::{TransformKind, TransformStore};
+use crate::codec::{pack_unit_id, unpack_unit_id};
 use crate::units::UnitId;
 
 // ── Serialisable mirror types ──────────────────────────────────────────────
@@ -49,8 +50,8 @@ impl Serialize for UnitIdDto {
             st.serialize_field("raw", &self.raw)?;
             st.end()
         } else {
-            // bincode v3: packed u32 = (raw << 1) | is_chunk (§16)
-            let packed: u32 = (self.raw << 1) | (self.is_chunk as u32);
+            // bincode v3: §44: use canonical pack rule from codec (SSOT)
+            let packed = pack_unit_id(UnitId::from(*self));
             packed.serialize(s)
         }
     }
@@ -65,9 +66,9 @@ impl<'de> Deserialize<'de> for UnitIdDto {
             let j = JsonForm::deserialize(d)?;
             Ok(Self { is_chunk: j.is_chunk, raw: j.raw })
         } else {
-            // bincode v3: packed u32
+            // bincode v3: §44: use canonical unpack rule from codec (SSOT)
             let packed = u32::deserialize(d)?;
-            Ok(Self { is_chunk: (packed & 1) != 0, raw: packed >> 1 })
+            Ok(Self::from(unpack_unit_id(packed)))
         }
     }
 }
@@ -889,7 +890,8 @@ fn stm_write_container<W: std::io::Write + std::io::Seek>(
 
     writer.flush()?;
     let end_pos = writer.seek(SeekFrom::Current(0))?;
-    let payload_len = (end_pos - 10) as u32; // header is exactly 10 bytes
+    let payload_len = u32::try_from(end_pos - 10)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "STM payload exceeds 4 GiB"))?;
     writer.seek(SeekFrom::Start(6))?;
     writer.write_all(&payload_len.to_le_bytes())?;
     writer.seek(SeekFrom::End(0))?;

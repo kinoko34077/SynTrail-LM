@@ -7,6 +7,13 @@
 ///   snapshots        — model state snapshots
 use rusqlite::{Connection, Result, params};
 
+/// Unified snapshot payload returned by [Database::load_latest_snapshot].
+/// Callers prefer Binary (bincode BLOB) over Json (legacy text).
+pub enum SnapshotPayload {
+    Binary(Vec<u8>),
+    Json(String),
+}
+
 use crate::feedback::{FeedbackEvent, FeedbackSign, FeedbackSource};
 use crate::trace::{DecisionStep, RouteKind, TurnTrace};
 
@@ -269,6 +276,26 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    /// §3: Unified latest-snapshot loader — prefers blob_data, falls back to json_blob.
+    /// Single query; callers should use this instead of calling blob + json separately.
+    pub fn load_latest_snapshot(&self) -> Result<Option<SnapshotPayload>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT json_blob, blob_data FROM snapshots ORDER BY snapshot_id DESC LIMIT 1"
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let blob: Option<Vec<u8>> = row.get(1)?;
+            if let Some(b) = blob {
+                return Ok(Some(SnapshotPayload::Binary(b)));
+            }
+            let json: String = row.get(0)?;
+            if !json.is_empty() {
+                return Ok(Some(SnapshotPayload::Json(json)));
+            }
+        }
+        Ok(None)
     }
 
     // ── History query ─────────────────────────────────────────────────────

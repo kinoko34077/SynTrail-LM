@@ -87,15 +87,17 @@ pub fn load_model_file(path: &Path) -> Result<ModelState, Box<dyn Error>> {
         Some("stm") => Ok(persistence::load_binary(path)?),
         Some("db") | Some("sqlite") => {
             let db = Database::open(&path.to_string_lossy())?;
-            // Prefer BLOB (bincode); fall back to JSON for legacy rows.
-            if let Some(blob) = db.load_latest_snapshot_blob()? {
-                let snap: persistence::ModelSnapshot = bincode::deserialize(&blob)?;
-                Ok(persistence::from_snapshot(snap))
-            } else {
-                let json = db.load_latest_snapshot_json()?
-                    .ok_or("no snapshot found in database")?;
-                let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
-                Ok(persistence::from_snapshot(snap))
+            // §3: unified latest snapshot: blob_data (bincode) preferred over json_blob.
+            match db.load_latest_snapshot()? {
+                Some(crate::db::SnapshotPayload::Binary(blob)) => {
+                    let snap: persistence::ModelSnapshot = bincode::deserialize(&blob)?;
+                    Ok(persistence::from_snapshot(snap))
+                }
+                Some(crate::db::SnapshotPayload::Json(json)) => {
+                    let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
+                    Ok(persistence::from_snapshot(snap))
+                }
+                None => Err("no snapshot found in database".into()),
             }
         }
         _ => Ok(persistence::load(path)?),

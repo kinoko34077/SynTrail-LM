@@ -9,6 +9,7 @@ use syntrail_lm::tier::{Tier, TierThresholds};
 use syntrail_lm::units::UnitId;
 use tempfile::NamedTempFile;
 extern crate bincode;
+extern crate serde_json;
 
 // ── AC-01: Unicode round-trip ──────────────────────────────────────────────
 #[test]
@@ -3028,4 +3029,79 @@ fn stm_version_07_unknown_version_rejected() {
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("42") || msg.contains("not supported") || msg.contains("Unsupported"),
         "STM-VERSION-02: error must mention the version: {}", msg);
+}
+
+// ── DB-OPEN tests (§3) ────────────────────────────────────────────────────
+
+#[test]
+fn db_open_01_blob_snapshot_restored() {
+    // DB-OPEN-01: latest BLOB Snapshot restores when Session::open().
+    use syntrail_lm::config::Config;
+    use syntrail_lm::session::Session;
+    let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    // Create session, train, save blob snapshot, then reopen.
+    {
+        let mut s = Session::open(path, Config::default_v04()).unwrap();
+        for _ in 0..10 { s.model.train("hello world"); }
+        s.snapshot_to_db(None).unwrap();
+    }
+    let s2 = Session::open(path, Config::default_v04()).unwrap();
+    assert!(s2.model.tick > 0, "DB-OPEN-01: model tick must be non-zero after restore");
+    assert!(s2.model.chunk_count() > 0, "DB-OPEN-01: model must have chunks after BLOB restore");
+}
+
+#[test]
+fn db_open_02_json_snapshot_restored() {
+    // DB-OPEN-02: legacy JSON Snapshot also restores when Session::open().
+    use syntrail_lm::config::Config;
+    use syntrail_lm::session::Session;
+    use syntrail_lm::db::Database;
+    let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    // Insert a JSON-format snapshot directly via the legacy insert_snapshot path.
+    {
+        let mut m = ModelState::new();
+        for _ in 0..10 { m.train("hello world"); }
+        let snap = persistence::to_snapshot(&m);
+        let json = serde_json::to_string(&snap).unwrap();
+        let db = Database::open(path).unwrap();
+        let fp = m.state_fingerprint();
+        db.insert_snapshot(None, m.tick, &fp, &json, 0).unwrap();
+    }
+    let s2 = Session::open(path, Config::default_v04()).unwrap();
+    assert!(s2.model.tick > 0, "DB-OPEN-02: model tick must be non-zero after JSON restore");
+    assert!(s2.model.chunk_count() > 0, "DB-OPEN-02: model must have chunks after JSON restore");
+}
+
+#[test]
+fn db_open_03_no_snapshot_returns_empty_model() {
+    // DB-OPEN-03: no-snapshot DB returns empty model (tick == 0, no chunks).
+    use syntrail_lm::config::Config;
+    use syntrail_lm::session::Session;
+    let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let s = Session::open(path, Config::default_v04()).unwrap();
+    assert_eq!(s.model.tick, 0, "DB-OPEN-03: empty DB must yield tick == 0");
+    assert_eq!(s.model.chunk_count(), 0, "DB-OPEN-03: empty DB must yield no chunks");
+}
+
+#[test]
+fn db_open_04_model_state_persists_across_reopen() {
+    // DB-OPEN-04: model state is not lost when reopening an existing DB session.
+    use syntrail_lm::config::Config;
+    use syntrail_lm::session::Session;
+    let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let tick_after_train;
+    {
+        let mut s = Session::open(path, Config::default_v04()).unwrap();
+        for _ in 0..15 { s.model.train("persistent state check"); }
+        tick_after_train = s.model.tick;
+        s.snapshot_to_db(None).unwrap();
+    }
+    // Reopen — simulate what CLI chat does on subsequent invocations.
+    let s2 = Session::open(path, Config::default_v04()).unwrap();
+    assert_eq!(s2.model.tick, tick_after_train,
+        "DB-OPEN-04: tick must match after reopening DB — model state must not be lost");
 }

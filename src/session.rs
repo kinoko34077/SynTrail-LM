@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::config::Config;
-use crate::db::{Database, TurnRow};
+use crate::db::{Database, SnapshotPayload, TurnRow};
 use crate::feedback::{distribute, FeedbackEvent, FeedbackSign, FeedbackSource};
 use crate::model::ModelState;
 use crate::persistence;
@@ -38,11 +38,17 @@ impl Session {
     /// if one exists.
     pub fn open(db_path: &str, config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let db = Database::open(db_path)?;
-        let model = if let Some(json) = db.load_latest_snapshot_json()? {
-            let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
-            persistence::from_snapshot(snap)
-        } else {
-            ModelState::new()
+        // §3: prefer blob_data (bincode) over json_blob; both are valid snapshot formats.
+        let model = match db.load_latest_snapshot()? {
+            Some(SnapshotPayload::Binary(blob)) => {
+                let snap: persistence::ModelSnapshot = bincode::deserialize(&blob)?;
+                persistence::from_snapshot(snap)
+            }
+            Some(SnapshotPayload::Json(json)) => {
+                let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
+                persistence::from_snapshot(snap)
+            }
+            None => ModelState::new(),
         };
         Ok(Self { model, db, config, turn_count: 0 })
     }

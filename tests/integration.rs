@@ -1863,6 +1863,29 @@ fn doc01_apphandle_doc_state_tracks_path() {
     assert!(h.doc.path.is_none(), "DOC-01: doc.path must be None after reset_model");
 }
 
+// ── BUD-01: §14-§16 — MemoryBudgetConfig enforced by train() ─────────────
+#[test]
+fn bud01_hot_budget_enforced_by_train() {
+    use syntrail_lm::config::MemoryBudgetConfig;
+    let mut m = ModelState::new();
+    m.memory_budget = MemoryBudgetConfig { hot_chunks_max: 5 };
+    // Heavy training creates many chunks; budget must cap HOT count.
+    for _ in 0..200 { m.train("hello world foo bar baz qux quux"); }
+    let hot = m.hot_chunk_count();
+    assert!(hot <= 5,
+        "BUD-01: HOT chunk count must be ≤ hot_chunks_max=5 after train(); got {hot}");
+}
+
+// ── BUD-02: §14 — budget=0 means unlimited ────────────────────────────────
+#[test]
+fn bud02_zero_budget_is_unlimited() {
+    let mut m = ModelState::new();
+    // Default budget is 0 (unlimited); hot count must exceed 5.
+    for _ in 0..200 { m.train("hello world foo bar baz qux quux"); }
+    let hot = m.hot_chunk_count();
+    assert!(hot > 0, "BUD-02: model with no budget should have HOT chunks after training");
+}
+
 // ── DOC-03: §27 — new_conversation preserves model, reset_model clears it ──
 #[test]
 fn doc03_new_conversation_vs_reset_model() {

@@ -141,6 +141,8 @@ pub struct ModelState {
     pub(crate) next_trace_id: TraceId,
     /// Generation tunables (§13).
     pub gen_config: GenerationConfig,
+    /// Memory budget tunables (§14-§16).
+    pub memory_budget: crate::config::MemoryBudgetConfig,
 }
 
 impl ModelState {
@@ -268,6 +270,8 @@ impl ModelState {
     #[inline]
     pub fn train(&mut self, text: &str) {
         self.expose_external(text);
+        let budget = self.memory_budget.hot_chunks_max;
+        if budget > 0 { self.enforce_hot_budget(budget); }
     }
 
     // ── Frozen generation (P0: cycle detection, seed/output separation, Top-K) ──
@@ -833,6 +837,7 @@ impl ModelState {
             metrics,
             next_trace_id,
             gen_config: GenerationConfig::default(),
+            memory_budget: crate::config::MemoryBudgetConfig::default(),
         }
     }
 }

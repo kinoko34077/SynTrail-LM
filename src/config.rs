@@ -34,6 +34,12 @@ pub struct GenerationConfig {
     pub dialogue_prompt_units_max: usize,
     /// §6: weight of prompt-route support added to candidate scores in Dialogue mode.
     pub dialogue_prompt_support_weight: f64,
+    /// §11: rolling primitive window size for surface repetition detection.
+    pub surface_window_primitives: usize,
+    /// §11: max n-gram length checked in surface repetition detection.
+    pub surface_pattern_max: usize,
+    /// §11: how many consecutive full repeats of a pattern trigger detection.
+    pub surface_repeat_threshold: usize,
 }
 
 impl Default for GenerationConfig {
@@ -44,6 +50,9 @@ impl Default for GenerationConfig {
             recent_routes_max: 8,
             dialogue_prompt_units_max: 4,
             dialogue_prompt_support_weight: 0.3,
+            surface_window_primitives: 24,
+            surface_pattern_max: 4,
+            surface_repeat_threshold: 2,
         }
     }
 }

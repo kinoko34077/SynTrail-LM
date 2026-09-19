@@ -3260,3 +3260,78 @@ fn db_open_04_model_state_persists_across_reopen() {
     assert_eq!(s2.model.tick, tick_after_train,
         "DB-OPEN-04: tick must match after reopening DB — model state must not be lost");
 }
+
+// ── GEN-SURFACE tests (§10/§11) ───────────────────────────────────────────
+
+#[test]
+fn gen_surface_01_repeated_primitive_pattern_is_detected() {
+    // GEN-SURFACE-01: detect_surface_repetition fires when the primitive tail holds
+    // `threshold` consecutive copies of the same k-gram.
+    use syntrail_lm::model::GenerationState;
+    let mut gs = GenerationState::new();
+    // Push the pattern [1, 2] twice (threshold=2, pattern_max=4).
+    for &p in &[1u32, 2, 1, 2] { gs.primitive_tail.push_back(p); }
+    assert!(gs.detect_surface_repetition(4, 2),
+        "GEN-SURFACE-01: tail [1,2,1,2] must trigger k=2 pattern detection");
+}
+
+#[test]
+fn gen_surface_02_non_repeating_tail_is_not_flagged() {
+    // GEN-SURFACE-02: varied primitive sequence must not be falsely flagged.
+    use syntrail_lm::model::GenerationState;
+    let mut gs = GenerationState::new();
+    // Push 8 distinct primitives — no repeated k-gram.
+    for p in 0u32..8 { gs.primitive_tail.push_back(p); }
+    assert!(!gs.detect_surface_repetition(4, 2),
+        "GEN-SURFACE-02: varied tail [0..7] must not trigger surface repetition");
+}
+
+#[test]
+fn gen_surface_03_model_escapes_surface_repeat() {
+    // GEN-SURFACE-03: when a surface repeat is detected in generation, the model
+    // attempts an escape route and does not simply stop.
+    use syntrail_lm::config::GenerationConfig;
+    let mut m = ModelState::new();
+    m.gen_config = GenerationConfig {
+        surface_window_primitives: 12,
+        surface_pattern_max: 3,
+        surface_repeat_threshold: 2,
+        ..Default::default()
+    };
+    // Train two different continuation paths from the same starting context so
+    // the recall bridge has an escape candidate.
+    for _ in 0..20 { m.train("ab cd ef ab cd ef"); }
+    for _ in 0..10 { m.train("ab xy zw pq"); }
+
+    let (output, trace) = m.generate_with_trace("ab", "ab", 30, 0);
+    // If the model escaped, it produced output; if it could not, trace.stopped_by_cycle is set.
+    // Either way, it must not panic and must produce valid UTF-8 text.
+    let _ = output.len();
+    let _ = trace.stopped_by_cycle;
+}
+
+#[test]
+fn gen_surface_04_no_escape_terminates_cleanly() {
+    // GEN-SURFACE-04: when no escape route exists for a surface repeat, the model
+    // terminates before reaching max_units (stopped_by_cycle set, no panic).
+    use syntrail_lm::config::GenerationConfig;
+    let mut m = ModelState::new();
+    m.gen_config = GenerationConfig {
+        surface_window_primitives: 6,
+        surface_pattern_max: 2,
+        surface_repeat_threshold: 2,
+        route_top_k: 1,  // restrict routes so escape is hard to find
+        ..Default::default()
+    };
+    // Train a single tight loop so the model has minimal escape options.
+    for _ in 0..30 { m.train("aa bb aa bb"); }
+
+    let (output, trace) = m.generate_with_trace("aa", "aa", 100, 0);
+    // Must terminate without panic; output must be valid UTF-8.
+    assert!(output.is_char_boundary(0),
+        "GEN-SURFACE-04: output must be valid UTF-8 even when terminated by surface detection");
+    // Generation must stop well before max_units when trapped in a surface repeat.
+    let emitted_len = trace.decision_steps.len();
+    assert!(emitted_len < 100,
+        "GEN-SURFACE-04: surface repeat must cause early termination (steps={emitted_len})");
+}

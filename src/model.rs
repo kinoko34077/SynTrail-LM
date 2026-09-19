@@ -48,6 +48,8 @@ pub struct GenerationState {
     pub current_rep: Option<RepId>,
     /// §6: bounded prompt units for Dialogue-mode prompt conditioning (empty in Completion mode).
     pub prompt_context_units: Vec<crate::units::UnitId>,
+    /// §10: bounded primitive sequence for surface repetition detection.
+    pub primitive_tail: std::collections::VecDeque<u32>,
 }
 
 impl GenerationState {
@@ -59,6 +61,7 @@ impl GenerationState {
             current_identity: None,
             current_rep: None,
             prompt_context_units: Vec::new(),
+            primitive_tail: std::collections::VecDeque::new(),
         }
     }
 
@@ -91,6 +94,24 @@ impl GenerationState {
         while self.recent_routes.len() > max {
             self.recent_routes.pop_front();
         }
+    }
+
+    /// §10/§11: true if the primitive tail contains `threshold` consecutive full repeats of any
+    /// k-gram (k ∈ 1..=pattern_max).  Returns false when the tail is shorter than k*threshold.
+    pub fn detect_surface_repetition(&self, pattern_max: usize, threshold: usize) -> bool {
+        if threshold < 2 { return false; }
+        let tail: Vec<u32> = self.primitive_tail.iter().copied().collect();
+        for k in 1..=pattern_max {
+            let needed = k * threshold;
+            if tail.len() < needed { continue; }
+            let pattern = &tail[tail.len() - k..];
+            let all_match = (1..threshold).all(|i| {
+                let start = tail.len() - k * (i + 1);
+                &tail[start..start + k] == pattern
+            });
+            if all_match { return true; }
+        }
+        false
     }
 }
 
@@ -569,6 +590,79 @@ impl ModelState {
                     if gen_state.record_emitted(next, self.gen_config.recent_routes_max) {
                         stopped_by_cycle = true;
                         break;
+                    }
+                    // §10/§11: update primitive tail; detect surface repetition.
+                    {
+                        let prims = expand(&[next], &self.chunks, &self.primitives);
+                        for p in prims { gen_state.primitive_tail.push_back(p); }
+                    }
+                    let surf_win = self.gen_config.surface_window_primitives;
+                    while gen_state.primitive_tail.len() > surf_win {
+                        gen_state.primitive_tail.pop_front();
+                    }
+                    if gen_state.detect_surface_repetition(
+                        self.gen_config.surface_pattern_max,
+                        self.gen_config.surface_repeat_threshold,
+                    ) {
+                        let escape_ctx = next;
+                        let mut surface_escaped = false;
+                        // Recall bridge from escape context.
+                        let associates = self.associations.recall(escape_ctx, &self.chunks, 8);
+                        for (assoc, _) in associates {
+                            if assoc == escape_ctx { continue; }
+                            if let Some((alt, alt_score)) = self.predictions.top1_with_score(assoc) {
+                                if eos != Some(alt) {
+                                    steps.push(DecisionStep {
+                                        step_index, unit: alt, context: escape_ctx,
+                                        route_source: assoc, score: alt_score,
+                                        route_kind: RouteKind::RecallBridge,
+                                        representation_id: None,
+                                    });
+                                    gen_state.push_route(escape_ctx, alt);
+                                    gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
+                                    emitted_units.push(alt);
+                                    let alt_prims = expand(&[alt], &self.chunks, &self.primitives);
+                                    for p in alt_prims { gen_state.primitive_tail.push_back(p); }
+                                    while gen_state.primitive_tail.len() > surf_win {
+                                        gen_state.primitive_tail.pop_front();
+                                    }
+                                    if gen_state.record_emitted(alt, self.gen_config.recent_routes_max) {
+                                        stopped_by_cycle = true;
+                                    }
+                                    surface_escaped = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !surface_escaped {
+                            if let Some((alt, alt_score)) = self.generalize_excluding(escape_ctx, &[escape_ctx]) {
+                                if eos != Some(alt) {
+                                    steps.push(DecisionStep {
+                                        step_index, unit: alt, context: escape_ctx,
+                                        route_source: escape_ctx, score: alt_score,
+                                        route_kind: RouteKind::Generalize,
+                                        representation_id: None,
+                                    });
+                                    gen_state.push_route(escape_ctx, alt);
+                                    gen_state.trim_recent_routes(self.gen_config.recent_routes_max);
+                                    emitted_units.push(alt);
+                                    let alt_prims = expand(&[alt], &self.chunks, &self.primitives);
+                                    for p in alt_prims { gen_state.primitive_tail.push_back(p); }
+                                    while gen_state.primitive_tail.len() > surf_win {
+                                        gen_state.primitive_tail.pop_front();
+                                    }
+                                    if gen_state.record_emitted(alt, self.gen_config.recent_routes_max) {
+                                        stopped_by_cycle = true;
+                                    }
+                                    surface_escaped = true;
+                                }
+                            }
+                        }
+                        if !surface_escaped {
+                            stopped_by_cycle = true;
+                            break;
+                        }
+                        continue;
                     }
                 }
             }

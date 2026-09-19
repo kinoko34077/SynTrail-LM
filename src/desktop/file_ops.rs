@@ -54,33 +54,5 @@ pub enum FileCommand {
     LoadPath(PathBuf),
 }
 
-/// Document state — tracks current path and unsaved changes (§87).
-#[derive(Debug, Default, Clone)]
-pub struct DocumentState {
-    pub path: Option<PathBuf>,
-    pub dirty: bool,
-}
-
-impl DocumentState {
-    pub fn new_unsaved() -> Self {
-        Self { path: None, dirty: false }
-    }
-
-    pub fn from_path(path: PathBuf) -> Self {
-        Self { path: Some(path), dirty: false }
-    }
-
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    /// Called after a successful save. Updates path and clears dirty flag.
-    pub fn mark_saved(&mut self, path: PathBuf) {
-        self.path = Some(path);
-        self.dirty = false;
-    }
-
-    pub fn path_str(&self) -> &str {
-        self.path.as_ref().and_then(|p| p.to_str()).unwrap_or("(unsaved)")
-    }
-}
+/// Document state — re-exported from app (canonical definition lives there).
+pub use crate::app::DocumentState;

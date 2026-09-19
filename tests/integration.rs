@@ -1803,6 +1803,46 @@ fn trf06_composed_does_not_merge() {
         "TRF-06: composed transform must not merge endpoints");
 }
 
+// ── DOC-01: §24 — DocumentState wired into AppHandle ────────────────────
+#[test]
+fn doc01_apphandle_doc_state_tracks_path() {
+    use syntrail_lm::app::AppHandle;
+    // New handle with a non-existent path → doc.path is set, no load.
+    let f = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+    let path = f.path().to_path_buf();
+    // Pre-create an empty model file so new() can load it.
+    syntrail_lm::app::save_model_file(&syntrail_lm::model::ModelState::new(), &path).unwrap();
+    let mut h = AppHandle::new(path.clone(), ":memory:").unwrap();
+    assert_eq!(h.doc.path.as_deref(), Some(path.as_path()),
+        "DOC-01: doc.path must be set after AppHandle::new");
+    assert!(!h.doc.dirty, "DOC-01: doc must not be dirty after clean load");
+    // generate_turn marks dirty.
+    for _ in 0..10 { h.session.model.expose_external("hello world"); }
+    let _ = h.generate_turn("hello");
+    assert!(h.doc.dirty, "DOC-01: doc must be dirty after generate_turn");
+    // save_model clears dirty.
+    h.save_model().unwrap();
+    assert!(!h.doc.dirty, "DOC-01: doc must not be dirty after save_model");
+    // reset_model clears path.
+    h.reset_model();
+    assert!(h.doc.path.is_none(), "DOC-01: doc.path must be None after reset_model");
+}
+
+// ── DOC-02: §25 — save_model returns error when doc.path is None ─────────
+#[test]
+fn doc02_save_model_requires_path() {
+    use syntrail_lm::app::AppHandle;
+    // Create a handle backed by a temp db, but immediately reset to clear path.
+    let f = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+    let path = f.path().to_path_buf();
+    syntrail_lm::app::save_model_file(&syntrail_lm::model::ModelState::new(), &path).unwrap();
+    let mut h = AppHandle::new(path, ":memory:").unwrap();
+    h.reset_model(); // clears doc.path
+    assert!(h.doc.path.is_none());
+    let result = h.save_model();
+    assert!(result.is_err(), "DOC-02: save_model must error when doc.path is None");
+}
+
 // ── MFILE-01: §21/§22 — save_model_file/.stm roundtrip ───────────────────
 #[test]
 fn mfile01_stm_roundtrip() {

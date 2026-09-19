@@ -179,17 +179,14 @@ impl SynTrailApp {
 
     fn do_save(&mut self) {
         match self.handle.save_model() {
-            Ok(()) => self.status = format!("Saved: {}", self.handle.model_path.display()),
+            Ok(()) => self.status = format!("Saved: {}", self.handle.doc.path_str()),
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
     fn do_save_as(&mut self, path: PathBuf) {
         match self.handle.save_model_to(&path) {
-            Ok(()) => {
-                self.handle.model_path = path.clone();
-                self.status = format!("Saved: {}", path.display());
-            }
+            Ok(()) => self.status = format!("Saved: {}", path.display()),
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
@@ -257,7 +254,7 @@ impl eframe::App for SynTrailApp {
         }
 
         // Current model path for display
-        let model_path_str = self.handle.model_path.display().to_string();
+        let model_path_str = self.handle.doc.path_str().to_string();
 
         // ── Top toolbar ───────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {

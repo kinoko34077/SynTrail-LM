@@ -14,6 +14,33 @@ use crate::persistence;
 use crate::session::Session;
 use crate::trace::now_secs;
 
+// ── DocumentState ─────────────────────────────────────────────────────────
+
+/// Tracks the current model file path and whether there are unsaved changes.
+#[derive(Debug, Default, Clone)]
+pub struct DocumentState {
+    pub path: Option<PathBuf>,
+    pub dirty: bool,
+}
+
+impl DocumentState {
+    pub fn new_unsaved() -> Self { Self { path: None, dirty: false } }
+
+    pub fn from_path(path: PathBuf) -> Self { Self { path: Some(path), dirty: false } }
+
+    pub fn mark_dirty(&mut self) { self.dirty = true; }
+
+    /// Called after a successful save. Updates path and clears dirty flag.
+    pub fn mark_saved(&mut self, path: PathBuf) {
+        self.path = Some(path);
+        self.dirty = false;
+    }
+
+    pub fn path_str(&self) -> &str {
+        self.path.as_ref().and_then(|p| p.to_str()).unwrap_or("(unsaved)")
+    }
+}
+
 // ── Shared free functions (used by both AppHandle and Trainer) ────────────
 
 /// Extension-aware save: `.stm` → binary; `.db`/`.sqlite` → snapshot row; anything else → JSON.
@@ -112,11 +139,11 @@ pub struct Analytics {
 
 // ── AppHandle ─────────────────────────────────────────────────────────────
 
-/// Shared application state. Owns the model (via Session) and the model file path.
+/// Shared application state. Owns the model (via Session) and the document state.
 /// History is stored in `history_db_path` (separate from the model file — §10).
 pub struct AppHandle {
     pub session: Session,
-    pub model_path: PathBuf,
+    pub doc: DocumentState,
     last_decision_count: usize,
     last_output_len: usize,
     last_output_chars: usize,
@@ -131,14 +158,14 @@ impl AppHandle {
     pub fn new(model_path: PathBuf, history_db_path: &str) -> Result<Self, Box<dyn Error>> {
         let db = Database::open(history_db_path)?;
         let model = if model_path.exists() {
-            persistence::load(&model_path)?
+            load_model_file(&model_path)?
         } else {
             ModelState::new()
         };
         let session = Session { model, db, config: Config::default_v04(), turn_count: 0 };
         Ok(Self {
             session,
-            model_path,
+            doc: DocumentState::from_path(model_path),
             last_decision_count: 0,
             last_output_len: 0,
             last_output_chars: 0,
@@ -153,6 +180,7 @@ impl AppHandle {
         self.last_decision_count = trace.decision_count;
         self.last_output_len = output.len();
         self.last_output_chars = output.chars().count();
+        self.doc.mark_dirty();
         Ok((turn_id, output))
     }
 
@@ -169,35 +197,41 @@ impl AppHandle {
         self.session.feedback(turn_id, sign, FeedbackSource::User, None)
     }
 
-    /// Quick-save to `self.model_path` (extension-aware).
-    pub fn save_model(&self) -> Result<(), Box<dyn Error>> {
-        self.save_model_to(&self.model_path.clone())
+    /// Quick-save to `self.doc.path`. Fails if no path is set.
+    pub fn save_model(&mut self) -> Result<(), Box<dyn Error>> {
+        let path = self.doc.path.clone().ok_or("no save path — use Save As first")?;
+        save_model_file(&self.session.model, &path)?;
+        self.doc.mark_saved(path);
+        Ok(())
     }
 
-    /// Save As: write to `path` (json or db/sqlite). Does NOT update `self.model_path`.
-    pub fn save_model_to(&self, path: &Path) -> Result<(), Box<dyn Error>> {
-        save_model_file(&self.session.model, path)
+    /// Save As: write to `path`, update doc state.
+    pub fn save_model_to(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
+        save_model_file(&self.session.model, path)?;
+        self.doc.mark_saved(path.to_path_buf());
+        Ok(())
     }
 
-    /// Load model from `path` (json or db/sqlite). Alias for `load_model_from`.
+    /// Load model from `path`. Alias for `load_model_from`.
     pub fn load_model(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
         self.load_model_from(path)
     }
 
-    /// Extension-aware load; updates `self.model_path` on success.
+    /// Extension-aware load; updates doc state on success.
     pub fn load_model_from(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
         self.session.model = load_model_file(path)?;
-        self.model_path = path.to_path_buf();
+        self.doc = DocumentState::from_path(path.to_path_buf());
         self.last_decision_count = 0;
         self.last_output_len = 0;
         self.last_output_chars = 0;
         Ok(())
     }
 
-    /// Replace model with a blank one, reset counters.
+    /// Replace model with a blank one, reset counters, clear doc path (New).
     pub fn reset_model(&mut self) {
         self.session.model = ModelState::new();
         self.session.turn_count = 0;
+        self.doc = DocumentState::new_unsaved();
         self.last_decision_count = 0;
         self.last_output_len = 0;
         self.last_output_chars = 0;

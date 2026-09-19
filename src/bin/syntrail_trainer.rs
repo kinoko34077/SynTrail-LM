@@ -95,6 +95,7 @@ enum TrainerEvent {
     LevelChanged(BlockLevel),
     Saved,
     Paused,
+    Stopped,
     Completed(usize),
     Error(String),
     Analytics(Box<Analytics>),
@@ -131,7 +132,11 @@ fn worker_main(
                     Ok(TrainerCommand::Pause) => {
                         tr_state.status = TrainerStatus::Paused;
                         tr_state.model_fingerprint = model.state_fingerprint();
-                        do_save(&model, &model_path, &tr_state, &ev_tx);
+                        // Only enter Paused state if save succeeded.
+                        if !do_save(&model, &model_path, &tr_state, &ev_tx) {
+                            // save failed — stay Running; Error already sent by do_save
+                            break;
+                        }
                         let _ = ev_tx.send(TrainerEvent::Paused);
                         // Wait for Resume or Stop.
                         loop {
@@ -141,7 +146,7 @@ fn worker_main(
                                     break;
                                 }
                                 Ok(TrainerCommand::Stop) | Err(_) => {
-                                    save_and_exit(&mut model, &model_path, &mut tr_state);
+                                    save_and_exit(&mut model, &model_path, &mut tr_state, &ev_tx);
                                     return;
                                 }
                                 _ => {}
@@ -149,12 +154,12 @@ fn worker_main(
                         }
                     }
                     Ok(TrainerCommand::Stop) => {
-                        save_and_exit(&mut model, &model_path, &mut tr_state);
+                        save_and_exit(&mut model, &model_path, &mut tr_state, &ev_tx);
                         return;
                     }
                     Ok(TrainerCommand::Resume) => {}  // already running
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => { save_and_exit(&mut model, &model_path, &mut tr_state); return; }
+                    Err(TryRecvError::Disconnected) => { save_and_exit(&mut model, &model_path, &mut tr_state, &ev_tx); return; }
                 }
             }
         }};
@@ -327,11 +332,24 @@ fn do_save(
     true
 }
 
-/// Save on worker exit; updates fingerprint before saving (§112).
-fn save_and_exit(model: &mut ModelState, model_path: &PathBuf, tr_state: &mut TrainerState) {
+/// Save on worker exit; updates fingerprint, reports errors, sends Stopped (§112).
+fn save_and_exit(
+    model: &mut ModelState,
+    model_path: &PathBuf,
+    tr_state: &mut TrainerState,
+    ev_tx: &Sender<TrainerEvent>,
+) {
     tr_state.model_fingerprint = model.state_fingerprint();
-    let _ = save_model_file(model, model_path);
-    let _ = tr_state.save(&PathBuf::from(&tr_state.dataset_path));
+    if let Err(e) = save_model_file(model, model_path) {
+        eprintln!("save_and_exit: model save failed: {e}");
+        let _ = ev_tx.send(TrainerEvent::Error(format!("Exit save failed: {e}")));
+    } else if let Err(e) = tr_state.save(&PathBuf::from(&tr_state.dataset_path)) {
+        eprintln!("save_and_exit: state save failed: {e}");
+        let _ = ev_tx.send(TrainerEvent::Error(format!("Exit save failed: {e}")));
+    } else {
+        let _ = ev_tx.send(TrainerEvent::Saved);
+    }
+    let _ = ev_tx.send(TrainerEvent::Stopped);
 }
 
 // ── GUI state ─────────────────────────────────────────────────────────────
@@ -551,7 +569,27 @@ impl TrainerApp {
                 self.state = AppState::Paused;
                 self.status_msg = "Paused and saved.".to_owned();
             }
+            TrainerEvent::Stopped => {
+                // Worker has exited; reclaim resources and return to Ready.
+                if let Some(h) = self.worker.take() { let _ = h.join(); }
+                self.cmd_tx = None;
+                self.event_rx = None;
+                // Re-instate loaded objects from model_path so UI is consistent.
+                let model_path = PathBuf::from(&self.model_path);
+                if let Ok(m) = syntrail_lm::app::load_model_file(&model_path) {
+                    self.loaded_model = Some(m);
+                }
+                self.check_ready();
+                if self.status_msg.starts_with("Error") {
+                    // keep error message
+                } else {
+                    self.status_msg = "Stopped and saved.".to_owned();
+                }
+            }
             TrainerEvent::Completed(n) => {
+                if let Some(h) = self.worker.take() { let _ = h.join(); }
+                self.cmd_tx = None;
+                self.event_rx = None;
                 self.state = AppState::Completed(n);
                 self.status_msg = format!("Training complete — {} blocks processed.", n);
             }
@@ -687,11 +725,14 @@ impl eframe::App for TrainerApp {
             ui.heading("SynTrail Trainer");
             ui.separator();
 
-            // ── File selection ────────────────────────────────────────────
+            // ── File selection — read-only display during training (§116) ──
+            let file_ops_enabled = !matches!(&self.state, AppState::Running | AppState::Paused);
             ui.horizontal(|ui| {
                 ui.label("Model:");
-                ui.add(egui::TextEdit::singleline(&mut self.model_path).desired_width(260.0));
-                if ui.button("Open…").clicked() {
+                // Read-only display; Open is the only way to change path (§116)
+                ui.add_enabled(false,
+                    egui::TextEdit::singleline(&mut self.model_path.clone()).desired_width(260.0));
+                if ui.add_enabled(file_ops_enabled, egui::Button::new("Open…")).clicked() {
                     if let Some(p) = rfd::FileDialog::new()
                         .set_title("モデルを開く")
                         .add_filter("SynTrail JSON", &["json"])
@@ -706,8 +747,9 @@ impl eframe::App for TrainerApp {
 
             ui.horizontal(|ui| {
                 ui.label("Dataset:");
-                ui.add(egui::TextEdit::singleline(&mut self.dataset_path).desired_width(260.0));
-                if ui.button("Open…").clicked() {
+                ui.add_enabled(false,
+                    egui::TextEdit::singleline(&mut self.dataset_path.clone()).desired_width(260.0));
+                if ui.add_enabled(file_ops_enabled, egui::Button::new("Open…")).clicked() {
                     if let Some(p) = rfd::FileDialog::new()
                         .set_title("テキストファイルを開く")
                         .add_filter("Text", &["txt"])

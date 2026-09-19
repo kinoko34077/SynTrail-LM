@@ -69,7 +69,7 @@ integration tests: 100
 | ~~P0~~ | `save_and_exit()` | fingerprint未更新 (§112) | ✅ UI-4 |
 | ~~P0~~ | `update()` D&D | Running中にstate上書き (§108) | ✅ UI-4 |
 | ~~P1~~ | Resume ボタン | 既存workerへのResume経路なし (§107) | ✅ UI-4 |
-| P1 | Path TextEdit | model_path / dataset_path がTextEdit可能だが loaded_model と非同期 (§116) | 未 |
+| ~~P1~~ | Path TextEdit | model_path / dataset_path がTextEdit可能だが loaded_model と非同期 (§116) | ✅ P0修正 |
 
 ### Chat GUI
 
@@ -85,8 +85,8 @@ integration tests: 100
 | 優先 | 内容 | 状態 |
 |------|------|------|
 | ~~P1~~ | `desktop/` 共通層 (FileKind/FileCommand/DropRouter/fonts) (§78/§82/§95/§122) | ✅ UI-2 |
-| P2 | Windows Native Menu (§88-94) | 未 |
-| P2 | Keyboard shortcuts Ctrl+N/O/S/Shift+S (§92) | 未 |
+| ~~P2~~ | Windows Native Menu (§88-94) | ✅ UI-6/7/8 |
+| ~~P2~~ | Keyboard shortcuts Ctrl+N/O/S/Shift+S (§92) | ✅ UI-6/7/8 |
 | P2 | Chat/Trainer の setup_fonts を desktop::fonts::setup_fonts に切り替え | 未 |
 
 ---

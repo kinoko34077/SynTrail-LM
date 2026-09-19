@@ -62,7 +62,7 @@ impl Session {
         let trace_id = self.model.alloc_trace_id();
         let max_units = self.config.default_max_units;
 
-        let (output, trace) = self.model.generate_with_trace(input, input, max_units, trace_id);
+        let (_output, trace) = self.model.generate_with_trace(input, input, max_units, trace_id);
 
         // Expose input to model (phase 3: post-turn exposure of INPUT not output)
         self.model.expose(input);
@@ -78,7 +78,9 @@ impl Session {
             self.snapshot_to_db(Some(turn_id))?;
         }
 
-        Ok((turn_id, output, trace))
+        // Return dialogue output (generated-only, without echoing seed back).
+        let emitted = trace.emitted_text.clone();
+        Ok((turn_id, emitted, trace))
     }
 
     // ── Feedback ─────────────────────────────────────────────────────────

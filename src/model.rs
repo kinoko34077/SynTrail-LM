@@ -243,7 +243,27 @@ impl ModelState {
             }
         }
 
-        // Lineage fallback — one-level decomposition.
+        // Preferred-representation fallback (P1): use RepresentationStore's best
+        // segmentation for this context's identity, which may differ from the
+        // structural lineage decomposition.
+        let prim_units = self.lineage.decompose_to_primitives(context);
+        let prim_ids: Vec<_> = prim_units.iter().filter_map(|u| u.as_primitive()).collect();
+        if !prim_ids.is_empty() {
+            if let Some(id) = self.identities.find_identity(&prim_ids) {
+                if let Some(rep) = self.representations.preferred(id) {
+                    // rep.units gives the preferred segmentation; try from last unit.
+                    for &u in rep.units.iter().rev() {
+                        if u != context {
+                            if let Some(r) = self.predictions.top1_with_score(u) {
+                                return Some(r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Lineage fallback — one-level structural decomposition.
         let one_level = self.lineage.decompose_one(context);
         if one_level.len() > 1 || one_level.first() != Some(&context) {
             for &u in one_level.iter().rev() {
@@ -254,8 +274,7 @@ impl ModelState {
         }
 
         // Full primitive decomposition.
-        let prims = self.lineage.decompose_to_primitives(context);
-        for &u in prims.iter().rev() {
+        for &u in prim_units.iter().rev() {
             if u != context {
                 if let Some(r) = self.predictions.top1_with_score(u) {
                     return Some(r);

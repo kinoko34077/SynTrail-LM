@@ -9,7 +9,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use syntrail_lm::app::{load_model_file, model_analytics, save_model_file, save_model_file_with_generation, Analytics};
-use syntrail_lm::desktop::dialogs::{open_dataset_dialog, open_model_dialog, save_model_dialog};
+use syntrail_lm::desktop::dialogs::{
+    open_dataset_dialog, open_model_dialog, save_model_dialog,
+    confirm_save_discard_cancel_dialog, ConfirmResult,
+};
 use syntrail_lm::desktop::drop::{AcceptedKinds, DropResult, route_drop};
 use syntrail_lm::desktop::file_ops::{FileCommand, FileKind};
 use syntrail_lm::desktop::fonts::setup_fonts;
@@ -487,6 +490,8 @@ struct TrainerApp {
     event_rx: Option<Receiver<TrainerEvent>>,
     progress: TrainerProgress,
     status_msg: String,
+    // §41: model has been trained since last save.
+    model_dirty: bool,
     // Loaded objects (only valid in Ready/before start)
     loaded_model: Option<ModelState>,
     loaded_dataset: Option<Dataset>,
@@ -507,6 +512,7 @@ impl TrainerApp {
             event_rx: None,
             progress: TrainerProgress::default(),
             status_msg: "Select a model and a text file to begin.".to_owned(),
+            model_dirty: false,
             loaded_model: None,
             loaded_dataset: None,
             resume_state: None,
@@ -671,6 +677,7 @@ impl TrainerApp {
                 } else {
                     self.status_msg = format!("Saved (block {})", self.progress.block_idx);
                 }
+                self.model_dirty = false; // §41
             }
             TrainerEvent::SaveFailed { path, operation, recoverable } => {
                 let op_name = match operation {
@@ -698,6 +705,8 @@ impl TrainerApp {
                 self.event_rx = None;
                 self.loaded_model = Some(*model);
                 self.check_ready();
+                // §41: model is dirty only if the final save failed.
+                self.model_dirty = matches!(save_result, SaveResult::Failed { .. });
                 if self.status_msg.starts_with("Error") || self.status_msg.contains("failed") {
                     // keep error message
                 } else {
@@ -713,6 +722,7 @@ impl TrainerApp {
                 self.event_rx = None;
                 // §39: take ownership of the trained model so Save/Save As uses it.
                 self.loaded_model = Some(*trained_model);
+                self.model_dirty = false; // §41: always checkpoint-saved before Completed
                 self.state = AppState::Completed(n);
                 self.status_msg = format!("Training complete — {} blocks processed.", n);
             }
@@ -754,10 +764,28 @@ impl eframe::App for TrainerApp {
                 match cmd {
                     FileCommand::New => {
                         if !training_active_menu {
+                            // §41: guard dirty model before discarding it.
+                            if self.model_dirty {
+                                match confirm_save_discard_cancel_dialog() {
+                                    ConfirmResult::Save => {
+                                        let p = PathBuf::from(&self.model_path);
+                                        match save_model_file(self.loaded_model.as_ref().unwrap(), &p) {
+                                            Ok(()) => { self.model_dirty = false; }
+                                            Err(e) => {
+                                                self.status_msg = format!("Save failed: {e}");
+                                                return; // abort New
+                                            }
+                                        }
+                                    }
+                                    ConfirmResult::Discard => {}
+                                    ConfirmResult::Cancel => return,
+                                }
+                            }
                             self.loaded_model = None;
                             self.loaded_dataset = None;
                             self.resume_state = None;
                             self.state = AppState::Idle;
+                            self.model_dirty = false;
                             self.status_msg = "Ready for new model and dataset.".to_owned();
                         } else {
                             self.status_msg = "Stop training before starting new session.".to_owned();
@@ -765,8 +793,26 @@ impl eframe::App for TrainerApp {
                     }
                     FileCommand::Open => {
                         if !training_active_menu {
+                            // §41: guard dirty model before replacing it.
+                            if self.model_dirty {
+                                match confirm_save_discard_cancel_dialog() {
+                                    ConfirmResult::Save => {
+                                        let p = PathBuf::from(&self.model_path);
+                                        match save_model_file(self.loaded_model.as_ref().unwrap(), &p) {
+                                            Ok(()) => { self.model_dirty = false; }
+                                            Err(e) => {
+                                                self.status_msg = format!("Save failed: {e}");
+                                                return; // abort Open
+                                            }
+                                        }
+                                    }
+                                    ConfirmResult::Discard => {}
+                                    ConfirmResult::Cancel => return,
+                                }
+                            }
                             if let Some(p) = open_model_dialog(&self.model_path) {
                                 self.model_path = p.to_string_lossy().to_string();
+                                self.model_dirty = false;
                                 self.try_load_model();
                             }
                         } else {
@@ -781,7 +827,10 @@ impl eframe::App for TrainerApp {
                             self.status_msg = format!("Save requested: {}", p.display());
                         } else if let Some(m) = &self.loaded_model {
                             match save_model_file(m, &p) {
-                                Ok(()) => self.status_msg = format!("Saved: {}", p.display()),
+                                Ok(()) => {
+                                    self.model_dirty = false; // §41
+                                    self.status_msg = format!("Saved: {}", p.display());
+                                }
                                 Err(e) => self.status_msg = format!("Save failed: {e}"),
                             }
                         }
@@ -796,6 +845,7 @@ impl eframe::App for TrainerApp {
                             } else if let Some(m) = &self.loaded_model {
                                 match save_model_file(m, &p) {
                                     Ok(()) => {
+                                        self.model_dirty = false; // §41
                                         self.model_path = p.to_string_lossy().to_string();
                                         self.status_msg = format!("Saved: {}", p.display());
                                     }

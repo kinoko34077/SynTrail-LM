@@ -84,4 +84,33 @@ mod gui {
             .set_buttons(rfd::MessageButtons::YesNo)
             .show() == rfd::MessageDialogResult::Yes
     }
+
+    /// Result of the 3-button Save/Discard/Cancel dialog (§41).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ConfirmResult {
+        Save,
+        Discard,
+        Cancel,
+    }
+
+    /// Save / Discard / Cancel confirmation dialog for unsaved changes (§41).
+    ///
+    /// Shows "Yes = 保存して続ける / No = 破棄して続ける / Cancel = キャンセル".
+    pub fn confirm_save_discard_cancel_dialog() -> ConfirmResult {
+        match rfd::MessageDialog::new()
+            .set_title("未保存の変更")
+            .set_description(
+                "保存されていない変更があります。\n\
+                 「はい」で保存して続ける、「いいえ」で破棄して続ける、\
+                 「キャンセル」で操作を中断します。"
+            )
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show()
+        {
+            rfd::MessageDialogResult::Yes    => ConfirmResult::Save,
+            rfd::MessageDialogResult::No     => ConfirmResult::Discard,
+            rfd::MessageDialogResult::Cancel => ConfirmResult::Cancel,
+            _                                => ConfirmResult::Cancel,
+        }
+    }
 }

@@ -64,8 +64,8 @@ impl Session {
 
         let (_output, trace) = self.model.generate_with_trace(input, input, max_units, trace_id);
 
-        // Expose input to model (phase 3: post-turn exposure of INPUT not output)
-        self.model.expose(input);
+        // Expose input with EOS at turn boundary — teaches model to predict sequence end.
+        self.model.expose_with_eos(input);
 
         // Log to DB
         let turn_id = self.db.insert_turn(&trace)?;

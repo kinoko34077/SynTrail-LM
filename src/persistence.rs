@@ -495,9 +495,8 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         })
         .collect();
 
-    let lineage_entries: Vec<(u32, UnitIdDto, UnitIdDto)> = model.lineage.all_entries()
-        .map(|(child, l, r)| (child, UnitIdDto::from(l), UnitIdDto::from(r)))
-        .collect();
+    // §19: lineage_entries omitted from new saves — reconstructed from chunks on load.
+    let lineage_entries: Vec<(u32, UnitIdDto, UnitIdDto)> = Vec::new();
 
     let identity_parent: Vec<u32> = model.identities.all_parents().to_vec();
     let representation_entries: Vec<RepresentationEntryDto> =
@@ -623,10 +622,20 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
     let parent_opt = if snap.identity_parent.is_empty() { None } else { Some(snap.identity_parent) };
     let identities = IdentityStore::from_bulk(identity_seqs, view_pairs, parent_opt);
 
-    let lineage_bulk: Vec<(u32, UnitId, UnitId)> = snap.lineage_entries.into_iter()
-        .map(|(c, l, r)| (c, UnitId::from(l), UnitId::from(r)))
-        .collect();
-    let lineage = LineageStore::from_bulk(lineage_bulk);
+    // §19: Lineage is fully derivable from chunks (each chunk stores left+right).
+    // New saves write lineage_entries=[]; legacy files may still carry it — use
+    // the stored data when present so old saves load correctly.
+    let lineage = if !snap.lineage_entries.is_empty() {
+        let bulk: Vec<(u32, UnitId, UnitId)> = snap.lineage_entries.into_iter()
+            .map(|(c, l, r)| (c, UnitId::from(l), UnitId::from(r)))
+            .collect();
+        LineageStore::from_bulk(bulk)
+    } else {
+        let bulk: Vec<(u32, UnitId, UnitId)> = chunks.iter_all()
+            .map(|ch| (ch.id, ch.left, ch.right))
+            .collect();
+        LineageStore::from_bulk(bulk)
+    };
 
     // §26: RelationStore is derived — create empty; rebuild_relations() below fills it.
     let relations = RelationStore::new();

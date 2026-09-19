@@ -295,14 +295,17 @@ pub fn save(model: &ModelState, path: &Path) -> std::io::Result<()> {
 }
 
 /// §32: Save to JSON and embed a checkpoint_generation for trainer-state pairing.
+/// §9: Streams directly to a BufWriter — avoids building the full JSON string in memory.
 pub fn save_with_generation(model: &ModelState, path: &Path, generation: u64) -> std::io::Result<()> {
     let mut snapshot = to_snapshot(model);
     snapshot.checkpoint_generation = generation;
-    let json = serde_json::to_string_pretty(&snapshot)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    // §38: write to temp file beside the target then rename atomically.
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, json)?;
+    {
+        let file = std::fs::File::create(&tmp)?;
+        let writer = std::io::BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, &snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    }
     std::fs::rename(&tmp, path)
 }
 
@@ -363,13 +366,18 @@ pub fn save_binary(model: &ModelState, path: &Path) -> std::io::Result<()> {
 ///
 /// Fixes the bug where `.stm` saves via `save_binary` lost the generation,
 /// making `TrainerState.checkpoint_generation != STM.checkpoint_generation`.
+/// §10: Streams via BufWriter + bincode::serialize_into — avoids allocating
+/// the full serialized bytes as a Vec before writing.
 pub fn save_binary_with_generation(model: &ModelState, path: &Path, generation: u64) -> std::io::Result<()> {
     let mut snapshot = to_snapshot(model);
     snapshot.checkpoint_generation = generation;
-    let bytes = bincode::serialize(&snapshot)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes)?;
+    {
+        let file = std::fs::File::create(&tmp)?;
+        let writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(writer, &snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    }
     std::fs::rename(&tmp, path)
 }
 
@@ -671,7 +679,6 @@ pub struct StorageProfile {
 /// and save/load timing.  No files are written to disk during profiling.
 pub fn profile_storage(model: &ModelState) -> StorageProfile {
     use std::time::Instant;
-    use std::io::Write as _;
 
     let snap = to_snapshot(model);
 

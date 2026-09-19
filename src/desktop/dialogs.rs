@@ -28,12 +28,13 @@ mod gui {
             .pick_file()
     }
 
-    /// Save-model file picker (§35).
+    /// Save-model file picker (§35, §6).
     pub fn save_model_dialog(current: &str) -> Option<PathBuf> {
         let cur = PathBuf::from(current);
         let name = cur.file_name().and_then(|n| n.to_str()).unwrap_or("model.json");
         rfd::FileDialog::new()
             .set_title("名前を付けて保存")
+            .add_filter("SynTrail STM (binary)", &["stm"])
             .add_filter("SynTrail JSON", &["json"])
             .add_filter("SynTrail DB", &["db", "sqlite"])
             .set_file_name(name)

@@ -387,8 +387,26 @@ pub fn load_checkpoint_generation(path: &Path) -> std::io::Result<u64> {
         .map(|s| s.to_ascii_lowercase());
     match ext.as_deref() {
         Some("stm") => {
-            let bytes = std::fs::read(path)?;
-            let snapshot = stm_read_container(&bytes)?;
+            use std::io::{BufReader, Read};
+            let file = std::fs::File::open(path)?;
+            let mut reader = BufReader::new(file);
+            let mut magic = [0u8; 4];
+            reader.read_exact(&mut magic)?;
+            if &magic != STM_MAGIC {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an STM file"));
+            }
+            let mut hdr = [0u8; 6];
+            reader.read_exact(&mut hdr)?;
+            let version = hdr[0];
+            let flags = hdr[1];
+            let payload_len = u32::from_le_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]);
+            let snapshot = if flags & STM_FLAG_ZSTD != 0 {
+                let mut decoder = zstd::stream::read::Decoder::new(reader.take(payload_len as u64))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                stm_dispatch_version_stream(version, &mut decoder)?
+            } else {
+                stm_dispatch_version_stream(version, &mut reader.take(payload_len as u64))?
+            };
             Ok(snapshot.checkpoint_generation)
         }
         Some("db") | Some("sqlite") => {
@@ -443,20 +461,37 @@ const STM_MAGIC: &[u8; 4] = b"STM1";
 const STM_VERSION: u8 = 3;
 const STM_FLAG_ZSTD: u8 = 0b0000_0001;
 
-fn bincode_serialize_varint(snapshot: &ModelSnapshot) -> Result<Vec<u8>, std::io::Error> {
+fn bincode_serialize_into_varint<W: std::io::Write>(w: &mut W, snap: &ModelSnapshot) -> std::io::Result<()> {
     use bincode::Options;
     bincode::DefaultOptions::new()
         .with_varint_encoding()
-        .serialize(snapshot)
+        .serialize_into(w, snap)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-fn bincode_deserialize_varint(payload: &[u8]) -> Result<ModelSnapshot, std::io::Error> {
+/// §11/§12/§13: Version-dispatching deserializer from a streaming reader.
+/// Eliminates the 256 MB bulk-decompress limit; bincode reads directly from the decoder.
+fn stm_dispatch_version_stream<R: std::io::Read>(version: u8, reader: &mut R) -> std::io::Result<ModelSnapshot> {
     use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_varint_encoding()
-        .deserialize(payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    match version {
+        STM_VERSION => bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .deserialize_from(reader)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        2 => {
+            let v2: v2_compat::ModelSnapshot = bincode::DefaultOptions::new()
+                .with_varint_encoding()
+                .deserialize_from(reader)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Ok(from_v2_snapshot(v2))
+        }
+        1 => bincode::deserialize_from(reader)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("STM version {} is not supported by this build (max: {})", version, STM_VERSION),
+        )),
+    }
 }
 
 // ── STM v2 backward-compat deserialization (§16/§17) ─────────────────────────
@@ -613,13 +648,6 @@ mod v2_compat {
     }
 }
 
-fn bincode_deserialize_varint_v2(payload: &[u8]) -> Result<v2_compat::ModelSnapshot, std::io::Error> {
-    use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_varint_encoding()
-        .deserialize(payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
 
 fn from_v2_snapshot(v2: v2_compat::ModelSnapshot) -> ModelSnapshot {
     let cv = |u: v2_compat::UnitIdDto| -> UnitIdDto {
@@ -687,27 +715,43 @@ fn from_v2_snapshot(v2: v2_compat::ModelSnapshot) -> ModelSnapshot {
     }
 }
 
-fn stm_write_container(
-    writer: &mut impl std::io::Write,
+/// §9/§10: Streaming STM save — serialize directly into Zstd encoder, then seek back
+/// to write the actual compressed payload_len into the header placeholder.
+/// Eliminates the large intermediate raw-payload and compressed-payload Vecs.
+fn stm_write_container<W: std::io::Write + std::io::Seek>(
+    writer: &mut W,
     snapshot: &ModelSnapshot,
     compress: bool,
 ) -> std::io::Result<()> {
-    // §27: version 2 — varint bincode
-    let payload = bincode_serialize_varint(snapshot)?;
-    let (flags, encoded) = if compress {
-        let compressed = zstd::bulk::compress(&payload, 3)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        (STM_FLAG_ZSTD, compressed)
-    } else {
-        (0u8, payload)
-    };
-    let payload_len = encoded.len() as u32;
+    use std::io::{Seek, SeekFrom};
+
+    let flags = if compress { STM_FLAG_ZSTD } else { 0u8 };
     writer.write_all(STM_MAGIC)?;
     writer.write_all(&[STM_VERSION, flags])?;
+    writer.write_all(&0u32.to_le_bytes())?; // payload_len placeholder at byte offset 6
+
+    if compress {
+        let mut encoder = zstd::stream::write::Encoder::new(&mut *writer, 3)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        bincode_serialize_into_varint(&mut encoder, snapshot)?;
+        encoder.finish()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    } else {
+        bincode_serialize_into_varint(writer, snapshot)?;
+    }
+
+    writer.flush()?;
+    let end_pos = writer.seek(SeekFrom::Current(0))?;
+    let payload_len = (end_pos - 10) as u32; // header is exactly 10 bytes
+    writer.seek(SeekFrom::Start(6))?;
     writer.write_all(&payload_len.to_le_bytes())?;
-    writer.write_all(&encoded)
+    writer.seek(SeekFrom::End(0))?;
+
+    Ok(())
 }
 
+/// §12/§13: Streaming container reader — no 256 MB hard decompression limit.
+/// Uses a Zstd streaming decoder so bincode reads directly without a full decompressed buffer.
 fn stm_read_container(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
     if bytes.len() >= 4 && &bytes[..4] == STM_MAGIC {
         if bytes.len() < 10 {
@@ -720,26 +764,12 @@ fn stm_read_container(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "STM payload truncated"));
         }
         let encoded = &bytes[10..10 + payload_len];
-        let payload = if flags & STM_FLAG_ZSTD != 0 {
-            zstd::bulk::decompress(encoded, 256 * 1024 * 1024)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        if flags & STM_FLAG_ZSTD != 0 {
+            let mut decoder = zstd::stream::read::Decoder::new(encoded)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            stm_dispatch_version_stream(version, &mut decoder)
         } else {
-            encoded.to_vec()
-        };
-        // Strict version dispatch — unknown future versions are rejected (§7).
-        if version == 3 {
-            bincode_deserialize_varint(&payload)
-        } else if version == 2 {
-            let v2 = bincode_deserialize_varint_v2(&payload)?;
-            Ok(from_v2_snapshot(v2))
-        } else if version == 1 {
-            bincode::deserialize(&payload)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!("STM version {} is not supported by this build (max: {})", version, STM_VERSION),
-            ))
+            stm_dispatch_version_stream(version, &mut std::io::Cursor::new(encoded))
         }
     } else {
         // Legacy: raw bincode without header
@@ -770,11 +800,41 @@ pub fn save_binary_with_generation(model: &ModelState, path: &Path, generation: 
     std::fs::rename(&tmp, path)
 }
 
-/// Phase 16 / §12: Load from STM container format (or legacy raw bincode).
+/// §11: Streaming STM load — reads the header then pipes compressed bytes through a
+/// Zstd streaming decoder directly into bincode without loading the full file into RAM.
 pub fn load_binary(path: &Path) -> std::io::Result<ModelState> {
-    let bytes = std::fs::read(path)?;
-    let snapshot = stm_read_container(&bytes)?;
-    Ok(from_snapshot(snapshot))
+    use std::io::{BufReader, Read};
+
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+
+    if &magic == STM_MAGIC {
+        let mut header_rest = [0u8; 6]; // version + flags + payload_len(4)
+        reader.read_exact(&mut header_rest)?;
+        let version = header_rest[0];
+        let flags = header_rest[1];
+        let payload_len = u32::from_le_bytes([header_rest[2], header_rest[3], header_rest[4], header_rest[5]]);
+        let snapshot = if flags & STM_FLAG_ZSTD != 0 {
+            let mut decoder = zstd::stream::read::Decoder::new(reader.take(payload_len as u64))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            stm_dispatch_version_stream(version, &mut decoder)?
+        } else {
+            stm_dispatch_version_stream(version, &mut reader.take(payload_len as u64))?
+        };
+        Ok(from_snapshot(snapshot))
+    } else {
+        // Legacy: raw bincode — read remaining bytes and prepend the 4 magic bytes
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining)?;
+        let mut bytes = magic.to_vec();
+        bytes.extend_from_slice(&remaining);
+        let snapshot = bincode::deserialize(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(from_snapshot(snapshot))
+    }
 }
 
 /// Convenience: dispatch to JSON or binary based on the file extension.
@@ -1227,13 +1287,17 @@ pub fn profile_storage(model: &ModelState) -> StorageProfile {
     let json_compact_bytes = serde_json::to_string(&snap).map(|s| s.len()).unwrap_or(0);
     let legacy_bincode_bytes = bincode::serialize(&snap).map(|v| v.len()).unwrap_or(0);
 
-    // STM v3 raw payload = varint bincode of the snapshot (as stm_write_container does)
-    let stm_raw = varint().serialize(&snap).unwrap_or_default();
-    let stm_raw_bytes = stm_raw.len();
-    let stm_compressed = zstd::bulk::compress(&stm_raw, 3).unwrap_or_default();
-    let stm_compressed_bytes = stm_compressed.len();
-    // Actual .stm = 10-byte header + compressed payload
-    let stm_actual_bytes = 10 + stm_compressed_bytes;
+    // STM raw payload size = varint bincode of the snapshot (uncompressed)
+    let stm_raw_bytes = varint().serialize(&snap).map(|v| v.len()).unwrap_or(0);
+
+    // §9/§10: STM save timing — streaming write to in-memory Cursor
+    let t0 = Instant::now();
+    let mut stm_buf = std::io::Cursor::new(Vec::new());
+    let _ = stm_write_container(&mut stm_buf, &snap, true);
+    let stm_save_ms = t0.elapsed().as_millis() as u64;
+    let stm_file_bytes = stm_buf.into_inner();
+    let stm_actual_bytes = stm_file_bytes.len();
+    let stm_compressed_bytes = stm_actual_bytes.saturating_sub(10); // minus 10-byte header
 
     // ── Save / load timing (in-memory, no disk) ───────────────────────────
     let t0 = Instant::now();
@@ -1244,16 +1308,9 @@ pub fn profile_storage(model: &ModelState) -> StorageProfile {
     let _ = serde_json::from_str::<ModelSnapshot>(&json_str).map(from_snapshot);
     let json_load_ms = t0.elapsed().as_millis() as u64;
 
-    // STM v3 save timing: varint serialize + Zstd
+    // §11/§12/§13: STM load timing — streaming decompress directly into bincode
     let t0 = Instant::now();
-    let stm_payload = varint().serialize(&snap).unwrap_or_default();
-    let _stm_comp = zstd::bulk::compress(&stm_payload, 3).unwrap_or_default();
-    let stm_save_ms = t0.elapsed().as_millis() as u64;
-
-    // STM v3 load timing: Zstd decompress + varint deserialize
-    let t0 = Instant::now();
-    let decomp = zstd::bulk::decompress(&_stm_comp, 256 * 1024 * 1024).unwrap_or_default();
-    let _ = varint().deserialize::<ModelSnapshot>(&decomp).map(from_snapshot);
+    let _ = stm_read_container(&stm_file_bytes);
     let stm_load_ms = t0.elapsed().as_millis() as u64;
 
     StorageProfile {

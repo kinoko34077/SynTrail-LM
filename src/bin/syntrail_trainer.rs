@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use syntrail_lm::app::{load_model_file, model_analytics, save_model_file, save_model_file_with_generation, Analytics};
+use syntrail_lm::app::{load_model_file, model_analytics, save_model_file, save_model_file_with_generation, Analytics, DocumentState};
 use syntrail_lm::desktop::dialogs::{
     open_dataset_dialog, open_model_dialog, save_model_dialog,
     confirm_save_discard_cancel_dialog, ConfirmResult,
@@ -483,7 +483,7 @@ enum AppState {
 }
 
 struct TrainerApp {
-    model_path: String,
+    doc: DocumentState,
     dataset_path: String,
     state: AppState,
     worker: Option<JoinHandle<()>>,
@@ -491,8 +491,6 @@ struct TrainerApp {
     event_rx: Option<Receiver<TrainerEvent>>,
     progress: TrainerProgress,
     status_msg: String,
-    // §41: model has been trained since last save.
-    model_dirty: bool,
     // Loaded objects (only valid in Ready/before start)
     loaded_model: Option<ModelState>,
     loaded_dataset: Option<Dataset>,
@@ -505,7 +503,7 @@ struct TrainerApp {
 impl TrainerApp {
     fn new() -> Self {
         Self {
-            model_path: "model.json".to_owned(),
+            doc: DocumentState::from_path(PathBuf::from("model.json")),
             dataset_path: String::new(),
             state: AppState::Idle,
             worker: None,
@@ -513,7 +511,6 @@ impl TrainerApp {
             event_rx: None,
             progress: TrainerProgress::default(),
             status_msg: "Select a model and a text file to begin.".to_owned(),
-            model_dirty: false,
             loaded_model: None,
             loaded_dataset: None,
             resume_state: None,
@@ -523,7 +520,7 @@ impl TrainerApp {
     }
 
     fn try_load_model(&mut self) {
-        let p = PathBuf::from(&self.model_path);
+        let p = self.doc.path.clone().unwrap_or_else(|| PathBuf::from("model.json"));
         match load_model_file(&p) {
             Ok(m) => {
                 self.status_msg = format!("Model loaded: {}", p.display());
@@ -563,6 +560,16 @@ impl TrainerApp {
         let model_ok = self.loaded_model.is_some();
         let dataset_ok = self.loaded_dataset.is_some();
         self.state = AppState::Ready { model_loaded: model_ok, dataset_loaded: dataset_ok };
+        // §23: show diagnostic summary when both model and dataset are loaded.
+        if model_ok && dataset_ok {
+            let m = self.loaded_model.as_ref().unwrap();
+            let ds = self.loaded_dataset.as_ref().unwrap();
+            self.status_msg = format!(
+                "Ready — model: {} chunks / {} primitives / tick {} | dataset: {} chars",
+                m.chunk_count(), m.primitive_count(), m.tick,
+                ds.normalized.chars().count()
+            );
+        }
     }
 
     fn start_training(&mut self, resume: bool) {
@@ -577,7 +584,7 @@ impl TrainerApp {
 
         let model_fp = model.state_fingerprint();
         let dataset_path = PathBuf::from(&self.dataset_path);
-        let model_path = PathBuf::from(&self.model_path);
+        let model_path = self.doc.path.clone().unwrap_or_else(|| PathBuf::from("model.json"));
 
         let tr_state = if resume {
             match &self.resume_state {
@@ -673,12 +680,12 @@ impl TrainerApp {
             TrainerEvent::Saved { path, kind } => {
                 // §28: SaveAs confirmed — update canonical path in UI now.
                 if kind == SaveKind::SaveAs {
-                    self.model_path = path.to_string_lossy().to_string();
+                    self.doc.mark_saved(path.clone());
                     self.status_msg = format!("Saved As: {}", path.display());
                 } else {
+                    self.doc.dirty = false;
                     self.status_msg = format!("Saved (block {})", self.progress.block_idx);
                 }
-                self.model_dirty = false; // §41
             }
             TrainerEvent::SaveFailed { path, operation, recoverable } => {
                 let op_name = match operation {
@@ -707,7 +714,7 @@ impl TrainerApp {
                 self.loaded_model = Some(*model);
                 self.check_ready();
                 // §41: model is dirty only if the final save failed.
-                self.model_dirty = matches!(save_result, SaveResult::Failed { .. });
+                self.doc.dirty = matches!(save_result, SaveResult::Failed { .. });
                 if self.status_msg.starts_with("Error") || self.status_msg.contains("failed") {
                     // keep error message
                 } else {
@@ -723,7 +730,7 @@ impl TrainerApp {
                 self.event_rx = None;
                 // §39: take ownership of the trained model so Save/Save As uses it.
                 self.loaded_model = Some(*trained_model);
-                self.model_dirty = false; // §41: always checkpoint-saved before Completed
+                self.doc.dirty = false; // §41: always checkpoint-saved before Completed
                 self.state = AppState::Completed(n);
                 self.status_msg = format!("Training complete — {} blocks processed.", n);
             }
@@ -766,12 +773,12 @@ impl eframe::App for TrainerApp {
                     FileCommand::New => {
                         if !training_active_menu {
                             // §41: guard dirty model before discarding it.
-                            if self.model_dirty {
+                            if self.doc.dirty {
                                 match confirm_save_discard_cancel_dialog() {
                                     ConfirmResult::Save => {
-                                        let p = PathBuf::from(&self.model_path);
+                                        let p = self.doc.path.clone().unwrap_or_else(|| PathBuf::from("model.json"));
                                         match save_model_file(self.loaded_model.as_ref().unwrap(), &p) {
-                                            Ok(()) => { self.model_dirty = false; }
+                                            Ok(()) => { self.doc.dirty = false; }
                                             Err(e) => {
                                                 self.status_msg = format!("Save failed: {e}");
                                                 return; // abort New
@@ -786,7 +793,7 @@ impl eframe::App for TrainerApp {
                             self.loaded_dataset = None;
                             self.resume_state = None;
                             self.state = AppState::Idle;
-                            self.model_dirty = false;
+                            self.doc.dirty = false;
                             self.status_msg = "Ready for new model and dataset.".to_owned();
                         } else {
                             self.status_msg = "Stop training before starting new session.".to_owned();
@@ -795,12 +802,12 @@ impl eframe::App for TrainerApp {
                     FileCommand::Open => {
                         if !training_active_menu {
                             // §41: guard dirty model before replacing it.
-                            if self.model_dirty {
+                            if self.doc.dirty {
                                 match confirm_save_discard_cancel_dialog() {
                                     ConfirmResult::Save => {
-                                        let p = PathBuf::from(&self.model_path);
+                                        let p = self.doc.path.clone().unwrap_or_else(|| PathBuf::from("model.json"));
                                         match save_model_file(self.loaded_model.as_ref().unwrap(), &p) {
-                                            Ok(()) => { self.model_dirty = false; }
+                                            Ok(()) => { self.doc.dirty = false; }
                                             Err(e) => {
                                                 self.status_msg = format!("Save failed: {e}");
                                                 return; // abort Open
@@ -811,9 +818,9 @@ impl eframe::App for TrainerApp {
                                     ConfirmResult::Cancel => return,
                                 }
                             }
-                            if let Some(p) = open_model_dialog(&self.model_path) {
-                                self.model_path = p.to_string_lossy().to_string();
-                                self.model_dirty = false;
+                            if let Some(p) = open_model_dialog(self.doc.path_str()) {
+                                self.doc.path = Some(p.clone());
+                                self.doc.dirty = false;
                                 self.try_load_model();
                             }
                         } else {
@@ -821,7 +828,7 @@ impl eframe::App for TrainerApp {
                         }
                     }
                     FileCommand::Save => {
-                        let p = PathBuf::from(&self.model_path);
+                        let p = self.doc.path.clone().unwrap_or_else(|| PathBuf::from("model.json"));
                         if training_active_menu {
                             // §28: delegate save to worker; path stays canonical until SavedAs confirmed.
                             self.send_cmd(TrainerCommand::Save);
@@ -829,7 +836,7 @@ impl eframe::App for TrainerApp {
                         } else if let Some(m) = &self.loaded_model {
                             match save_model_file(m, &p) {
                                 Ok(()) => {
-                                    self.model_dirty = false; // §41
+                                    self.doc.dirty = false;
                                     self.status_msg = format!("Saved: {}", p.display());
                                 }
                                 Err(e) => self.status_msg = format!("Save failed: {e}"),
@@ -837,17 +844,16 @@ impl eframe::App for TrainerApp {
                         }
                     }
                     FileCommand::SaveAs => {
-                        if let Some(p) = save_model_dialog(&self.model_path) {
+                        if let Some(p) = save_model_dialog(self.doc.path_str()) {
                             if training_active_menu {
-                                // §28: delegate SaveAs to worker; do NOT update model_path yet.
+                                // §28: delegate SaveAs to worker; do NOT update doc.path yet.
                                 // UI path updates only on receiving Saved { kind: SaveAs }.
                                 self.send_cmd(TrainerCommand::SaveAs(p.clone()));
                                 self.status_msg = format!("Save As requested: {}", p.display());
                             } else if let Some(m) = &self.loaded_model {
                                 match save_model_file(m, &p) {
                                     Ok(()) => {
-                                        self.model_dirty = false; // §41
-                                        self.model_path = p.to_string_lossy().to_string();
+                                        self.doc.mark_saved(p.clone());
                                         self.status_msg = format!("Saved: {}", p.display());
                                     }
                                     Err(e) => self.status_msg = format!("Save failed: {e}"),
@@ -867,7 +873,8 @@ impl eframe::App for TrainerApp {
                     }
                     FileCommand::LoadPath(p) => {
                         if !training_active_menu {
-                            self.model_path = p.to_string_lossy().to_string();
+                            self.doc.path = Some(p.clone());
+                            self.doc.dirty = false;
                             self.try_load_model();
                         }
                     }
@@ -893,14 +900,50 @@ impl eframe::App for TrainerApp {
                                 self.try_load_dataset();
                             }
                             _ => {
-                                self.model_path = p.to_string_lossy().to_string();
+                                // §22: guard dirty model before D&D replacement.
+                                if self.doc.dirty {
+                                    match confirm_save_discard_cancel_dialog() {
+                                        ConfirmResult::Save => {
+                                            let save_p = self.doc.path.clone().unwrap_or_else(|| PathBuf::from("model.json"));
+                                            match save_model_file(self.loaded_model.as_ref().unwrap(), &save_p) {
+                                                Ok(()) => { self.doc.dirty = false; }
+                                                Err(e) => {
+                                                    self.status_msg = format!("Save failed: {e}");
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        ConfirmResult::Discard => {}
+                                        ConfirmResult::Cancel => return,
+                                    }
+                                }
+                                self.doc.path = Some(p.clone());
+                                self.doc.dirty = false;
                                 self.try_load_model();
                             }
                         }
                     }
                     DropResult::ModelAndDataset { model, dataset } => {
                         // §43: load both in one drop.
-                        self.model_path = model.to_string_lossy().to_string();
+                        // §22: guard dirty model before D&D replacement.
+                        if self.doc.dirty {
+                            match confirm_save_discard_cancel_dialog() {
+                                ConfirmResult::Save => {
+                                    let save_p = self.doc.path.clone().unwrap_or_else(|| PathBuf::from("model.json"));
+                                    match save_model_file(self.loaded_model.as_ref().unwrap(), &save_p) {
+                                        Ok(()) => { self.doc.dirty = false; }
+                                        Err(e) => {
+                                            self.status_msg = format!("Save failed: {e}");
+                                            return;
+                                        }
+                                    }
+                                }
+                                ConfirmResult::Discard => {}
+                                ConfirmResult::Cancel => return,
+                            }
+                        }
+                        self.doc.path = Some(model.clone());
+                        self.doc.dirty = false;
                         self.dataset_path = dataset.to_string_lossy().to_string();
                         self.try_load_model();
                         self.try_load_dataset();
@@ -938,12 +981,14 @@ impl eframe::App for TrainerApp {
             ui.horizontal(|ui| {
                 ui.label("Model:");
                 // Read-only display; Open is the only way to change path (§116)
+                let mut model_display = self.doc.path_str().to_owned();
                 ui.add_enabled(false,
-                    egui::TextEdit::singleline(&mut self.model_path.clone()).desired_width(260.0));
+                    egui::TextEdit::singleline(&mut model_display).desired_width(260.0));
                 #[cfg(not(all(target_os = "windows", feature = "gui")))]
                 if ui.add_enabled(file_ops_enabled, egui::Button::new("Open…")).clicked() {
-                    if let Some(p) = open_model_dialog(&self.model_path) {
-                        self.model_path = p.to_string_lossy().to_string();
+                    if let Some(p) = open_model_dialog(self.doc.path_str()) {
+                        self.doc.path = Some(p.clone());
+                        self.doc.dirty = false;
                         self.try_load_model();
                     }
                 }

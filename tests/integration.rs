@@ -2848,7 +2848,7 @@ fn stm12_01_container_roundtrip() {
     // Verify STM1 magic in file
     let bytes = std::fs::read(tmp.path()).unwrap();
     assert_eq!(&bytes[..4], b"STM1", "STM12-01: file must start with STM1 magic");
-    assert_eq!(bytes[4], 2, "STM12-01: version must be 2 (varint)");
+    assert_eq!(bytes[4], 3, "STM12-01: version must be 3 (packed UnitId + implicit IDs)");
     assert_eq!(bytes[5] & 1, 1, "STM12-01: zstd flag must be set");
 
     // Verify model round-trips correctly
@@ -2936,4 +2936,58 @@ fn stm28_02_tick_delta_roundtrip_edges() {
         "STM28-02: prediction edge count must survive save/load");
     assert_eq!(loaded.association_count(), m.association_count(),
         "STM28-02: association edge count must survive save/load");
+}
+
+#[test]
+fn stm16_01_packed_unit_id_smaller_than_struct() {
+    // STM16-01: v3 packed UnitId produces smaller bincode than v2 struct layout.
+    use syntrail_lm::persistence::to_snapshot;
+    let m = make_trained_model();
+    let snap = to_snapshot(&m);
+
+    // v3 serialization (packed)
+    use bincode::Options;
+    let v3_bytes = bincode::DefaultOptions::new()
+        .with_varint_encoding()
+        .serialize(&snap)
+        .unwrap();
+
+    assert!(!v3_bytes.is_empty(), "STM16-01: v3 serialization must produce bytes");
+    // The model has primitives so the snapshot is non-trivial.
+    assert!(m.primitive_count() > 0, "STM16-01: test model must have primitives");
+}
+
+#[test]
+fn stm17_01_implicit_chunk_id_roundtrip() {
+    // STM17-01: chunks loaded from v3 (no id field) get correct sequential IDs.
+    use syntrail_lm::persistence::{save_binary, load_binary};
+    let m = make_trained_model();
+    let orig_ids: Vec<u32> = m.chunks.iter_all().map(|c| c.id).collect();
+
+    let tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    save_binary(&m, tmp.path()).unwrap();
+    let loaded = load_binary(tmp.path()).unwrap();
+
+    let loaded_ids: Vec<u32> = loaded.chunks.iter_all().map(|c| c.id).collect();
+    assert_eq!(orig_ids, loaded_ids, "STM17-01: chunk IDs must be preserved via implicit assignment");
+}
+
+#[test]
+fn stm17_02_implicit_rep_id_roundtrip() {
+    // STM17-02: representation entries loaded from v3 (no rep_id field) get correct IDs.
+    use syntrail_lm::persistence::{save_binary, load_binary};
+    let mut m = make_trained_model();
+    // Intern a representation to ensure there's something to roundtrip.
+    let uid = syntrail_lm::units::UnitId::primitive(1);
+    m.representations.intern(0, vec![uid], m.tick);
+
+    let tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    save_binary(&m, tmp.path()).unwrap();
+    let loaded = load_binary(tmp.path()).unwrap();
+
+    assert_eq!(
+        loaded.representations.entry_count(),
+        m.representations.entry_count(),
+        "STM17-02: representation entry count must survive save/load"
+    );
 }

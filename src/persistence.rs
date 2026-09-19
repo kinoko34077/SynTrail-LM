@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::association::{AssociationEdge, AssociationStore};
 use crate::db::Database;
@@ -31,10 +31,45 @@ use crate::units::UnitId;
 
 // ── Serialisable mirror types ──────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+/// §16: Packed UnitId serialization: single varint u32 = (raw << 1) | is_chunk.
+/// Saves one byte per UnitId vs the v2 struct layout (bool + u32).
+#[derive(Clone, Copy)]
 struct UnitIdDto {
     is_chunk: bool,
     raw: u32,
+}
+
+impl Serialize for UnitIdDto {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            // JSON: keep {is_chunk, raw} for forward/backward compat
+            use serde::ser::SerializeStruct;
+            let mut st = s.serialize_struct("UnitIdDto", 2)?;
+            st.serialize_field("is_chunk", &self.is_chunk)?;
+            st.serialize_field("raw", &self.raw)?;
+            st.end()
+        } else {
+            // bincode v3: packed u32 = (raw << 1) | is_chunk (§16)
+            let packed: u32 = (self.raw << 1) | (self.is_chunk as u32);
+            packed.serialize(s)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UnitIdDto {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        if d.is_human_readable() {
+            // JSON: {is_chunk: bool, raw: u32}
+            #[derive(Deserialize)]
+            struct JsonForm { is_chunk: bool, raw: u32 }
+            let j = JsonForm::deserialize(d)?;
+            Ok(Self { is_chunk: j.is_chunk, raw: j.raw })
+        } else {
+            // bincode v3: packed u32
+            let packed = u32::deserialize(d)?;
+            Ok(Self { is_chunk: (packed & 1) != 0, raw: packed >> 1 })
+        }
+    }
 }
 
 impl From<UnitId> for UnitIdDto {
@@ -64,9 +99,9 @@ impl From<TierDto> for Tier {
 
 /// Phase 17: strength fields in DTOs use f32 for compact serialisation.
 /// Runtime model still uses f64; the cast is lossless for values in [0, 1e6].
+/// §17: id field removed — position in snapshot array is the implicit id.
 #[derive(Serialize, Deserialize)]
 struct ChunkDto {
-    id: u32,
     left: UnitIdDto,
     right: UnitIdDto,
     tier: TierDto,
@@ -94,7 +129,6 @@ struct ChunkDto {
 impl From<&Chunk> for ChunkDto {
     fn from(c: &Chunk) -> Self {
         Self {
-            id: c.id,
             left: c.left.into(),
             right: c.right.into(),
             tier: c.tier.into(),
@@ -171,9 +205,9 @@ struct AssocEdgeEntryDto {
 }
 
 /// Phase B: Representation Lineage entry DTO.
+/// §17: rep_id removed — position in snapshot array is the implicit id.
 #[derive(Serialize, Deserialize)]
 struct RepresentationEntryDto {
-    rep_id: u32,
     identity_id: u32,
     units: Vec<UnitIdDto>,
     acquired_at: u64,
@@ -186,7 +220,6 @@ struct RepresentationEntryDto {
 impl From<&RepresentationEntry> for RepresentationEntryDto {
     fn from(e: &RepresentationEntry) -> Self {
         Self {
-            rep_id: e.rep_id,
             identity_id: e.identity_id,
             units: e.units.iter().copied().map(UnitIdDto::from).collect(),
             acquired_at: e.acquired_at,
@@ -398,7 +431,7 @@ pub fn load(path: &Path) -> std::io::Result<ModelState> {
 //
 // Layout (10-byte header + payload):
 //   [0..4]  magic:       b"STM1"
-//   [4]     version:     1 = fixed-int bincode; 2 = varint bincode (§27)
+//   [4]     version:     1 = fixed-int bincode; 2 = varint (§27); 3 = packed UnitId + implicit IDs (§16/§17)
 //   [5]     flags:       bit 0 = zstd compressed; remaining bits reserved
 //   [6..10] payload_len: u32 little-endian (byte length of payload)
 //   [10..]  payload:     bincode(ModelSnapshot), optionally zstd-compressed
@@ -406,8 +439,8 @@ pub fn load(path: &Path) -> std::io::Result<ModelState> {
 // Legacy files (no STM1 header) are detected by checking the first 4 bytes
 // and are deserialized as raw bincode for backward compatibility.
 const STM_MAGIC: &[u8; 4] = b"STM1";
-// Version 2 = varint-encoded bincode (§27). New saves use this by default.
-const STM_VERSION: u8 = 2;
+// Version 3 = varint bincode + packed UnitId + implicit chunk/rep IDs (§16/§17).
+const STM_VERSION: u8 = 3;
 const STM_FLAG_ZSTD: u8 = 0b0000_0001;
 
 fn bincode_serialize_varint(snapshot: &ModelSnapshot) -> Result<Vec<u8>, std::io::Error> {
@@ -424,6 +457,234 @@ fn bincode_deserialize_varint(payload: &[u8]) -> Result<ModelSnapshot, std::io::
         .with_varint_encoding()
         .deserialize(payload)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+// ── STM v2 backward-compat deserialization (§16/§17) ─────────────────────────
+// V2 uses struct UnitId { bool, u32 }, has ChunkDto.id, RepresentationEntryDto.rep_id.
+
+mod v2_compat {
+    use serde::Deserialize;
+
+    #[derive(Deserialize, Clone, Copy)]
+    pub struct UnitIdDto { pub is_chunk: bool, pub raw: u32 }
+
+    #[derive(Deserialize)]
+    pub struct ChunkDto {
+        pub id: u32,
+        pub left: UnitIdDto,
+        pub right: UnitIdDto,
+        pub tier: super::TierDto,
+        #[serde(alias = "success_count")]
+        pub use_count: u32,
+        #[serde(alias = "strength")]
+        pub usage_strength: f32,
+        pub last_used: u64,
+        pub expanded_length: u32,
+        #[serde(default)]
+        pub feedback_value: f32,
+        #[serde(default)]
+        pub feedback_count: u32,
+        #[serde(default)]
+        pub residency: u8,
+        #[serde(default)]
+        pub last_used_delta: u32,
+    }
+
+    #[derive(Deserialize)]
+    pub struct PredictionEdgeDto {
+        pub context: UnitIdDto,
+        pub next_unit: UnitIdDto,
+        #[serde(alias = "success_count")]
+        pub use_count: u32,
+        #[serde(alias = "strength")]
+        pub usage_strength: f32,
+        #[serde(default)]
+        pub feedback_value: f32,
+        #[serde(default)]
+        pub feedback_count: u32,
+        #[serde(default)]
+        pub avoidance: f32,
+        #[serde(default)]
+        pub last_used_tick: u64,
+        #[serde(default)]
+        pub external_route_evidence: f32,
+    }
+
+    #[derive(Deserialize)]
+    pub struct PredEdgeEntryDto {
+        pub next_unit: UnitIdDto,
+        pub use_count: u32,
+        pub usage_strength: f32,
+        #[serde(default)]
+        pub feedback_value: f32,
+        #[serde(default)]
+        pub feedback_count: u32,
+        #[serde(default)]
+        pub avoidance: f32,
+        #[serde(default)]
+        pub last_used_tick: u64,
+        #[serde(default)]
+        pub last_used_tick_delta: u32,
+        #[serde(default)]
+        pub external_route_evidence: f32,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AssocEdgeEntryDto {
+        pub target: UnitIdDto,
+        pub strength: f64,
+        pub use_count: u32,
+        pub last_used: u64,
+        #[serde(default)]
+        pub last_used_delta: u32,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AssociationEdgeDto {
+        pub source: UnitIdDto,
+        pub target: UnitIdDto,
+        pub strength: f64,
+        pub use_count: u32,
+        pub last_used: u64,
+    }
+
+    #[derive(Deserialize)]
+    pub struct RepresentationEntryDto {
+        pub rep_id: u32,
+        pub identity_id: u32,
+        pub units: Vec<UnitIdDto>,
+        pub acquired_at: u64,
+        pub practice_count: u32,
+        pub confidence: f32,
+        #[serde(default)]
+        pub predecessor_rep_id: Option<u32>,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ViewDto {
+        pub units: Vec<UnitIdDto>,
+        pub identity: u32,
+    }
+
+    #[derive(Deserialize)]
+    pub struct MergeCandidateDto {
+        pub left: UnitIdDto,
+        pub right: UnitIdDto,
+        pub count: u32,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ModelSnapshot {
+        pub version: String,
+        pub tick: u64,
+        pub primitives: Vec<(u32, u32)>,
+        pub chunks: Vec<ChunkDto>,
+        pub prediction_edges: Vec<PredictionEdgeDto>,
+        pub merge_candidates: Vec<MergeCandidateDto>,
+        pub metrics: super::MetricsDto,
+        #[serde(default)]
+        pub next_trace_id: crate::trace::TraceId,
+        #[serde(default)]
+        pub association_edges: Vec<AssociationEdgeDto>,
+        #[serde(default = "super::default_top_k")]
+        pub association_top_k: usize,
+        #[serde(default = "super::default_decay")]
+        pub association_decay: f64,
+        #[serde(default)]
+        pub identities: Vec<Vec<u32>>,
+        #[serde(default)]
+        pub views: Vec<ViewDto>,
+        #[serde(default)]
+        pub lineage_entries: Vec<(u32, UnitIdDto, UnitIdDto)>,
+        #[serde(default)]
+        pub identity_parent: Vec<u32>,
+        #[serde(default)]
+        pub representation_entries: Vec<RepresentationEntryDto>,
+        #[serde(default)]
+        pub transforms: Vec<super::TransformEntryDto>,
+        #[serde(default)]
+        pub merge_right_reuse: Vec<(UnitIdDto, Vec<UnitIdDto>)>,
+        #[serde(default)]
+        pub checkpoint_generation: u64,
+        #[serde(default)]
+        pub prediction_edge_groups: Vec<(UnitIdDto, Vec<PredEdgeEntryDto>)>,
+        #[serde(default)]
+        pub association_edge_groups: Vec<(UnitIdDto, Vec<AssocEdgeEntryDto>)>,
+    }
+}
+
+fn bincode_deserialize_varint_v2(payload: &[u8]) -> Result<v2_compat::ModelSnapshot, std::io::Error> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_varint_encoding()
+        .deserialize(payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn from_v2_snapshot(v2: v2_compat::ModelSnapshot) -> ModelSnapshot {
+    let cv = |u: v2_compat::UnitIdDto| -> UnitIdDto {
+        UnitIdDto { is_chunk: u.is_chunk, raw: u.raw }
+    };
+    ModelSnapshot {
+        version: v2.version,
+        tick: v2.tick,
+        primitives: v2.primitives,
+        chunks: v2.chunks.into_iter().map(|c| ChunkDto {
+            left: cv(c.left), right: cv(c.right), tier: c.tier,
+            use_count: c.use_count, usage_strength: c.usage_strength,
+            last_used: c.last_used, last_used_delta: c.last_used_delta,
+            expanded_length: c.expanded_length,
+            feedback_value: c.feedback_value, feedback_count: c.feedback_count,
+            residency: c.residency,
+        }).collect(),
+        prediction_edges: v2.prediction_edges.into_iter().map(|e| PredictionEdgeDto {
+            context: cv(e.context), next_unit: cv(e.next_unit),
+            use_count: e.use_count, usage_strength: e.usage_strength,
+            feedback_value: e.feedback_value, feedback_count: e.feedback_count,
+            avoidance: e.avoidance, last_used_tick: e.last_used_tick,
+            external_route_evidence: e.external_route_evidence,
+        }).collect(),
+        merge_candidates: v2.merge_candidates.into_iter().map(|m| MergeCandidateDto {
+            left: cv(m.left), right: cv(m.right), count: m.count,
+        }).collect(),
+        metrics: v2.metrics,
+        next_trace_id: v2.next_trace_id,
+        association_edges: v2.association_edges.into_iter().map(|a| AssociationEdgeDto {
+            source: cv(a.source), target: cv(a.target),
+            strength: a.strength, use_count: a.use_count, last_used: a.last_used,
+        }).collect(),
+        association_top_k: v2.association_top_k,
+        association_decay: v2.association_decay,
+        identities: v2.identities,
+        views: v2.views.into_iter().map(|v| ViewDto {
+            units: v.units.into_iter().map(cv).collect(), identity: v.identity,
+        }).collect(),
+        lineage_entries: v2.lineage_entries.into_iter().map(|(id, l, r)| (id, cv(l), cv(r))).collect(),
+        identity_parent: v2.identity_parent,
+        representation_entries: v2.representation_entries.into_iter().map(|e| RepresentationEntryDto {
+            identity_id: e.identity_id,
+            units: e.units.into_iter().map(cv).collect(),
+            acquired_at: e.acquired_at, practice_count: e.practice_count,
+            confidence: e.confidence, predecessor_rep_id: e.predecessor_rep_id,
+        }).collect(),
+        transforms: v2.transforms,
+        merge_right_reuse: v2.merge_right_reuse.into_iter()
+            .map(|(r, ls)| (cv(r), ls.into_iter().map(cv).collect())).collect(),
+        checkpoint_generation: v2.checkpoint_generation,
+        prediction_edge_groups: v2.prediction_edge_groups.into_iter()
+            .map(|(ctx, edges)| (cv(ctx), edges.into_iter().map(|e| PredEdgeEntryDto {
+                next_unit: cv(e.next_unit), use_count: e.use_count,
+                usage_strength: e.usage_strength, feedback_value: e.feedback_value,
+                feedback_count: e.feedback_count, avoidance: e.avoidance,
+                last_used_tick: e.last_used_tick, last_used_tick_delta: e.last_used_tick_delta,
+                external_route_evidence: e.external_route_evidence,
+            }).collect())).collect(),
+        association_edge_groups: v2.association_edge_groups.into_iter()
+            .map(|(src, edges)| (cv(src), edges.into_iter().map(|e| AssocEdgeEntryDto {
+                target: cv(e.target), strength: e.strength,
+                use_count: e.use_count, last_used: e.last_used, last_used_delta: e.last_used_delta,
+            }).collect())).collect(),
+    }
 }
 
 fn stm_write_container(
@@ -465,9 +726,12 @@ fn stm_read_container(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
         } else {
             encoded.to_vec()
         };
-        // §27: version 2 uses varint encoding; version 1 uses fixed-int
-        if version >= 2 {
+        // version 3 = packed UnitId + implicit IDs (current); version 2 = varint struct UnitId
+        if version >= 3 {
             bincode_deserialize_varint(&payload)
+        } else if version == 2 {
+            let v2 = bincode_deserialize_varint_v2(&payload)?;
+            Ok(from_v2_snapshot(v2))
         } else {
             bincode::deserialize(&payload)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -553,7 +817,6 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
     let chunks: Vec<ChunkDto> = model.chunks.iter_all().map(|c| {
         let delta = encode_tick_delta(c.last_used, model_tick);
         ChunkDto {
-            id: c.id,
             left: c.left.into(),
             right: c.right.into(),
             tier: c.tier.into(),
@@ -701,7 +964,6 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         let left: UnitId = dto.left.into();
         let right: UnitId = dto.right.into();
         let id = chunks.get_or_create(left, right, dto.expanded_length);
-        debug_assert_eq!(id, dto.id);
         let chunk = chunks.get_mut(id).unwrap();
         chunk.tier = dto.tier.into();
         chunk.use_count = dto.use_count;
@@ -805,19 +1067,18 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
     // Legacy snapshots have no entries — no synthetic history is created (REP-07).
     let representation_bulk: Vec<RepresentationEntry> = snap.representation_entries
         .into_iter()
-        .map(|d| {
+        .enumerate()
+        .map(|(idx, d)| {
             let units: Vec<UnitId> = d.units.into_iter().map(UnitId::from).collect();
-            let mut entry = RepresentationEntry {
-                rep_id: d.rep_id,
+            RepresentationEntry {
+                rep_id: idx as u32, // §17: implicit id from position in snapshot array
                 identity_id: d.identity_id,
                 units,
                 acquired_at: d.acquired_at,
                 practice_count: d.practice_count,
                 confidence: d.confidence,
                 predecessor_rep_id: d.predecessor_rep_id,
-            };
-            entry.practice_count = d.practice_count; // redundant but explicit
-            entry
+            }
         })
         .collect();
     let representations = RepresentationStore::from_bulk(representation_bulk);

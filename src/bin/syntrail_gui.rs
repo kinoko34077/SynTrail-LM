@@ -84,6 +84,7 @@ enum FeedbackState {
 enum Action {
     None,
     New,
+    NewConversation,
     OpenLoadDialog,
     Save,
     OpenSaveDialog,
@@ -168,9 +169,12 @@ impl SynTrailApp {
     }
 
     fn do_load(&mut self, path: PathBuf) {
+        if !self.confirm_discard_if_dirty() { return; }
         match self.handle.load_model_from(&path) {
             Ok(()) => {
                 self.analytics = self.handle.get_analytics();
+                self.chat_history.clear();
+                self.feedback_state = FeedbackState::None;
                 self.status = format!("Loaded: {}", path.display());
             }
             Err(e) => self.status = format!("Load failed: {e}"),
@@ -191,12 +195,30 @@ impl SynTrailApp {
         }
     }
 
+    /// Returns true if the user confirmed or no confirmation was needed.
+    fn confirm_discard_if_dirty(&self) -> bool {
+        if !self.handle.doc.dirty { return true; }
+        rfd::MessageDialog::new()
+            .set_title("未保存の変更")
+            .set_description("保存されていない変更があります。続けますか？")
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show() == rfd::MessageDialogResult::Yes
+    }
+
     fn do_new(&mut self) {
+        if !self.confirm_discard_if_dirty() { return; }
         self.handle.reset_model();
         self.chat_history.clear();
         self.feedback_state = FeedbackState::None;
         self.analytics = self.handle.get_analytics();
         self.status = "New model (unsaved)".to_string();
+    }
+
+    fn do_new_conversation(&mut self) {
+        self.handle.new_conversation();
+        self.chat_history.clear();
+        self.feedback_state = FeedbackState::None;
+        self.status = "New conversation".to_string();
     }
 }
 
@@ -228,11 +250,12 @@ impl eframe::App for SynTrailApp {
             }
             if let Some(cmd) = self.native_menu.poll() {
                 action = match cmd {
-                    syntrail_lm::desktop::FileCommand::New     => Action::New,
-                    syntrail_lm::desktop::FileCommand::Open    => Action::OpenLoadDialog,
-                    syntrail_lm::desktop::FileCommand::Save    => Action::Save,
-                    syntrail_lm::desktop::FileCommand::SaveAs  => Action::OpenSaveDialog,
-                    syntrail_lm::desktop::FileCommand::LoadPath(p) => Action::LoadPath(p),
+                    syntrail_lm::desktop::FileCommand::New            => Action::New,
+                    syntrail_lm::desktop::FileCommand::NewConversation => Action::NewConversation,
+                    syntrail_lm::desktop::FileCommand::Open           => Action::OpenLoadDialog,
+                    syntrail_lm::desktop::FileCommand::Save           => Action::Save,
+                    syntrail_lm::desktop::FileCommand::SaveAs         => Action::OpenSaveDialog,
+                    syntrail_lm::desktop::FileCommand::LoadPath(p)    => Action::LoadPath(p),
                 };
             }
         }
@@ -259,10 +282,11 @@ impl eframe::App for SynTrailApp {
         // ── Top toolbar ───────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("New").clicked()      { action = Action::New; }
-                if ui.button("Open…").clicked()    { action = Action::OpenLoadDialog; }
-                if ui.button("Save").clicked()     { action = Action::Save; }
-                if ui.button("Save As…").clicked() { action = Action::OpenSaveDialog; }
+                if ui.button("New Model").clicked()       { action = Action::New; }
+                if ui.button("New Conversation").clicked() { action = Action::NewConversation; }
+                if ui.button("Open…").clicked()            { action = Action::OpenLoadDialog; }
+                if ui.button("Save").clicked()             { action = Action::Save; }
+                if ui.button("Save As…").clicked()         { action = Action::OpenSaveDialog; }
                 ui.separator();
                 ui.label(egui::RichText::new(&model_path_str).small().weak());
                 ui.separator();
@@ -390,9 +414,10 @@ impl eframe::App for SynTrailApp {
         // ── Deferred action dispatch ──────────────────────────────────────
         match action {
             Action::None => {}
-            Action::New  => self.do_new(),
-            Action::Save => self.do_save(),
-            Action::Send => self.send_message(),
+            Action::New             => self.do_new(),
+            Action::NewConversation => self.do_new_conversation(),
+            Action::Save            => self.do_save(),
+            Action::Send            => self.send_message(),
             Action::Feedback(id, s)  => self.do_feedback(id, s),
             Action::RefreshAnalytics => self.analytics = self.handle.get_analytics(),
             Action::LoadPath(path)   => self.do_load(path),

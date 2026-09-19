@@ -47,6 +47,8 @@ impl FileKind {
 #[derive(Debug, Clone)]
 pub enum FileCommand {
     New,
+    /// §27: Reset conversation history only; model state is preserved.
+    NewConversation,
     Open,
     Save,
     SaveAs,

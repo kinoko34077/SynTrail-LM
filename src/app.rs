@@ -227,7 +227,7 @@ impl AppHandle {
         Ok(())
     }
 
-    /// Replace model with a blank one, reset counters, clear doc path (New).
+    /// Replace model with a blank one, reset counters, clear doc path (New Model — §27).
     pub fn reset_model(&mut self) {
         self.session.model = ModelState::new();
         self.session.turn_count = 0;
@@ -237,6 +237,16 @@ impl AppHandle {
         self.last_output_chars = 0;
         self.pos_feedback_count = 0;
         self.neg_feedback_count = 0;
+    }
+
+    /// Reset conversation state only — keeps the model intact (New Conversation — §27).
+    /// Returns true so the caller can clear the in-app chat history.
+    pub fn new_conversation(&mut self) -> bool {
+        self.session.turn_count = 0;
+        self.last_decision_count = 0;
+        self.last_output_len = 0;
+        self.last_output_chars = 0;
+        true
     }
 
     /// Snapshot the current model state into a read-only Analytics value.

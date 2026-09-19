@@ -703,6 +703,7 @@ impl eframe::App for TrainerApp {
                             self.try_load_model();
                         }
                     }
+                    FileCommand::NewConversation => {} // not applicable in Trainer
                 }
             }
         }

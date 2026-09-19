@@ -1863,6 +1863,33 @@ fn doc01_apphandle_doc_state_tracks_path() {
     assert!(h.doc.path.is_none(), "DOC-01: doc.path must be None after reset_model");
 }
 
+// ── DOC-03: §27 — new_conversation preserves model, reset_model clears it ──
+#[test]
+fn doc03_new_conversation_vs_reset_model() {
+    use syntrail_lm::app::AppHandle;
+    let f = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+    let path = f.path().to_path_buf();
+    syntrail_lm::app::save_model_file(&syntrail_lm::model::ModelState::new(), &path).unwrap();
+    let mut h = AppHandle::new(path.clone(), ":memory:").unwrap();
+    for _ in 0..20 { h.session.model.expose_external("hello world"); }
+    let tick_after_training = h.session.model.tick;
+
+    // new_conversation: model intact, turn_count reset.
+    h.session.turn_count = 5;
+    h.new_conversation();
+    assert_eq!(h.session.model.tick, tick_after_training,
+        "DOC-03: new_conversation must not change model tick");
+    assert_eq!(h.session.turn_count, 0,
+        "DOC-03: new_conversation must reset turn_count");
+    assert!(h.doc.path.is_some(), "DOC-03: new_conversation must not clear doc path");
+
+    // reset_model: model cleared, path cleared.
+    h.reset_model();
+    assert_ne!(h.session.model.tick, tick_after_training,
+        "DOC-03: reset_model must reset model tick");
+    assert!(h.doc.path.is_none(), "DOC-03: reset_model must clear doc path");
+}
+
 // ── DOC-02: §25 — save_model returns error when doc.path is None ─────────
 #[test]
 fn doc02_save_model_requires_path() {

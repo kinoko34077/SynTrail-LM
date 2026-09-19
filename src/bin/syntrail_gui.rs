@@ -6,6 +6,7 @@ use eframe::egui;
 use std::path::PathBuf;
 use syntrail_lm::app::{Analytics, AppHandle};
 use syntrail_lm::db::TurnRow;
+use syntrail_lm::desktop::dialogs::{confirm_discard_dialog, open_model_dialog, save_model_dialog};
 use syntrail_lm::desktop::drop::{AcceptedKinds, DropResult, route_drop};
 use syntrail_lm::desktop::fonts::setup_fonts;
 use syntrail_lm::feedback::FeedbackSign;
@@ -35,38 +36,6 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-// ── File dialogs ──────────────────────────────────────────────────────────
-
-fn open_load_dialog(current: &str) -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .set_title("モデルを開く")
-        .add_filter("SynTrail JSON", &["json"])
-        .add_filter("SynTrail DB (snapshot)", &["db", "sqlite"])
-        .add_filter("すべてのファイル", &["*"])
-        .set_directory(parent_of(current))
-        .pick_file()
-}
-
-fn open_save_dialog(current: &str) -> Option<PathBuf> {
-    let cur = PathBuf::from(current);
-    let name = cur.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("model.json");
-    rfd::FileDialog::new()
-        .set_title("名前を付けて保存")
-        .add_filter("SynTrail JSON", &["json"])
-        .add_filter("SynTrail DB (snapshot)", &["db", "sqlite"])
-        .set_file_name(name)
-        .set_directory(parent_of(current))
-        .save_file()
-}
-
-fn parent_of(path_str: &str) -> PathBuf {
-    PathBuf::from(path_str)
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
 
 // ── Data types ────────────────────────────────────────────────────────────
 
@@ -198,11 +167,7 @@ impl SynTrailApp {
     /// Returns true if the user confirmed or no confirmation was needed.
     fn confirm_discard_if_dirty(&self) -> bool {
         if !self.handle.doc.dirty { return true; }
-        rfd::MessageDialog::new()
-            .set_title("未保存の変更")
-            .set_description("保存されていない変更があります。続けますか？")
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show() == rfd::MessageDialogResult::Yes
+        confirm_discard_dialog()
     }
 
     fn do_new(&mut self) {
@@ -424,12 +389,12 @@ impl eframe::App for SynTrailApp {
 
             // File dialogs — blocking native dialog; runs after frame is rendered
             Action::OpenLoadDialog => {
-                if let Some(path) = open_load_dialog(&model_path_str) {
+                if let Some(path) = open_model_dialog(&model_path_str) {
                     self.do_load(path);
                 }
             }
             Action::OpenSaveDialog => {
-                if let Some(path) = open_save_dialog(&model_path_str) {
+                if let Some(path) = save_model_dialog(&model_path_str) {
                     self.do_save_as(path);
                 }
             }

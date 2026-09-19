@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use syntrail_lm::app::{load_model_file, model_analytics, save_model_file, save_model_file_with_generation, Analytics};
+use syntrail_lm::desktop::dialogs::{open_dataset_dialog, open_model_dialog, save_model_dialog};
 use syntrail_lm::desktop::drop::{AcceptedKinds, DropResult, route_drop};
 use syntrail_lm::desktop::file_ops::{FileCommand, FileKind};
 use syntrail_lm::desktop::fonts::setup_fonts;
@@ -764,11 +765,7 @@ impl eframe::App for TrainerApp {
                     }
                     FileCommand::Open => {
                         if !training_active_menu {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .set_title("モデルを開く")
-                                .add_filter("Model files", &["json", "db", "sqlite"])
-                                .pick_file()
-                            {
+                            if let Some(p) = open_model_dialog(&self.model_path) {
                                 self.model_path = p.to_string_lossy().to_string();
                                 self.try_load_model();
                             }
@@ -790,11 +787,7 @@ impl eframe::App for TrainerApp {
                         }
                     }
                     FileCommand::SaveAs => {
-                        if let Some(p) = rfd::FileDialog::new()
-                            .set_title("名前を付けて保存")
-                            .add_filter("Model JSON", &["json"])
-                            .save_file()
-                        {
+                        if let Some(p) = save_model_dialog(&self.model_path) {
                             if training_active_menu {
                                 // §28: delegate SaveAs to worker; do NOT update model_path yet.
                                 // UI path updates only on receiving Saved { kind: SaveAs }.
@@ -878,12 +871,7 @@ impl eframe::App for TrainerApp {
                 ui.add_enabled(false,
                     egui::TextEdit::singleline(&mut self.model_path.clone()).desired_width(260.0));
                 if ui.add_enabled(file_ops_enabled, egui::Button::new("Open…")).clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_title("モデルを開く")
-                        .add_filter("SynTrail JSON", &["json"])
-                        .add_filter("SynTrail DB", &["db", "sqlite"])
-                        .pick_file()
-                    {
+                    if let Some(p) = open_model_dialog(&self.model_path) {
                         self.model_path = p.to_string_lossy().to_string();
                         self.try_load_model();
                     }
@@ -895,11 +883,7 @@ impl eframe::App for TrainerApp {
                 ui.add_enabled(false,
                     egui::TextEdit::singleline(&mut self.dataset_path.clone()).desired_width(260.0));
                 if ui.add_enabled(file_ops_enabled, egui::Button::new("Open…")).clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_title("テキストファイルを開く")
-                        .add_filter("Text", &["txt"])
-                        .pick_file()
-                    {
+                    if let Some(p) = open_dataset_dialog(&self.dataset_path) {
                         self.dataset_path = p.to_string_lossy().to_string();
                         self.try_load_dataset();
                     }

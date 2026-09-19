@@ -1,4 +1,7 @@
-/// File dialog wrappers using rfd (§83).
+/// File dialog wrappers — single source of truth for all GUI file operations (§35).
+///
+/// Both syntrail_gui and syntrail_trainer must call these functions instead of
+/// inline rfd calls.  All dialog titles use Japanese (consistent with app locale).
 #[cfg(feature = "gui")]
 pub use gui::*;
 
@@ -6,43 +9,79 @@ pub use gui::*;
 mod gui {
     use std::path::PathBuf;
 
-    pub fn open_model_dialog() -> Option<PathBuf> {
+    fn parent_of(path: &str) -> PathBuf {
+        PathBuf::from(path)
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Open-model file picker (§35).
+    pub fn open_model_dialog(current: &str) -> Option<PathBuf> {
         rfd::FileDialog::new()
-            .set_title("Open Model")
-            .add_filter("Model files", &["json", "db", "sqlite", "stm"])
-            .add_filter("All files", &["*"])
+            .set_title("モデルを開く")
+            .add_filter("SynTrail JSON", &["json"])
+            .add_filter("SynTrail DB", &["db", "sqlite"])
+            .add_filter("SynTrail STM", &["stm"])
+            .add_filter("すべてのファイル", &["*"])
+            .set_directory(parent_of(current))
             .pick_file()
     }
 
-    pub fn save_model_dialog(default_name: &str) -> Option<PathBuf> {
+    /// Save-model file picker (§35).
+    pub fn save_model_dialog(current: &str) -> Option<PathBuf> {
+        let cur = PathBuf::from(current);
+        let name = cur.file_name().and_then(|n| n.to_str()).unwrap_or("model.json");
         rfd::FileDialog::new()
-            .set_title("Save Model")
-            .set_file_name(default_name)
-            .add_filter("Model JSON", &["json"])
+            .set_title("名前を付けて保存")
+            .add_filter("SynTrail JSON", &["json"])
+            .add_filter("SynTrail DB", &["db", "sqlite"])
+            .set_file_name(name)
+            .set_directory(parent_of(current))
             .save_file()
     }
 
-    pub fn open_dataset_dialog() -> Option<PathBuf> {
+    /// Open-dataset file picker (§35).
+    pub fn open_dataset_dialog(current: &str) -> Option<PathBuf> {
         rfd::FileDialog::new()
-            .set_title("Open Dataset")
+            .set_title("テキストファイルを開く")
             .add_filter("Text files", &["txt"])
-            .add_filter("All files", &["*"])
+            .add_filter("すべてのファイル", &["*"])
+            .set_directory(parent_of(current))
             .pick_file()
     }
 
-    pub fn open_trainer_state_dialog() -> Option<PathBuf> {
+    /// Open-trainer-state file picker (§35).
+    pub fn open_trainer_state_dialog(current: &str) -> Option<PathBuf> {
         rfd::FileDialog::new()
-            .set_title("Open Trainer State")
-            .add_filter("Trainer state", &["json"])
-            .add_filter("All files", &["*"])
+            .set_title("トレーナー状態を開く")
+            .add_filter("Trainer state JSON", &["json"])
+            .add_filter("すべてのファイル", &["*"])
+            .set_directory(parent_of(current))
             .pick_file()
     }
 
-    pub fn save_trainer_state_dialog(default_name: &str) -> Option<PathBuf> {
+    /// Save-trainer-state file picker (§35).
+    pub fn save_trainer_state_dialog(current: &str) -> Option<PathBuf> {
+        let cur = PathBuf::from(current);
+        let name = cur.file_name().and_then(|n| n.to_str())
+            .unwrap_or("trainer.syntrail-trainer.json");
         rfd::FileDialog::new()
-            .set_title("Save Trainer State")
-            .set_file_name(default_name)
-            .add_filter("Trainer state", &["json"])
+            .set_title("トレーナー状態を保存")
+            .add_filter("Trainer state JSON", &["json"])
+            .set_file_name(name)
+            .set_directory(parent_of(current))
             .save_file()
+    }
+
+    /// Dirty-discard confirmation dialog (§35).
+    ///
+    /// Returns true if the user chose to discard (Yes) or there was nothing dirty.
+    pub fn confirm_discard_dialog() -> bool {
+        rfd::MessageDialog::new()
+            .set_title("未保存の変更")
+            .set_description("保存されていない変更があります。続けますか？")
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show() == rfd::MessageDialogResult::Yes
     }
 }

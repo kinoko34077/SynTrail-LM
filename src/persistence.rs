@@ -637,6 +637,162 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
     model
 }
 
+// ── §1/§2 Storage Profiler ─────────────────────────────────────────────────
+
+/// Per-section storage measurement.
+#[derive(Debug, Default)]
+pub struct SectionStats {
+    pub name: &'static str,
+    pub count: usize,
+    /// Serialized size in bytes (bincode).
+    pub bincode_bytes: usize,
+    /// Serialized size in bytes (JSON).
+    pub json_bytes: usize,
+}
+
+/// Full storage profile for a model file.
+#[derive(Debug)]
+pub struct StorageProfile {
+    pub sections: Vec<SectionStats>,
+    pub json_total_bytes: usize,
+    pub bincode_total_bytes: usize,
+    pub zstd_json_bytes: usize,
+    pub zstd_bincode_bytes: usize,
+    pub json_save_ms: u64,
+    pub json_load_ms: u64,
+    pub bincode_save_ms: u64,
+    pub bincode_load_ms: u64,
+    pub file_size_on_disk: u64,
+}
+
+/// §1/§2: Profile the storage of a model and print a report to stdout.
+///
+/// Measures per-section sizes (bincode), JSON/bincode totals, Zstd ratios,
+/// and save/load timing.  No files are written to disk during profiling.
+pub fn profile_storage(model: &ModelState) -> StorageProfile {
+    use std::time::Instant;
+    use std::io::Write as _;
+
+    let snap = to_snapshot(model);
+
+    // ── Per-section bincode + JSON sizes ─────────────────────────────────
+    macro_rules! section {
+        ($name:expr, $field:expr) => {{
+            let bc = bincode::serialize(&$field).map(|v| v.len()).unwrap_or(0);
+            let js = serde_json::to_string(&$field).map(|s| s.len()).unwrap_or(0);
+            SectionStats { name: $name, count: $field.len(), bincode_bytes: bc, json_bytes: js }
+        }};
+    }
+    macro_rules! section_scalar {
+        ($name:expr, $field:expr) => {{
+            let bc = bincode::serialize(&$field).map(|v| v.len()).unwrap_or(0);
+            let js = serde_json::to_string(&$field).map(|s| s.len()).unwrap_or(0);
+            SectionStats { name: $name, count: 1, bincode_bytes: bc, json_bytes: js }
+        }};
+    }
+
+    let sections = vec![
+        section!("primitives",           snap.primitives),
+        section!("chunks",               snap.chunks),
+        section!("prediction_edges",     snap.prediction_edges),
+        section!("association_edges",    snap.association_edges),
+        section!("merge_candidates",     snap.merge_candidates),
+        section!("identities",           snap.identities),
+        section!("identity_parent",      snap.identity_parent),
+        section!("views",                snap.views),
+        section!("lineage_entries",      snap.lineage_entries),
+        section!("representation_entries", snap.representation_entries),
+        section!("transforms",           snap.transforms),
+        section!("merge_right_reuse",    snap.merge_right_reuse),
+        section_scalar!("metrics",       snap.metrics),
+    ];
+
+    // ── Total JSON / bincode ───────────────────────────────────────────────
+    let snap2 = to_snapshot(model);
+    let json_bytes = serde_json::to_string(&snap2).map(|s| s.len()).unwrap_or(0);
+    let snap3 = to_snapshot(model);
+    let bincode_bytes = bincode::serialize(&snap3).map(|v| v.len()).unwrap_or(0);
+
+    // ── Zstd compressed sizes ──────────────────────────────────────────────
+    let snap_json_str = serde_json::to_string(&to_snapshot(model)).unwrap_or_default();
+    let zstd_json_bytes = zstd::encode_all(snap_json_str.as_bytes(), 3)
+        .map(|v| v.len()).unwrap_or(0);
+    let snap_bc = bincode::serialize(&to_snapshot(model)).unwrap_or_default();
+    let zstd_bincode_bytes = zstd::encode_all(snap_bc.as_slice(), 3)
+        .map(|v| v.len()).unwrap_or(0);
+
+    // ── Save / load timing (in-memory, no disk) ────────────────────────────
+    let t0 = Instant::now();
+    let _jb = serde_json::to_string(&to_snapshot(model)).unwrap_or_default();
+    let json_save_ms = t0.elapsed().as_millis() as u64;
+
+    let t0 = Instant::now();
+    let _: Result<ModelState, _> = serde_json::from_str(&_jb)
+        .map(|s: ModelSnapshot| from_snapshot(s));
+    let json_load_ms = t0.elapsed().as_millis() as u64;
+
+    let t0 = Instant::now();
+    let bc_bytes = bincode::serialize(&to_snapshot(model)).unwrap_or_default();
+    let bincode_save_ms = t0.elapsed().as_millis() as u64;
+
+    let t0 = Instant::now();
+    let _: Result<ModelState, _> = bincode::deserialize::<ModelSnapshot>(&bc_bytes)
+        .map(from_snapshot);
+    let bincode_load_ms = t0.elapsed().as_millis() as u64;
+
+    StorageProfile {
+        sections,
+        json_total_bytes: json_bytes,
+        bincode_total_bytes: bincode_bytes,
+        zstd_json_bytes,
+        zstd_bincode_bytes,
+        json_save_ms,
+        json_load_ms,
+        bincode_save_ms,
+        bincode_load_ms,
+        file_size_on_disk: 0, // filled in by caller from actual file
+    }
+}
+
+/// Print the storage profile in tabular form.
+pub fn print_storage_profile(profile: &StorageProfile) {
+    println!("{:<28} {:>8} {:>12} {:>12}", "Section", "Count", "Bincode", "JSON");
+    println!("{}", "-".repeat(64));
+    for s in &profile.sections {
+        println!("{:<28} {:>8} {:>12} {:>12}",
+            s.name, s.count, fmt_bytes(s.bincode_bytes), fmt_bytes(s.json_bytes));
+    }
+    println!("{}", "-".repeat(64));
+    println!("{:<28} {:>8} {:>12} {:>12}", "TOTAL", "",
+        fmt_bytes(profile.bincode_total_bytes), fmt_bytes(profile.json_total_bytes));
+    println!();
+    println!("Compressed (Zstd-3):");
+    println!("  JSON  → Zstd : {} ({:.1}×)",
+        fmt_bytes(profile.zstd_json_bytes),
+        ratio(profile.json_total_bytes, profile.zstd_json_bytes));
+    println!("  STM   → Zstd : {} ({:.1}×)",
+        fmt_bytes(profile.zstd_bincode_bytes),
+        ratio(profile.bincode_total_bytes, profile.zstd_bincode_bytes));
+    println!();
+    println!("Serialize timing (in-memory):");
+    println!("  JSON   save: {}ms   load: {}ms", profile.json_save_ms, profile.json_load_ms);
+    println!("  Bincode save: {}ms  load: {}ms", profile.bincode_save_ms, profile.bincode_load_ms);
+    if profile.file_size_on_disk > 0 {
+        println!();
+        println!("File on disk: {}", fmt_bytes(profile.file_size_on_disk as usize));
+    }
+}
+
+fn fmt_bytes(n: usize) -> String {
+    if n >= 1_048_576 { format!("{:.2} MB", n as f64 / 1_048_576.0) }
+    else if n >= 1024 { format!("{:.1} KB", n as f64 / 1024.0) }
+    else { format!("{} B", n) }
+}
+
+fn ratio(a: usize, b: usize) -> f64 {
+    if b == 0 { 0.0 } else { a as f64 / b as f64 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

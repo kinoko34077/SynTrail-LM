@@ -42,7 +42,7 @@ Usage: syntrail <command> [options]
 Commands:
   train      --input <file> [--model <path>] [--hot-budget N]
   generate   --seed <text>  [--model <path>] [--max-units N]
-  inspect    [--model <path>]
+  inspect    [--model <path>] [--storage]
   evaluate   --input <file> [--model <path>]           (frozen — read-only)
   recall     --unit <text>  [--model <path>] [--limit N]
   chat       --input <text> [--db <path>] [--model <path>]
@@ -139,6 +139,7 @@ fn cmd_generate(args: &[String]) {
 
 fn cmd_inspect(args: &[String]) {
     let model_path = flag_path(args, "--model").unwrap_or_else(default_model_path);
+    let storage_mode = args.iter().any(|a| a == "--storage");
     let model = load_model(&model_path);
     println!("Model file    : {}", model_path.display());
     println!("Primitives    : {}", model.primitive_count());
@@ -153,6 +154,14 @@ fn cmd_inspect(args: &[String]) {
     let mut t = [0u32; 3];
     for chunk in model.chunks.iter_all() { t[chunk.tier as usize] += 1; }
     println!("Chunk tiers   : T0={} T1={} T2={}", t[0], t[1], t[2]);
+    if storage_mode {
+        println!();
+        println!("=== Storage Profile (§1/§2) ===");
+        let file_size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+        let mut profile = persistence::profile_storage(&model);
+        profile.file_size_on_disk = file_size;
+        persistence::print_storage_profile(&profile);
+    }
 }
 
 // ── evaluate ──────────────────────────────────────────────────────────────

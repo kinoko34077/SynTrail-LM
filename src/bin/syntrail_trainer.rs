@@ -238,9 +238,12 @@ fn worker_main(
                     accuracy: eval.prediction_accuracy,
                 }));
 
-                // Save at each checkpoint.
+                // Save at each checkpoint. §37: failure stops the worker.
                 tr_state.model_fingerprint = model.state_fingerprint();
-                do_save(&model, &model_path, &tr_state, &ev_tx);
+                if !do_save(&model, &model_path, &tr_state, &ev_tx) {
+                    let _ = ev_tx.send(TrainerEvent::Stopped);
+                    return;
+                }
                 let _ = ev_tx.send(TrainerEvent::Analytics(Box::new(model_analytics(&model))));
 
                 if outcome == CheckpointOutcome::Finished {
@@ -289,9 +292,12 @@ fn worker_main(
             syntrail_lm::trainer::adaptive::LevelChange::Keep => {}
         }
 
-        // Save after each block.
+        // Save after each block. §37: failure stops the worker.
         tr_state.model_fingerprint = model.state_fingerprint();
-        do_save(&model, &model_path, &tr_state, &ev_tx);
+        if !do_save(&model, &model_path, &tr_state, &ev_tx) {
+            let _ = ev_tx.send(TrainerEvent::Stopped);
+            return;
+        }
 
         block_idx += 1;
     }

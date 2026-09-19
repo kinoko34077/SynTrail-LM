@@ -268,7 +268,10 @@ pub fn save(model: &ModelState, path: &Path) -> std::io::Result<()> {
     let snapshot = to_snapshot(model);
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)
+    // §38: write to temp file beside the target then rename atomically.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Load from JSON.
@@ -287,7 +290,10 @@ pub fn save_binary(model: &ModelState, path: &Path) -> std::io::Result<()> {
     let snapshot = to_snapshot(model);
     let bytes = bincode::serialize(&snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, bytes)
+    // §38: write to temp file beside the target then rename atomically.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Phase 16: load from binary format (bincode).

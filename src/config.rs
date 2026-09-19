@@ -30,6 +30,10 @@ pub struct GenerationConfig {
     pub cycle_penalty: f64,
     /// Ring-buffer depth for cycle detection.
     pub recent_routes_max: usize,
+    /// §6: max prompt units retained in GenerationState for Dialogue-mode conditioning.
+    pub dialogue_prompt_units_max: usize,
+    /// §6: weight of prompt-route support added to candidate scores in Dialogue mode.
+    pub dialogue_prompt_support_weight: f64,
 }
 
 impl Default for GenerationConfig {
@@ -38,6 +42,8 @@ impl Default for GenerationConfig {
             route_top_k: 5,
             cycle_penalty: 0.05,
             recent_routes_max: 8,
+            dialogue_prompt_units_max: 4,
+            dialogue_prompt_support_weight: 0.3,
         }
     }
 }

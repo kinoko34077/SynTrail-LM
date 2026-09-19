@@ -46,6 +46,8 @@ pub struct GenerationState {
     pub current_identity: Option<IdentityId>,
     /// Representation active at the current step (the one whose predecessor chain was used).
     pub current_rep: Option<RepId>,
+    /// §6: bounded prompt units for Dialogue-mode prompt conditioning (empty in Completion mode).
+    pub prompt_context_units: Vec<crate::units::UnitId>,
 }
 
 impl GenerationState {
@@ -56,6 +58,7 @@ impl GenerationState {
             last_emitted: std::collections::VecDeque::new(),
             current_identity: None,
             current_rep: None,
+            prompt_context_units: Vec::new(),
         }
     }
 
@@ -305,13 +308,22 @@ impl ModelState {
     /// §4 — NextChoice: all route provenance (source, kind, rep_id) is captured here
     ///   and transferred directly to DecisionStep — never inferred after the fact.
     fn pick_next_unit(&mut self, context: UnitId, state: &mut GenerationState) -> Option<NextChoice> {
-        // Direct prediction — top-K with cycle penalty.
+        // Direct prediction — top-K with cycle penalty and §6 Dialogue prompt support.
         let candidates = self.predictions.top_k_with_score(context, self.gen_config.route_top_k);
         if !candidates.is_empty() {
             let best = candidates.into_iter()
                 .map(|(unit, score)| {
                     let factor = if state.is_recent_route(context, unit) { self.gen_config.cycle_penalty } else { 1.0 };
-                    (unit, score * factor)
+                    // §6: add prompt support bonus when prompt_context_units are set (Dialogue mode).
+                    let prompt_bonus = if state.prompt_context_units.is_empty() {
+                        0.0
+                    } else {
+                        let raw: f64 = state.prompt_context_units.iter()
+                            .filter_map(|&pu| self.predictions.edge_lazy_strength(pu, unit, self.tick))
+                            .sum();
+                        (raw / 100.0).min(1.0) * self.gen_config.dialogue_prompt_support_weight
+                    };
+                    (unit, score * factor + prompt_bonus)
                 })
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             if let Some((unit, score)) = best {
@@ -459,6 +471,12 @@ impl ModelState {
         let mut emitted_units: Vec<UnitId> = Vec::new();
         let mut steps: Vec<DecisionStep> = Vec::new();
         let mut gen_state = GenerationState::new();
+        // §6: Dialogue mode retains a bounded tail of prompt units for prompt conditioning.
+        if mode == GenerationMode::Dialogue && !context_units.is_empty() {
+            let max = self.gen_config.dialogue_prompt_units_max;
+            let start = context_units.len().saturating_sub(max);
+            gen_state.prompt_context_units = context_units[start..].to_vec();
+        }
         // §7: generation stops only on SEQUENCE_END_CHAR.
         // §10: TURN_BOUNDARY_CHAR is suppressed from visible output and causes a state transition.
         let eos = self.sequence_end_unit();

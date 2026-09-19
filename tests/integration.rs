@@ -3098,6 +3098,38 @@ fn score_diag_01_route_score_breakdown_fields() {
     assert!(bd2.positive > 0.0, "SCORE-DIAG-01: positive must be positive after feedback");
 }
 
+// ── DIALOGUE-COND tests (§6) ──────────────────────────────────────────────
+
+#[test]
+fn dialogue_cond_01_completion_mode_unaffected() {
+    // §6: Completion mode must not be affected by Dialogue changes.
+    use syntrail_lm::trace::GenerationMode;
+    let mut m = ModelState::new();
+    for _ in 0..20 { m.train("hello world"); }
+    let (out_comp, _) = m.generate_with_trace_mode("hello", "hello", 10, 0, GenerationMode::Completion);
+    let (out_comp2, _) = m.generate_with_trace("hello", "hello", 10, 0);
+    assert_eq!(out_comp, out_comp2,
+        "DIALOGUE-COND-01: Completion mode via generate_with_trace_mode must match generate_with_trace");
+}
+
+#[test]
+fn dialogue_cond_02_dialogue_mode_uses_prompt_anchors() {
+    // §6: Dialogue mode keeps prompt context — prompt_context_units initialized from context.
+    use syntrail_lm::trace::GenerationMode;
+    let mut m = ModelState::new();
+    // Train two distinct sequences so different prompts lead to different continuations.
+    for _ in 0..30 { m.train("apple followed by banana dessert"); }
+    for _ in 0..30 { m.train("zebra then xylophone music"); }
+
+    // Generate in Dialogue mode with distinct prompts.
+    let (out1, _) = m.generate_with_trace_mode("apple", "apple", 10, 0, GenerationMode::Dialogue);
+    let (out2, _) = m.generate_with_trace_mode("zebra", "zebra", 10, 0, GenerationMode::Dialogue);
+
+    // Dialogue mode must distinguish prompts via prompt conditioning.
+    assert_ne!(out1, out2,
+        "DIALOGUE-COND-02: distinct prompts in Dialogue mode must yield distinct outputs via prompt conditioning");
+}
+
 // ── GEN-SCORE tests (§8) ──────────────────────────────────────────────────
 
 #[test]

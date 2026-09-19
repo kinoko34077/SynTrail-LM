@@ -1740,6 +1740,32 @@ fn fac04_wa_reuse_detected_across_subject_noun_pairs() {
     );
 }
 
+// ── FAC-05: §17 — factorization_scale=0 disables right-reuse resistance ──
+#[test]
+fn fac05_factorization_scale_configurable() {
+    use syntrail_lm::config::LearningConfig;
+    // With scale=0, right-reuse penalty disappears → merge should happen more readily.
+    let mut m_no_penalty = ModelState::new();
+    m_no_penalty.learning = LearningConfig { factorization_scale: 0.0 };
+    // With default scale=1.0, right-reuse resists merge.
+    let mut m_with_penalty = ModelState::new();
+    // Same training: AZ, BZ, CZ → Z has high right-reuse.
+    for _ in 0..30 {
+        m_no_penalty.expose_external("AZAZAZAZ");
+        m_no_penalty.expose_external("BZBZBZBZ");
+        m_with_penalty.expose_external("AZAZAZAZ");
+        m_with_penalty.expose_external("BZBZBZBZ");
+    }
+    // Model with no penalty should form at least as many chunks (merge resists less).
+    let chunks_no_penalty = m_no_penalty.chunk_count();
+    let chunks_with_penalty = m_with_penalty.chunk_count();
+    assert!(
+        chunks_no_penalty >= chunks_with_penalty,
+        "FAC-05: scale=0 should not produce fewer chunks than scale=1.0; \
+         no_penalty={chunks_no_penalty} with_penalty={chunks_with_penalty}"
+    );
+}
+
 // ── TRF tests: Phase F Transform/Identity separation ──────────────────────
 
 // ── TRF-01: EquivalentView merges identities ──────────────────────────────

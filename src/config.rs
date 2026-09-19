@@ -9,6 +9,18 @@ impl Default for MemoryBudgetConfig {
     fn default() -> Self { Self { hot_chunks_max: 0 } }
 }
 
+/// Learning tunables — controls merge pressure and factorization (§17).
+#[derive(Debug, Clone)]
+pub struct LearningConfig {
+    /// Penalty per additional left context that shares the same right unit (§17).
+    /// High value → right-reuse resists merge (factorization pressure).
+    pub factorization_scale: f64,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self { Self { factorization_scale: 1.0 } }
+}
+
 /// Generation-specific tunables (§13 — moved from model.rs constants).
 #[derive(Debug, Clone)]
 pub struct GenerationConfig {
@@ -61,6 +73,9 @@ pub struct Config {
     // ── v0.5 Memory Budget (§14-§16) ──────────────────────────────────────
     /// Memory budget tunables (HOT chunk cap etc.).
     pub memory_budget: MemoryBudgetConfig,
+    // ── v0.5 Learning tunables (§17) ──────────────────────────────────────
+    /// Learning tunables (factorization_scale etc.).
+    pub learning: LearningConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +100,7 @@ impl Config {
             generation: GenerationConfig::default(),
             hot_budget: 0,
             memory_budget: MemoryBudgetConfig::default(),
+            learning: LearningConfig::default(),
         }
     }
 

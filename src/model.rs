@@ -23,11 +23,8 @@ const MERGE_THRESHOLD: u32 = 4;
 const BASE_MERGE_PROBABILITY: f64 = 0.5;
 const SEGMENT_MIN_SCORE: f64 = 0.0;
 /// Phase 10: Factorization Pressure scale — each additional left-element wanting the same
-/// right unit subtracts this from the net merge gain, making the merge harder to achieve.
-/// High right-reuse (e.g., `は` appearing in 犬は/猫は/私は) resists merge.
-const FACTORIZATION_SCALE: f64 = 1.0;
-
 // Generation tunables are in ModelState.gen_config (from GenerationConfig).
+// Factorization scale is in ModelState.learning (from LearningConfig § 17).
 /// §7: Turn-boundary marker (ETX U+0003) — injected after input at conversation turn boundaries.
 /// Teaches the model where one input turn ends; does NOT stop generation.
 pub const TURN_BOUNDARY_CHAR: char = '\x03';
@@ -143,6 +140,8 @@ pub struct ModelState {
     pub gen_config: GenerationConfig,
     /// Memory budget tunables (§14-§16).
     pub memory_budget: crate::config::MemoryBudgetConfig,
+    /// Learning tunables (§17).
+    pub learning: crate::config::LearningConfig,
 }
 
 impl ModelState {
@@ -737,7 +736,7 @@ impl ModelState {
                 .get(&right)
                 .map(|s| s.len() as f64)
                 .unwrap_or(1.0);
-            let factorization_reuse = FACTORIZATION_SCALE * (right_reuse - 1.0).max(0.0);
+            let factorization_reuse = self.learning.factorization_scale * (right_reuse - 1.0).max(0.0);
             let net_gain = count_val as f64 - factorization_reuse;
 
             if net_gain >= MERGE_THRESHOLD as f64 {
@@ -838,6 +837,7 @@ impl ModelState {
             next_trace_id,
             gen_config: GenerationConfig::default(),
             memory_budget: crate::config::MemoryBudgetConfig::default(),
+            learning: crate::config::LearningConfig::default(),
         }
     }
 }

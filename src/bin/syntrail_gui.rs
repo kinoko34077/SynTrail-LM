@@ -6,6 +6,7 @@ use eframe::egui;
 use std::path::PathBuf;
 use syntrail_lm::app::{Analytics, AppHandle};
 use syntrail_lm::db::TurnRow;
+use syntrail_lm::desktop::drop::{AcceptedKinds, DropResult, route_drop};
 use syntrail_lm::desktop::fonts::setup_fonts;
 use syntrail_lm::feedback::FeedbackSign;
 
@@ -239,17 +240,21 @@ impl eframe::App for SynTrailApp {
             }
         }
 
-        // File drag-and-drop (.json or .db)
-        ctx.input(|i| {
-            for file in &i.raw.dropped_files {
-                if let Some(path) = &file.path {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if matches!(ext, "json" | "db" | "sqlite") {
-                        action = Action::LoadPath(path.clone());
-                    }
-                }
-            }
+        // File drag-and-drop — routed via desktop::drop::route_drop.
+        let dropped: Vec<_> = ctx.input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
         });
+        if !dropped.is_empty() {
+            match route_drop(dropped, &AcceptedKinds::chat()) {
+                DropResult::Command(syntrail_lm::desktop::FileCommand::LoadPath(p)) => {
+                    action = Action::LoadPath(p);
+                }
+                DropResult::MultipleFiles => {
+                    // silently ignore multiple-file drops for Chat
+                }
+                _ => {}
+            }
+        }
 
         // Current model path for display
         let model_path_str = self.handle.model_path.display().to_string();

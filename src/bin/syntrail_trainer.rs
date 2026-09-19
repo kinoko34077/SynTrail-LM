@@ -9,7 +9,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use syntrail_lm::app::{load_model_file, model_analytics, save_model_file, Analytics};
-use syntrail_lm::desktop::file_ops::FileCommand;
+use syntrail_lm::desktop::drop::{AcceptedKinds, DropResult, route_drop};
+use syntrail_lm::desktop::file_ops::{FileCommand, FileKind};
 use syntrail_lm::desktop::fonts::setup_fonts;
 use syntrail_lm::eval::evaluate_sample_frozen;
 use syntrail_lm::model::ModelState;
@@ -667,33 +668,40 @@ impl eframe::App for TrainerApp {
             }
         }
 
-        // D&D: block changes while Running or Paused (§108)
+        // D&D — routed via desktop::drop::route_drop (§108).
         let training_active = matches!(&self.state, AppState::Running | AppState::Paused);
-        ctx.input(|i| {
-            if i.raw.dropped_files.is_empty() { return; }
-            if training_active {
-                // set status after closure; can't mutate self.status_msg here
-                return;
-            }
-            for file in &i.raw.dropped_files {
-                if let Some(path) = &file.path {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if ext == "txt" {
-                        self.dataset_path = path.to_string_lossy().to_string();
-                        self.try_load_dataset();
-                    } else if matches!(ext, "json" | "db" | "sqlite") {
-                        self.model_path = path.to_string_lossy().to_string();
-                        self.try_load_model();
-                    }
-                }
-            }
+        let dropped: Vec<_> = ctx.input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
         });
-        if training_active {
-            ctx.input(|i| {
-                if !i.raw.dropped_files.is_empty() {
-                    self.status_msg = "Stop training before replacing model/dataset.".to_owned();
+        if !dropped.is_empty() {
+            if training_active {
+                self.status_msg = "Stop training before replacing model/dataset.".to_owned();
+            } else {
+                match route_drop(dropped, &AcceptedKinds::trainer()) {
+                    DropResult::Command(FileCommand::LoadPath(p)) => {
+                        match FileKind::detect(&p) {
+                            FileKind::DatasetText => {
+                                self.dataset_path = p.to_string_lossy().to_string();
+                                self.try_load_dataset();
+                            }
+                            _ => {
+                                self.model_path = p.to_string_lossy().to_string();
+                                self.try_load_model();
+                            }
+                        }
+                    }
+                    DropResult::MultipleFiles => {
+                        self.status_msg = "Drop one file at a time.".to_owned();
+                    }
+                    DropResult::Unsupported(p) => {
+                        self.status_msg = format!(
+                            "Unsupported file: {}",
+                            p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                        );
+                    }
+                    _ => {}
                 }
-            });
+            }
         }
 
         // ── Status bar ────────────────────────────────────────────────────

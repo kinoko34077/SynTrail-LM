@@ -221,6 +221,7 @@ impl eframe::App for SynTrailApp {
                     syntrail_lm::desktop::FileCommand::Save           => Action::Save,
                     syntrail_lm::desktop::FileCommand::SaveAs         => Action::OpenSaveDialog,
                     syntrail_lm::desktop::FileCommand::LoadPath(p)    => Action::LoadPath(p),
+                    syntrail_lm::desktop::FileCommand::OpenDataset    => Action::None,
                 };
             }
         }

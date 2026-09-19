@@ -25,7 +25,7 @@ use syntrail_lm::trainer::splitter::BlockSplitter;
 use syntrail_lm::trainer::state::{TrainerState, TrainerStatus};
 
 #[cfg(all(target_os = "windows", feature = "gui"))]
-use syntrail_lm::desktop::platform::windows::NativeMenu;
+use syntrail_lm::desktop::platform::windows::TrainerMenu;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -498,7 +498,7 @@ struct TrainerApp {
     // Detected existing trainer state
     resume_state: Option<Result<TrainerState, String>>,
     #[cfg(all(target_os = "windows", feature = "gui"))]
-    native_menu: NativeMenu,
+    native_menu: TrainerMenu,
 }
 
 impl TrainerApp {
@@ -517,7 +517,7 @@ impl TrainerApp {
             loaded_dataset: None,
             resume_state: None,
             #[cfg(all(target_os = "windows", feature = "gui"))]
-            native_menu: NativeMenu::build(),
+            native_menu: TrainerMenu::build(),
         }
     }
 
@@ -852,6 +852,16 @@ impl eframe::App for TrainerApp {
                                     Err(e) => self.status_msg = format!("Save failed: {e}"),
                                 }
                             }
+                        }
+                    }
+                    FileCommand::OpenDataset => {
+                        if !training_active_menu {
+                            if let Some(p) = open_dataset_dialog(&self.dataset_path) {
+                                self.dataset_path = p.to_string_lossy().to_string();
+                                self.try_load_dataset();
+                            }
+                        } else {
+                            self.status_msg = "Stop training before opening a new dataset.".to_owned();
                         }
                     }
                     FileCommand::LoadPath(p) => {

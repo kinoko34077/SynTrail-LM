@@ -50,6 +50,8 @@ pub enum FileCommand {
     /// §27: Reset conversation history only; model state is preserved.
     NewConversation,
     Open,
+    /// §39: Trainer-specific — open a text dataset file.
+    OpenDataset,
     Save,
     SaveAs,
     /// Load a specific path (from D&D or a recent-files list).

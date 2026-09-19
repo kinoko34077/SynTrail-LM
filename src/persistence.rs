@@ -106,6 +106,7 @@ impl From<&Chunk> for ChunkDto {
 }
 
 /// Phase 17: strength fields stored as f32.
+/// Kept for loading legacy flat prediction_edges field.
 #[derive(Serialize, Deserialize)]
 struct PredictionEdgeDto {
     context: UnitIdDto,
@@ -131,20 +132,31 @@ struct PredictionEdgeDto {
     external_route_evidence: f32,
 }
 
-impl From<&PredictionEdge> for PredictionEdgeDto {
-    fn from(e: &PredictionEdge) -> Self {
-        Self {
-            context: e.context.into(),
-            next_unit: e.next_unit.into(),
-            use_count: e.use_count,
-            usage_strength: e.usage_strength as f32,
-            feedback_value: e.feedback_value as f32,
-            feedback_count: e.feedback_count,
-            avoidance: e.avoidance as f32,
-            last_used_tick: e.last_used_tick,
-            external_route_evidence: e.external_route_evidence as f32,
-        }
-    }
+/// §25: Per-edge payload within a source group (context omitted — implied by group key).
+#[derive(Serialize, Deserialize)]
+struct PredEdgeEntryDto {
+    next_unit: UnitIdDto,
+    use_count: u32,
+    usage_strength: f32,
+    #[serde(default)]
+    feedback_value: f32,
+    #[serde(default)]
+    feedback_count: u32,
+    #[serde(default)]
+    avoidance: f32,
+    #[serde(default)]
+    last_used_tick: u64,
+    #[serde(default)]
+    external_route_evidence: f32,
+}
+
+/// §26: Per-edge payload within a source group (source omitted — implied by group key).
+#[derive(Serialize, Deserialize)]
+struct AssocEdgeEntryDto {
+    target: UnitIdDto,
+    strength: f64,
+    use_count: u32,
+    last_used: u64,
 }
 
 /// Phase B: Representation Lineage entry DTO.
@@ -282,6 +294,14 @@ pub struct ModelSnapshot {
     /// §32: Links this model snapshot to the trainer state saved in the same operation.
     #[serde(default)]
     pub checkpoint_generation: u64,
+    /// §25: Source-grouped prediction edges (context appears once per group).
+    /// New saves populate this and leave prediction_edges=[].
+    #[serde(default)]
+    prediction_edge_groups: Vec<(UnitIdDto, Vec<PredEdgeEntryDto>)>,
+    /// §26: Source-grouped association edges (source appears once per group).
+    /// New saves populate this and leave association_edges=[].
+    #[serde(default)]
+    association_edge_groups: Vec<(UnitIdDto, Vec<AssocEdgeEntryDto>)>,
 }
 
 fn default_top_k() -> usize { 32 }
@@ -473,8 +493,27 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         .collect();
 
     let chunks: Vec<ChunkDto> = model.chunks.iter_all().map(ChunkDto::from).collect();
-    let prediction_edges: Vec<PredictionEdgeDto> =
-        model.predictions.iter_all().map(PredictionEdgeDto::from).collect();
+
+    // §25: source-grouped prediction edges — context appears once per group.
+    let prediction_edges: Vec<PredictionEdgeDto> = Vec::new(); // deprecated; new saves use groups
+    let mut pred_groups: std::collections::HashMap<UnitId, Vec<PredEdgeEntryDto>> =
+        std::collections::HashMap::new();
+    for e in model.predictions.iter_all() {
+        pred_groups.entry(e.context).or_default().push(PredEdgeEntryDto {
+            next_unit: e.next_unit.into(),
+            use_count: e.use_count,
+            usage_strength: e.usage_strength as f32,
+            feedback_value: e.feedback_value as f32,
+            feedback_count: e.feedback_count,
+            avoidance: e.avoidance as f32,
+            last_used_tick: e.last_used_tick,
+            external_route_evidence: e.external_route_evidence as f32,
+        });
+    }
+    let mut prediction_edge_groups: Vec<(UnitIdDto, Vec<PredEdgeEntryDto>)> =
+        pred_groups.into_iter().map(|(ctx, edges)| (UnitIdDto::from(ctx), edges)).collect();
+    prediction_edge_groups.sort_by_key(|(ctx, _)| (ctx.is_chunk, ctx.raw));
+
     let merge_candidates: Vec<MergeCandidateDto> = model
         .merge_candidates_iter()
         .map(|((left, right), count)| MergeCandidateDto {
@@ -483,8 +522,22 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
             count: *count,
         })
         .collect();
-    let association_edges: Vec<AssociationEdgeDto> =
-        model.associations.iter_all().map(AssociationEdgeDto::from).collect();
+
+    // §26: source-grouped association edges — source appears once per group.
+    let association_edges: Vec<AssociationEdgeDto> = Vec::new(); // deprecated; new saves use groups
+    let mut assoc_groups: std::collections::HashMap<UnitId, Vec<AssocEdgeEntryDto>> =
+        std::collections::HashMap::new();
+    for e in model.associations.iter_all() {
+        assoc_groups.entry(e.source).or_default().push(AssocEdgeEntryDto {
+            target: e.target.into(),
+            strength: e.strength,
+            use_count: e.use_count,
+            last_used: e.last_used,
+        });
+    }
+    let mut association_edge_groups: Vec<(UnitIdDto, Vec<AssocEdgeEntryDto>)> =
+        assoc_groups.into_iter().map(|(src, edges)| (UnitIdDto::from(src), edges)).collect();
+    association_edge_groups.sort_by_key(|(src, _)| (src.is_chunk, src.raw));
 
     // Phase 2: identity / view store
     let identities: Vec<Vec<u32>> = model.identities.all_identities().to_vec();
@@ -551,6 +604,8 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         transforms,
         merge_right_reuse,
         checkpoint_generation: 0,
+        prediction_edge_groups,
+        association_edge_groups,
     }
 }
 
@@ -582,16 +637,33 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         }
     }
 
+    // §25: use grouped format when present; fall back to flat for legacy files.
     let mut predictions = PredictionStore::new();
-    for dto in snap.prediction_edges {
-        let edge = predictions.get_or_create(dto.context.into(), dto.next_unit.into());
-        edge.use_count = dto.use_count;
-        edge.usage_strength = dto.usage_strength as f64; // Phase 17: f32 → f64
-        edge.feedback_value = dto.feedback_value as f64;
-        edge.feedback_count = dto.feedback_count;
-        edge.avoidance = dto.avoidance as f64;
-        edge.last_used_tick = dto.last_used_tick;
-        edge.external_route_evidence = dto.external_route_evidence as f64;
+    if !snap.prediction_edge_groups.is_empty() {
+        for (ctx_dto, entries) in snap.prediction_edge_groups {
+            let ctx: UnitId = ctx_dto.into();
+            for e in entries {
+                let edge = predictions.get_or_create(ctx, e.next_unit.into());
+                edge.use_count = e.use_count;
+                edge.usage_strength = e.usage_strength as f64;
+                edge.feedback_value = e.feedback_value as f64;
+                edge.feedback_count = e.feedback_count;
+                edge.avoidance = e.avoidance as f64;
+                edge.last_used_tick = e.last_used_tick;
+                edge.external_route_evidence = e.external_route_evidence as f64;
+            }
+        }
+    } else {
+        for dto in snap.prediction_edges {
+            let edge = predictions.get_or_create(dto.context.into(), dto.next_unit.into());
+            edge.use_count = dto.use_count;
+            edge.usage_strength = dto.usage_strength as f64;
+            edge.feedback_value = dto.feedback_value as f64;
+            edge.feedback_count = dto.feedback_count;
+            edge.avoidance = dto.avoidance as f64;
+            edge.last_used_tick = dto.last_used_tick;
+            edge.external_route_evidence = dto.external_route_evidence as f64;
+        }
     }
 
     let mut merge_candidates: HashMap<(UnitId, UnitId), u32> = HashMap::new();
@@ -599,16 +671,27 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         merge_candidates.insert((dto.left.into(), dto.right.into()), dto.count);
     }
 
-    // v0.3: restore associations
-    let raw_assoc: Vec<AssociationEdge> = snap.association_edges.into_iter().map(|d| {
-        AssociationEdge {
+    // §26: use grouped format when present; fall back to flat for legacy files.
+    let raw_assoc: Vec<AssociationEdge> = if !snap.association_edge_groups.is_empty() {
+        snap.association_edge_groups.into_iter().flat_map(|(src_dto, entries)| {
+            let src: UnitId = src_dto.into();
+            entries.into_iter().map(move |e| AssociationEdge {
+                source: src,
+                target: e.target.into(),
+                strength: e.strength,
+                use_count: e.use_count,
+                last_used: e.last_used,
+            })
+        }).collect()
+    } else {
+        snap.association_edges.into_iter().map(|d| AssociationEdge {
             source: d.source.into(),
             target: d.target.into(),
             strength: d.strength,
             use_count: d.use_count,
             last_used: d.last_used,
-        }
-    }).collect();
+        }).collect()
+    };
     let associations = AssociationStore::from_edges(raw_assoc, snap.association_top_k, snap.association_decay);
 
     // Phase 2: restore identity / view store

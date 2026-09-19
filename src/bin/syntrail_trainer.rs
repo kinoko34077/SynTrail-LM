@@ -49,6 +49,8 @@ enum TrainerCommand {
     Pause,
     Resume,
     Stop,
+    /// §35: UI requests an immediate save to `path` while training is running.
+    Save(std::path::PathBuf),
 }
 
 #[derive(Debug)]
@@ -133,6 +135,10 @@ fn worker_main(
                                     save_and_exit(&mut model, &model_path, &mut tr_state, &ev_tx);
                                     return;
                                 }
+                                Ok(TrainerCommand::Save(path)) => {
+                                    tr_state.model_fingerprint = model.state_fingerprint();
+                                    do_save(&model, &path, &tr_state, &ev_tx);
+                                }
                                 _ => {}
                             }
                         }
@@ -142,6 +148,11 @@ fn worker_main(
                         return;
                     }
                     Ok(TrainerCommand::Resume) => {}  // already running
+                    Ok(TrainerCommand::Save(path)) => {
+                        // §35: on-demand save while running; failure sends Error but continues.
+                        tr_state.model_fingerprint = model.state_fingerprint();
+                        do_save(&model, &path, &tr_state, &ev_tx);
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => { save_and_exit(&mut model, &model_path, &mut tr_state, &ev_tx); return; }
                 }
@@ -643,7 +654,11 @@ impl eframe::App for TrainerApp {
                     }
                     FileCommand::Save => {
                         let p = PathBuf::from(&self.model_path);
-                        if let Some(m) = &self.loaded_model {
+                        if training_active_menu {
+                            // §35: delegate save to worker while training is running.
+                            self.send_cmd(TrainerCommand::Save(p.clone()));
+                            self.status_msg = format!("Save requested: {}", p.display());
+                        } else if let Some(m) = &self.loaded_model {
                             match save_model_file(m, &p) {
                                 Ok(()) => self.status_msg = format!("Saved: {}", p.display()),
                                 Err(e) => self.status_msg = format!("Save failed: {e}"),
@@ -656,7 +671,12 @@ impl eframe::App for TrainerApp {
                             .add_filter("Model JSON", &["json"])
                             .save_file()
                         {
-                            if let Some(m) = &self.loaded_model {
+                            if training_active_menu {
+                                // §35: delegate save to worker; update path for future saves.
+                                self.model_path = p.to_string_lossy().to_string();
+                                self.send_cmd(TrainerCommand::Save(p.clone()));
+                                self.status_msg = format!("Save requested: {}", p.display());
+                            } else if let Some(m) = &self.loaded_model {
                                 match save_model_file(m, &p) {
                                     Ok(()) => {
                                         self.model_path = p.to_string_lossy().to_string();

@@ -323,10 +323,8 @@ pub fn load_checkpoint_generation(path: &Path) -> std::io::Result<u64> {
         .map(|s| s.to_ascii_lowercase());
     match ext.as_deref() {
         Some("stm") => {
-            // Full bincode deserialize — header-only read deferred to §12.
             let bytes = std::fs::read(path)?;
-            let snapshot: ModelSnapshot = bincode::deserialize(&bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let snapshot = stm_read_container(&bytes)?;
             Ok(snapshot.checkpoint_generation)
         }
         Some("db") | Some("sqlite") => {
@@ -357,35 +355,95 @@ pub fn load(path: &Path) -> std::io::Result<ModelState> {
     Ok(from_snapshot(snapshot))
 }
 
+// ── STM container format (§12) ────────────────────────────────────────────
+//
+// Layout (10-byte header + payload):
+//   [0..4]  magic:       b"STM1"
+//   [4]     version:     1u8
+//   [5]     flags:       bit 0 = zstd compressed; remaining bits reserved
+//   [6..10] payload_len: u32 little-endian (byte length of payload)
+//   [10..]  payload:     bincode(ModelSnapshot), optionally zstd-compressed
+//
+// Legacy files (no STM1 header) are detected by checking the first 4 bytes
+// and are deserialized as raw bincode for backward compatibility.
+const STM_MAGIC: &[u8; 4] = b"STM1";
+const STM_VERSION: u8 = 1;
+const STM_FLAG_ZSTD: u8 = 0b0000_0001;
+
+fn stm_write_container(
+    writer: &mut impl std::io::Write,
+    snapshot: &ModelSnapshot,
+    compress: bool,
+) -> std::io::Result<()> {
+    let payload = bincode::serialize(snapshot)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let (flags, encoded) = if compress {
+        let compressed = zstd::bulk::compress(&payload, 3)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        (STM_FLAG_ZSTD, compressed)
+    } else {
+        (0u8, payload)
+    };
+    let payload_len = encoded.len() as u32;
+    writer.write_all(STM_MAGIC)?;
+    writer.write_all(&[STM_VERSION, flags])?;
+    writer.write_all(&payload_len.to_le_bytes())?;
+    writer.write_all(&encoded)
+}
+
+fn stm_read_container(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
+    if bytes.len() >= 4 && &bytes[..4] == STM_MAGIC {
+        // New container format
+        if bytes.len() < 10 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "STM header truncated"));
+        }
+        let flags = bytes[5];
+        let payload_len = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
+        if bytes.len() < 10 + payload_len {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "STM payload truncated"));
+        }
+        let encoded = &bytes[10..10 + payload_len];
+        let payload = if flags & STM_FLAG_ZSTD != 0 {
+            zstd::bulk::decompress(encoded, 256 * 1024 * 1024)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        } else {
+            encoded.to_vec()
+        };
+        bincode::deserialize(&payload)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    } else {
+        // Legacy: raw bincode without header
+        bincode::deserialize(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
 /// Phase 16: save to binary format (bincode); generation=0 (legacy/unversioned).
 pub fn save_binary(model: &ModelState, path: &Path) -> std::io::Result<()> {
     save_binary_with_generation(model, path, 0)
 }
 
-/// §3 (Storage P0): save to binary format with checkpoint_generation embedded.
+/// §3/§12: Save to STM container format with optional Zstd compression.
 ///
-/// Fixes the bug where `.stm` saves via `save_binary` lost the generation,
-/// making `TrainerState.checkpoint_generation != STM.checkpoint_generation`.
-/// §10: Streams via BufWriter + bincode::serialize_into — avoids allocating
-/// the full serialized bytes as a Vec before writing.
+/// Writes the STM1 header + bincode payload (Zstd-compressed by default).
+/// Backward compatible: load_binary detects the header and falls back to
+/// raw bincode for files written before §12.
 pub fn save_binary_with_generation(model: &ModelState, path: &Path, generation: u64) -> std::io::Result<()> {
     let mut snapshot = to_snapshot(model);
     snapshot.checkpoint_generation = generation;
     let tmp = path.with_extension("tmp");
     {
         let file = std::fs::File::create(&tmp)?;
-        let writer = std::io::BufWriter::new(file);
-        bincode::serialize_into(writer, &snapshot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut writer = std::io::BufWriter::new(file);
+        stm_write_container(&mut writer, &snapshot, true)?;
     }
     std::fs::rename(&tmp, path)
 }
 
-/// Phase 16: load from binary format (bincode).
+/// Phase 16 / §12: Load from STM container format (or legacy raw bincode).
 pub fn load_binary(path: &Path) -> std::io::Result<ModelState> {
     let bytes = std::fs::read(path)?;
-    let snapshot: ModelSnapshot = bincode::deserialize(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let snapshot = stm_read_container(&bytes)?;
     Ok(from_snapshot(snapshot))
 }
 

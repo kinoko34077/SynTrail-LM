@@ -8,7 +8,7 @@
 use rusqlite::{Connection, Result, params};
 
 use crate::feedback::{FeedbackEvent, FeedbackSign, FeedbackSource};
-use crate::trace::{DecisionStep, TurnTrace};
+use crate::trace::{DecisionStep, RouteKind, TurnTrace};
 
 pub struct Database {
     conn: Connection,
@@ -31,6 +31,16 @@ impl Database {
         Ok(db)
     }
 
+    /// §29: add route_provenance columns to trace_steps if they don't exist yet.
+    fn migrate_trace_steps(&self) {
+        // ALTER TABLE ADD COLUMN fails if the column already exists; ignore that error.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE trace_steps ADD COLUMN rsrc_is_chunk INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE trace_steps ADD COLUMN rsrc_raw      INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE trace_steps ADD COLUMN route_kind    INTEGER NOT NULL DEFAULT 0;"
+        );
+    }
+
     fn create_tables(&self) -> Result<()> {
         self.conn.execute_batch("
             PRAGMA journal_mode=WAL;
@@ -47,15 +57,18 @@ impl Database {
             );
 
             CREATE TABLE IF NOT EXISTS trace_steps (
-                step_id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                turn_id       INTEGER NOT NULL REFERENCES turns(turn_id),
-                trace_id      INTEGER NOT NULL,
-                step_index    INTEGER NOT NULL,
-                unit_is_chunk INTEGER NOT NULL,
-                unit_raw      INTEGER NOT NULL,
-                ctx_is_chunk  INTEGER NOT NULL,
-                ctx_raw       INTEGER NOT NULL,
-                score         REAL    NOT NULL
+                step_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                turn_id           INTEGER NOT NULL REFERENCES turns(turn_id),
+                trace_id          INTEGER NOT NULL,
+                step_index        INTEGER NOT NULL,
+                unit_is_chunk     INTEGER NOT NULL,
+                unit_raw          INTEGER NOT NULL,
+                ctx_is_chunk      INTEGER NOT NULL,
+                ctx_raw           INTEGER NOT NULL,
+                score             REAL    NOT NULL,
+                rsrc_is_chunk     INTEGER NOT NULL DEFAULT 0,
+                rsrc_raw          INTEGER NOT NULL DEFAULT 0,
+                route_kind        INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS feedback_events (
@@ -77,7 +90,9 @@ impl Database {
                 json_blob     TEXT    NOT NULL,
                 created_at    INTEGER NOT NULL
             );
-        ")
+        ")?;
+        self.migrate_trace_steps();
+        Ok(())
     }
 
     // ── Turn insertion ────────────────────────────────────────────────────
@@ -105,8 +120,9 @@ impl Database {
         for step in &trace.decision_steps {
             self.conn.execute(
                 "INSERT INTO trace_steps
-                 (turn_id, trace_id, step_index, unit_is_chunk, unit_raw, ctx_is_chunk, ctx_raw, score)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (turn_id, trace_id, step_index, unit_is_chunk, unit_raw, ctx_is_chunk, ctx_raw, score,
+                  rsrc_is_chunk, rsrc_raw, route_kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     turn_id,
                     trace.trace_id as i64,
@@ -116,6 +132,9 @@ impl Database {
                     step.context.is_chunk() as i64,
                     step.context.raw() as i64,
                     step.score,
+                    step.route_source.is_chunk() as i64,
+                    step.route_source.raw() as i64,
+                    route_kind_to_i64(step.route_kind),
                 ],
             )?;
         }
@@ -233,7 +252,8 @@ impl Database {
     /// Return the DecisionSteps for a given turn_id.
     pub fn query_steps_for_turn(&self, turn_id: i64) -> Result<Vec<StepRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT step_index, unit_is_chunk, unit_raw, ctx_is_chunk, ctx_raw, score
+            "SELECT step_index, unit_is_chunk, unit_raw, ctx_is_chunk, ctx_raw, score,
+                    rsrc_is_chunk, rsrc_raw, route_kind
              FROM trace_steps WHERE turn_id = ?1 ORDER BY step_index"
         )?;
         let rows = stmt.query_map(params![turn_id], |row| {
@@ -244,6 +264,9 @@ impl Database {
                 ctx_is_chunk: row.get::<_, i64>(3)? != 0,
                 ctx_raw: row.get::<_, i64>(4)? as u32,
                 score: row.get(5)?,
+                rsrc_is_chunk: row.get::<_, i64>(6)? != 0,
+                rsrc_raw: row.get::<_, i64>(7)? as u32,
+                route_kind: row.get::<_, i64>(8)?,
             })
         })?;
         rows.collect()
@@ -252,23 +275,16 @@ impl Database {
     /// Convert a stored StepRow back to a DecisionStep.
     pub fn step_row_to_decision(row: &StepRow) -> DecisionStep {
         use crate::units::UnitId;
-        let unit = if row.unit_is_chunk {
-            UnitId::chunk(row.unit_raw)
-        } else {
-            UnitId::primitive(row.unit_raw)
-        };
-        let context = if row.ctx_is_chunk {
-            UnitId::chunk(row.ctx_raw)
-        } else {
-            UnitId::primitive(row.ctx_raw)
-        };
+        let unit = if row.unit_is_chunk { UnitId::chunk(row.unit_raw) } else { UnitId::primitive(row.unit_raw) };
+        let context = if row.ctx_is_chunk { UnitId::chunk(row.ctx_raw) } else { UnitId::primitive(row.ctx_raw) };
+        let route_source = if row.rsrc_is_chunk { UnitId::chunk(row.rsrc_raw) } else { UnitId::primitive(row.rsrc_raw) };
         DecisionStep {
             step_index: row.step_index,
             unit,
             context,
-            route_source: context,
+            route_source,
             score: row.score,
-            route_kind: crate::trace::RouteKind::Direct,
+            route_kind: route_kind_from_i64(row.route_kind),
         }
     }
 }
@@ -302,6 +318,28 @@ pub struct StepRow {
     pub ctx_is_chunk: bool,
     pub ctx_raw: u32,
     pub score: f64,
+    /// §29: route provenance fields.
+    pub rsrc_is_chunk: bool,
+    pub rsrc_raw: u32,
+    pub route_kind: i64,
+}
+
+fn route_kind_to_i64(k: RouteKind) -> i64 {
+    match k {
+        RouteKind::Direct       => 0,
+        RouteKind::RepFallback  => 1,
+        RouteKind::RecallBridge => 2,
+        RouteKind::Generalize   => 3,
+    }
+}
+
+fn route_kind_from_i64(v: i64) -> RouteKind {
+    match v {
+        1 => RouteKind::RepFallback,
+        2 => RouteKind::RecallBridge,
+        3 => RouteKind::Generalize,
+        _ => RouteKind::Direct,
+    }
 }
 
 #[cfg(test)]

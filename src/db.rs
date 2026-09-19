@@ -262,7 +262,14 @@ impl Database {
         } else {
             UnitId::primitive(row.ctx_raw)
         };
-        DecisionStep { step_index: row.step_index, unit, context, score: row.score }
+        DecisionStep {
+            step_index: row.step_index,
+            unit,
+            context,
+            route_source: context,
+            score: row.score,
+            route_kind: crate::trace::RouteKind::Direct,
+        }
     }
 }
 
@@ -305,11 +312,14 @@ mod tests {
     use crate::feedback::FeedbackSource;
 
     fn dummy_trace(id: u64) -> TurnTrace {
+        let ctx = UnitId::primitive(2);
         let step = DecisionStep {
             step_index: 0,
             unit: UnitId::primitive(1),
-            context: UnitId::primitive(2),
+            context: ctx,
+            route_source: ctx,
             score: 0.9,
+            route_kind: crate::trace::RouteKind::Direct,
         };
         TurnTrace::new(id, 1, "seed".into(), "input".into(), "output".into(), String::new(), vec![step], 1000)
     }

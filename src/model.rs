@@ -15,7 +15,7 @@ use crate::relation::{RelationKind, RelationStore};
 use crate::primitives::PrimitiveRegistry;
 use crate::representation::RepresentationStore;
 use crate::segmentation::{expand, segment};
-use crate::trace::{DecisionStep, TraceId, TurnTrace, now_secs};
+use crate::trace::{DecisionStep, RouteKind, TraceId, TurnTrace, now_secs};
 use crate::units::UnitId;
 
 const MERGE_THRESHOLD: u32 = 4;
@@ -338,7 +338,7 @@ impl ModelState {
                         stopped_by_eos = true;
                         break;
                     }
-                    // Cycle confirmed — escalate through fallback chain (P1).
+                    // Cycle confirmed — escalate through fallback chain (§10).
                     if gen_state.is_recent_route(context, next) {
                         // 1. Recall: find associations, try prediction from each associate.
                         let mut escaped = false;
@@ -347,7 +347,11 @@ impl ModelState {
                             if assoc == context { continue; }
                             if let Some((alt, alt_score)) = self.predictions.top1_with_score(assoc) {
                                 if !gen_state.is_recent_route(context, alt) && eos != Some(alt) {
-                                    steps.push(DecisionStep { step_index, unit: alt, context, score: alt_score });
+                                    steps.push(DecisionStep {
+                                        step_index, unit: alt, context,
+                                        route_source: assoc, score: alt_score,
+                                        route_kind: RouteKind::RecallBridge,
+                                    });
                                     gen_state.push_route(context, alt);
                                     emitted_units.push(alt);
                                     escaped = true;
@@ -356,10 +360,14 @@ impl ModelState {
                             }
                         }
                         if escaped { continue; }
-                        // 2. Generalize: association bridge for a novel next unit.
-                        if let Some((alt, alt_score)) = self.generalize(context) {
+                        // 2. Generalize: association bridge, excluding the cycled route (§11).
+                        if let Some((alt, alt_score)) = self.generalize_excluding(context, &[next]) {
                             if !gen_state.is_recent_route(context, alt) && eos != Some(alt) {
-                                steps.push(DecisionStep { step_index, unit: alt, context, score: alt_score });
+                                steps.push(DecisionStep {
+                                    step_index, unit: alt, context,
+                                    route_source: context, score: alt_score,
+                                    route_kind: RouteKind::Generalize,
+                                });
                                 gen_state.push_route(context, alt);
                                 emitted_units.push(alt);
                                 continue;
@@ -369,7 +377,11 @@ impl ModelState {
                         stopped_by_cycle = true;
                         break;
                     }
-                    steps.push(DecisionStep { step_index, unit: next, context, score });
+                    steps.push(DecisionStep {
+                        step_index, unit: next, context,
+                        route_source: context, score,
+                        route_kind: RouteKind::Direct,
+                    });
                     gen_state.push_route(context, next);
                     emitted_units.push(next);
                 }
@@ -463,16 +475,29 @@ impl ModelState {
     ///      direct prediction edges but a co-occurring unit does.
     ///   3. Returns `None` only when no path yields a prediction.
     pub fn generalize(&self, context: UnitId) -> Option<(UnitId, f64)> {
-        // Level 1: lineage fallback.
-        if let Some(r) = self.predict_with_fallback(context) {
-            return Some(r);
+        self.generalize_excluding(context, &[])
+    }
+
+    /// Like `generalize`, but skips any `next` unit in `excluded` (§11).
+    /// Called from cycle escape to avoid re-selecting already-failed routes.
+    pub fn generalize_excluding(
+        &self,
+        context: UnitId,
+        excluded: &[UnitId],
+    ) -> Option<(UnitId, f64)> {
+        // Level 1: lineage fallback (skip excluded).
+        // predict_with_fallback returns a single best; check exclusion.
+        if let Some((u, s)) = self.predict_with_fallback(context) {
+            if !excluded.contains(&u) {
+                return Some((u, s));
+            }
         }
-        // Level 2: association bridge.
+        // Level 2: association bridge (skip excluded).
         let associates = self.associations.recall(context, &self.chunks, 8);
         for (assoc, assoc_strength) in associates {
             if assoc == context { continue; }
             if let Some((next, pred_score)) = self.predictions.top1_with_score(assoc) {
-                // Combined score: geometric mean of association and prediction scores.
+                if excluded.contains(&next) { continue; }
                 let combined = (assoc_strength * pred_score).sqrt();
                 return Some((next, combined));
             }

@@ -3,6 +3,19 @@ use crate::units::UnitId;
 
 pub type TraceId = u64;
 
+/// How the prediction edge for this step was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    /// Direct prediction from the generation context.
+    Direct,
+    /// Prediction via representation predecessor chain.
+    RepFallback,
+    /// Prediction from an association recall bridge (cycle escape).
+    RecallBridge,
+    /// Prediction via generalize() association bridge (cycle escape).
+    Generalize,
+}
+
 /// One model decision during generation: the unit that was selected at a
 /// given step, and the context (previous unit) that triggered the prediction.
 /// This is the feedback credit unit — NOT the internal sub-nodes of a Chunk.
@@ -12,10 +25,15 @@ pub struct DecisionStep {
     pub step_index: usize,
     /// The unit selected at this step (Primitive or Chunk).
     pub unit: UnitId,
-    /// The context unit whose prediction edge led here.
+    /// The generation context (previous unit in the emitted sequence).
     pub context: UnitId,
+    /// The actual source context used for the prediction edge (may differ from
+    /// `context` when a fallback or bridge route was used).
+    pub route_source: UnitId,
     /// Score of the chosen prediction edge.
     pub score: f64,
+    /// How this prediction was obtained (for feedback credit assignment).
+    pub route_kind: RouteKind,
 }
 
 /// Complete trace of one generation call.

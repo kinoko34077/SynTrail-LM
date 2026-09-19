@@ -383,11 +383,11 @@ pub fn load(path: &Path) -> std::io::Result<ModelState> {
     Ok(from_snapshot(snapshot))
 }
 
-// ── STM container format (§12) ────────────────────────────────────────────
+// ── STM container format (§12 / §27) ─────────────────────────────────────
 //
 // Layout (10-byte header + payload):
 //   [0..4]  magic:       b"STM1"
-//   [4]     version:     1u8
+//   [4]     version:     1 = fixed-int bincode; 2 = varint bincode (§27)
 //   [5]     flags:       bit 0 = zstd compressed; remaining bits reserved
 //   [6..10] payload_len: u32 little-endian (byte length of payload)
 //   [10..]  payload:     bincode(ModelSnapshot), optionally zstd-compressed
@@ -395,16 +395,33 @@ pub fn load(path: &Path) -> std::io::Result<ModelState> {
 // Legacy files (no STM1 header) are detected by checking the first 4 bytes
 // and are deserialized as raw bincode for backward compatibility.
 const STM_MAGIC: &[u8; 4] = b"STM1";
-const STM_VERSION: u8 = 1;
+// Version 2 = varint-encoded bincode (§27). New saves use this by default.
+const STM_VERSION: u8 = 2;
 const STM_FLAG_ZSTD: u8 = 0b0000_0001;
+
+fn bincode_serialize_varint(snapshot: &ModelSnapshot) -> Result<Vec<u8>, std::io::Error> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_varint_encoding()
+        .serialize(snapshot)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn bincode_deserialize_varint(payload: &[u8]) -> Result<ModelSnapshot, std::io::Error> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_varint_encoding()
+        .deserialize(payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
 
 fn stm_write_container(
     writer: &mut impl std::io::Write,
     snapshot: &ModelSnapshot,
     compress: bool,
 ) -> std::io::Result<()> {
-    let payload = bincode::serialize(snapshot)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // §27: version 2 — varint bincode
+    let payload = bincode_serialize_varint(snapshot)?;
     let (flags, encoded) = if compress {
         let compressed = zstd::bulk::compress(&payload, 3)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -421,10 +438,10 @@ fn stm_write_container(
 
 fn stm_read_container(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
     if bytes.len() >= 4 && &bytes[..4] == STM_MAGIC {
-        // New container format
         if bytes.len() < 10 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "STM header truncated"));
         }
+        let version = bytes[4];
         let flags = bytes[5];
         let payload_len = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
         if bytes.len() < 10 + payload_len {
@@ -437,8 +454,13 @@ fn stm_read_container(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
         } else {
             encoded.to_vec()
         };
-        bincode::deserialize(&payload)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        // §27: version 2 uses varint encoding; version 1 uses fixed-int
+        if version >= 2 {
+            bincode_deserialize_varint(&payload)
+        } else {
+            bincode::deserialize(&payload)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }
     } else {
         // Legacy: raw bincode without header
         bincode::deserialize(bytes)

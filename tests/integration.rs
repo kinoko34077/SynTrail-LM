@@ -2848,7 +2848,7 @@ fn stm12_01_container_roundtrip() {
     // Verify STM1 magic in file
     let bytes = std::fs::read(tmp.path()).unwrap();
     assert_eq!(&bytes[..4], b"STM1", "STM12-01: file must start with STM1 magic");
-    assert_eq!(bytes[4], 1, "STM12-01: version must be 1");
+    assert_eq!(bytes[4], 2, "STM12-01: version must be 2 (varint)");
     assert_eq!(bytes[5] & 1, 1, "STM12-01: zstd flag must be set");
 
     // Verify model round-trips correctly

@@ -246,14 +246,19 @@ impl eframe::App for SynTrailApp {
         let model_path_str = self.handle.doc.path_str().to_string();
 
         // ── Top toolbar ───────────────────────────────────────────────────
+        // §38: File-operation buttons shown only on platforms without a native menu.
+        //      On Windows + gui, the native menu (NativeMenu) is the primary file UI.
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("New Model").clicked()       { action = Action::New; }
-                if ui.button("New Conversation").clicked() { action = Action::NewConversation; }
-                if ui.button("Open…").clicked()            { action = Action::OpenLoadDialog; }
-                if ui.button("Save").clicked()             { action = Action::Save; }
-                if ui.button("Save As…").clicked()         { action = Action::OpenSaveDialog; }
-                ui.separator();
+                #[cfg(not(all(target_os = "windows", feature = "gui")))]
+                {
+                    if ui.button("New Model").clicked()        { action = Action::New; }
+                    if ui.button("New Conversation").clicked() { action = Action::NewConversation; }
+                    if ui.button("Open…").clicked()            { action = Action::OpenLoadDialog; }
+                    if ui.button("Save").clicked()             { action = Action::Save; }
+                    if ui.button("Save As…").clicked()         { action = Action::OpenSaveDialog; }
+                    ui.separator();
+                }
                 ui.label(egui::RichText::new(&model_path_str).small().weak());
                 ui.separator();
                 let a = &self.analytics;

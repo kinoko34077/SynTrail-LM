@@ -924,12 +924,15 @@ impl eframe::App for TrainerApp {
             ui.separator();
 
             // ── File selection — read-only display during training (§116) ──
+            // §38: On Windows (native menu present), toolbar Open buttons are hidden;
+            //      use File menu instead.  Non-Windows keeps the buttons as the fallback.
             let file_ops_enabled = !matches!(&self.state, AppState::Running | AppState::Paused | AppState::Stopping);
             ui.horizontal(|ui| {
                 ui.label("Model:");
                 // Read-only display; Open is the only way to change path (§116)
                 ui.add_enabled(false,
                     egui::TextEdit::singleline(&mut self.model_path.clone()).desired_width(260.0));
+                #[cfg(not(all(target_os = "windows", feature = "gui")))]
                 if ui.add_enabled(file_ops_enabled, egui::Button::new("Open…")).clicked() {
                     if let Some(p) = open_model_dialog(&self.model_path) {
                         self.model_path = p.to_string_lossy().to_string();
@@ -942,6 +945,7 @@ impl eframe::App for TrainerApp {
                 ui.label("Dataset:");
                 ui.add_enabled(false,
                     egui::TextEdit::singleline(&mut self.dataset_path.clone()).desired_width(260.0));
+                #[cfg(not(all(target_os = "windows", feature = "gui")))]
                 if ui.add_enabled(file_ops_enabled, egui::Button::new("Open…")).clicked() {
                     if let Some(p) = open_dataset_dialog(&self.dataset_path) {
                         self.dataset_path = p.to_string_lossy().to_string();

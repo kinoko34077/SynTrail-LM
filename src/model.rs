@@ -733,6 +733,23 @@ impl ModelState {
         self.expose_with_turn_boundary(text);
     }
 
+    /// §31/§32: Expose a supervised (prompt, response) pair as one unified experience.
+    ///
+    /// Training sequence: prompt + TURN_BOUNDARY + response + SEQUENCE_END.
+    /// The entire pair is a single Experience — boundary semantics live here, not in the
+    /// Trainer, so callers never assemble the separator string themselves.
+    pub fn expose_supervised_pair(&mut self, prompt: &str, response: &str) {
+        let text = format!("{}{}{}{}", prompt, TURN_BOUNDARY_CHAR, response, SEQUENCE_END_CHAR);
+        self.expose_external(&text);
+    }
+
+    /// §31/§32: Replay a supervised (prompt, response) pair (internal reprocessing,
+    /// does not update external observation stats or Adjacency).
+    pub fn replay_supervised_pair(&mut self, prompt: &str, response: &str) {
+        let text = format!("{}{}{}{}", prompt, TURN_BOUNDARY_CHAR, response, SEQUENCE_END_CHAR);
+        self.replay(&text);
+    }
+
     /// Allocate the next trace ID (monotonically increasing).
     pub fn alloc_trace_id(&mut self) -> TraceId {
         self.next_trace_id += 1;
@@ -1458,5 +1475,43 @@ mod tests {
         }
         assert!(found_matching >= 2,
             "at least the primitive-only view and the chunked view must share identity; got {found_matching}");
+    }
+
+    // ── §31/§32: expose_supervised_pair / replay_supervised_pair ──────────
+
+    #[test]
+    fn sft_api_expose_supervised_pair_does_not_panic() {
+        let mut m = ModelState::new();
+        m.expose_supervised_pair("What is 2+2?", "4");
+        m.expose_supervised_pair("Hello", "Hi there");
+        m.expose_supervised_pair("", "empty prompt");
+        m.expose_supervised_pair("has prompt", "");
+    }
+
+    #[test]
+    fn sft_api_replay_supervised_pair_does_not_update_metrics() {
+        let mut m = ModelState::new();
+        // Seed some knowledge so replay has content to work with.
+        m.expose_supervised_pair("question", "answer");
+        let chars_before = m.metrics.total_characters;
+        let decisions_before = m.metrics.total_decisions;
+        m.replay_supervised_pair("question", "answer");
+        assert_eq!(m.metrics.total_characters, chars_before,
+            "SFT-replay: replay must not update total_characters");
+        assert_eq!(m.metrics.total_decisions, decisions_before,
+            "SFT-replay: replay must not update total_decisions");
+    }
+
+    #[test]
+    fn sft_api_expose_pair_uses_turn_and_seq_boundaries() {
+        let mut m = ModelState::new();
+        // Train enough that TURN_BOUNDARY and SEQUENCE_END become registered primitives.
+        for _ in 0..5 {
+            m.expose_supervised_pair("hello", "world");
+        }
+        assert!(m.turn_boundary_unit().is_some(),
+            "SFT: TURN_BOUNDARY_CHAR must be registered after supervised exposure");
+        assert!(m.sequence_end_unit().is_some(),
+            "SFT: SEQUENCE_END_CHAR must be registered after supervised exposure");
     }
 }

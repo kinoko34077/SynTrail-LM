@@ -69,7 +69,6 @@ struct CheckpointInfo {
     accuracy: f64,
 }
 
-#[derive(Debug)]
 #[allow(dead_code, clippy::enum_variant_names)]
 enum TrainerEvent {
     BlockStarted(BlockInfo),
@@ -80,7 +79,8 @@ enum TrainerEvent {
     Saved,
     Paused,
     Stopped,
-    Completed(usize),
+    /// §39: carries the finished model so the UI takes ownership without a disk re-read.
+    Completed(usize, Box<ModelState>),
     Error(String),
     Analytics(Box<Analytics>),
 }
@@ -175,7 +175,8 @@ fn worker_main(
                 tr_state.status = TrainerStatus::Completed;
                 tr_state.model_fingerprint = model.state_fingerprint();
                 do_save(&model, &model_path, &tr_state, &ev_tx);
-                let _ = ev_tx.send(TrainerEvent::Completed(block_idx));
+                // §39: transfer model ownership to UI; no disk re-read needed.
+                let _ = ev_tx.send(TrainerEvent::Completed(block_idx, Box::new(model)));
                 return;
             }
         };
@@ -576,10 +577,12 @@ impl TrainerApp {
                     self.status_msg = "Stopped and saved.".to_owned();
                 }
             }
-            TrainerEvent::Completed(n) => {
+            TrainerEvent::Completed(n, trained_model) => {
                 if let Some(h) = self.worker.take() { let _ = h.join(); }
                 self.cmd_tx = None;
                 self.event_rx = None;
+                // §39: take ownership of the trained model so Save/Save As uses it.
+                self.loaded_model = Some(*trained_model);
                 self.state = AppState::Completed(n);
                 self.status_msg = format!("Training complete — {} blocks processed.", n);
             }

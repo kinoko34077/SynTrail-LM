@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process;
 
+use syntrail_lm::app::{load_model_file, save_model_file};
 use syntrail_lm::config::Config;
 use syntrail_lm::eval::evaluate_frozen;
 use syntrail_lm::feedback::{FeedbackSign, FeedbackSource};
@@ -57,7 +58,7 @@ fn default_db_path() -> String { "syntrail.db".to_string() }
 
 fn load_model(path: &Path) -> ModelState {
     if path.exists() {
-        persistence::load(path).unwrap_or_else(|e| {
+        load_model_file(path).unwrap_or_else(|e| {
             eprintln!("Failed to load model from {}: {e}", path.display());
             process::exit(1);
         })
@@ -67,7 +68,7 @@ fn load_model(path: &Path) -> ModelState {
 }
 
 fn save_model(model: &ModelState, path: &Path) {
-    persistence::save(model, path).unwrap_or_else(|e| {
+    save_model_file(model, path).unwrap_or_else(|e| {
         eprintln!("Failed to save model to {}: {e}", path.display());
         process::exit(1);
     });
@@ -272,7 +273,7 @@ fn cmd_snapshot(args: &[String]) {
     });
     println!("Snapshot saved: id={sid} tick={}", session.model.tick);
     if let Some(path) = model_path {
-        persistence::save(&session.model, &path).unwrap_or_else(|e| {
+        save_model_file(&session.model, &path).unwrap_or_else(|e| {
             eprintln!("save error: {e}"); process::exit(1);
         });
         println!("Model also saved to {}", path.display());
@@ -292,7 +293,7 @@ fn cmd_restore(args: &[String]) {
     });
     println!("Restored from snapshot {snapshot_id}. tick={}", session.model.tick);
     if let Some(path) = model_path {
-        persistence::save(&session.model, &path).unwrap_or_else(|e| {
+        save_model_file(&session.model, &path).unwrap_or_else(|e| {
             eprintln!("save error: {e}"); process::exit(1);
         });
         println!("Model also saved to {}", path.display());

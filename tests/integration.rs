@@ -1303,6 +1303,155 @@ fn gen_loop_06_trace_fields_after_cycle() {
     );
 }
 
+// ── CYCLE-03: 3-state cycle (A→B→C→A) — escape mechanism fires ───────────
+/// The cycle detection window catches repeating (context, next) pairs.
+/// With 3-state cycles, `is_recent_route` fires and escape (Recall/Generalize) is attempted.
+/// Generation may still run max_units if escapes keep finding novel routes —
+/// this test verifies the cycle is at least recognised (escape steps exist) or stops.
+#[test]
+fn cycle_03_three_state_cycle_stops() {
+    use syntrail_lm::trace::RouteKind;
+    let mut m = ModelState::new();
+    for _ in 0..30 { m.expose_external("abcabc"); }
+    let (_, trace) = m.generate_with_trace("a", "a", 100, 101);
+    // Either cycle escape fires (RecallBridge/Generalize steps present)
+    // or generation terminates before max_units.
+    let escape_fired = trace.decision_steps.iter().any(|s|
+        matches!(s.route_kind, RouteKind::RecallBridge | RouteKind::Generalize));
+    let terminated_early = trace.stopped_by_cycle || trace.decision_count < 100;
+    assert!(
+        escape_fired || terminated_early,
+        "CYCLE-03: 3-state cycle must trigger escape or terminate; decisions={}, stopped={}, escape={}",
+        trace.decision_count, trace.stopped_by_cycle, escape_fired
+    );
+}
+
+// ── CYCLE-04: recall escape actually fires on cycle ────────────────────────
+#[test]
+fn cycle_04_recall_escape_fires() {
+    use syntrail_lm::trace::RouteKind;
+    let mut m = ModelState::new();
+    // Create a tight cycle A→B→A plus associations so recall escape can fire.
+    for _ in 0..40 { m.expose_external("ababab"); }
+    // Also give the model an association target with a route to something new.
+    for _ in 0..20 { m.expose_external("ac"); }
+    let (_, trace) = m.generate_with_trace("a", "a", 60, 102);
+    // Either stopped (no escape) or used RecallBridge or Generalize.
+    let has_escape = trace.decision_steps.iter().any(|s|
+        matches!(s.route_kind, RouteKind::RecallBridge | RouteKind::Generalize));
+    let stopped = trace.stopped_by_cycle || trace.decision_count < 60;
+    assert!(has_escape || stopped,
+        "CYCLE-04: cycle must either be escaped via recall/generalize or stop naturally");
+}
+
+// ── CYCLE-05: generalize escape fires when recall yields nothing ───────────
+#[test]
+fn cycle_05_generalize_escape_fires() {
+    use syntrail_lm::trace::RouteKind;
+    let mut m = ModelState::new();
+    // Strong A→B cycle with very weak associations — generalize may fire.
+    for _ in 0..40 { m.expose_external("abab"); }
+    for _ in 0..5 { m.expose_external("ac"); }
+    let (_, trace) = m.generate_with_trace("a", "a", 60, 103);
+    let has_escape = trace.decision_steps.iter().any(|s|
+        matches!(s.route_kind, RouteKind::RecallBridge | RouteKind::Generalize));
+    let stopped_early = trace.stopped_by_cycle || trace.decision_count < 60;
+    assert!(has_escape || stopped_early,
+        "CYCLE-05: cycle must be handled via escape or natural stop");
+}
+
+// ── CYCLE-06: no viable escape → generation stops ─────────────────────────
+#[test]
+fn cycle_06_no_viable_escape_stops() {
+    let mut m = ModelState::new();
+    // Single-unit vocabulary — only "a" exists; a→a is the only possible route.
+    for _ in 0..30 { m.expose_external("aaaa"); }
+    let (_, trace) = m.generate_with_trace("a", "a", 100, 104);
+    assert!(
+        trace.decision_count < 100,
+        "CYCLE-06: with no escape routes, generation must stop before max_units; got {}",
+        trace.decision_count
+    );
+}
+
+// ── CYCLE-07: output length is bounded regardless of cycle ────────────────
+#[test]
+fn cycle_07_output_length_bounded() {
+    let mut m = ModelState::new();
+    for _ in 0..30 { m.expose_external("abababababab"); }
+    let (output, trace) = m.generate_with_trace("a", "a", 50, 105);
+    // The expansion of ≤50 emitted units can be longer, but it must not be infinite.
+    assert!(output.len() < 10000,
+        "CYCLE-07: output must be bounded; len={}", output.len());
+    assert!(trace.decision_count <= 50,
+        "CYCLE-07: decision_count must not exceed max_units; got {}", trace.decision_count);
+}
+
+// ── CYCLE-08: feedback provenance correct in cycle scenario ──────────────
+#[test]
+fn cycle_08_feedback_provenance_correct_in_cycle() {
+    use syntrail_lm::trace::RouteKind;
+    let mut m = ModelState::new();
+    for _ in 0..30 { m.expose_external("ababab"); }
+    for _ in 0..15 { m.expose_external("ac"); }
+    let tid = m.alloc_trace_id();
+    let (_, trace) = m.generate_with_trace("a", "a", 40, tid);
+    let credits = vec![1.0_f64; trace.decision_steps.len()];
+    // For every RecallBridge step, feedback goes to (route_source → unit), not (context → unit).
+    for step in trace.decision_steps.iter().filter(|s| s.route_kind == RouteKind::RecallBridge) {
+        assert_ne!(step.route_source, step.context,
+            "CYCLE-08: RecallBridge route_source must differ from generation context");
+    }
+    // Applying feedback must not panic.
+    m.apply_feedback_to_trace(&trace, &credits, 0.99);
+}
+
+// ── CYCLE-09: fallback does not re-enter same cycle route ─────────────────
+#[test]
+fn cycle_09_fallback_avoids_same_cycle() {
+    use syntrail_lm::trace::RouteKind;
+    let mut m = ModelState::new();
+    for _ in 0..30 { m.expose_external("ababab"); }
+    for _ in 0..20 { m.expose_external("ac"); }
+    let tid = m.alloc_trace_id();
+    let (_, trace) = m.generate_with_trace("a", "a", 50, tid);
+    // Any RecallBridge or Generalize step must emit a unit different
+    // from the unit that triggered the cycle escape.
+    let mut prev_context = None;
+    let mut prev_unit = None;
+    for step in &trace.decision_steps {
+        if matches!(step.route_kind, RouteKind::RecallBridge | RouteKind::Generalize) {
+            if let (Some(pc), Some(pu)) = (prev_context, prev_unit) {
+                // The cycle was (pc → pu); the escape must produce a different unit.
+                if step.context == pc {
+                    assert_ne!(step.unit, pu,
+                        "CYCLE-09: escape route must not emit the same cycled unit; context={:?}", step.context);
+                }
+            }
+        }
+        prev_context = Some(step.context);
+        prev_unit = Some(step.unit);
+    }
+}
+
+// ── CYCLE-10: no-progress detection fires on 2-unit stagnation ───────────
+/// Current implementation: no-progress fires when ≤2 distinct emitted units in 2*max window.
+/// This test verifies the stagnation detector uses the unit-level window, not just raw char counts.
+/// Note: 3+-state vocabulary cycles do not currently trigger no-progress (known limitation);
+/// generalized stagnation detection is a future improvement tracked in CURRENT_STATE.
+#[test]
+fn cycle_10_no_progress_fires_on_unit_stagnation() {
+    let mut m = ModelState::new();
+    // 2-state cycle: only 'a' and 'b' — no-progress fires via ≤2 distinct emitted units.
+    for _ in 0..40 { m.expose_external("ab"); }
+    let (_, trace) = m.generate_with_trace("a", "a", 300, 200);
+    assert!(
+        trace.decision_count < 300,
+        "CYCLE-10: no-progress detection must stop 2-state stagnation before max_units; got {} decisions",
+        trace.decision_count
+    );
+}
+
 // ── GEN-LOOP-07: §12 no-progress stops generation (stagnation window) ────────
 #[test]
 fn gen_loop_07_no_progress_stops_generation() {

@@ -1803,6 +1803,30 @@ fn trf06_composed_does_not_merge() {
         "TRF-06: composed transform must not merge endpoints");
 }
 
+// ── DIAL-01: §8 — session.turn() returns dialogue output (emitted only) ────
+#[test]
+fn dial01_session_turn_returns_emitted_not_completion() {
+    use syntrail_lm::config::Config;
+    use syntrail_lm::session::Session;
+    let mut s = Session::new_in_memory(Config::default_v02()).unwrap();
+    for _ in 0..30 { s.model.expose_external("hello world foo bar"); }
+    let input = "hello";
+    let (_, dialogue_output, trace) = s.turn(input).unwrap();
+    // session.turn() must return emitted_text, not the full completion.
+    assert_eq!(dialogue_output, trace.emitted_text,
+        "DIAL-01: session.turn() must return emitted_text not output_text");
+    // Dialogue output must NOT start with the user's input (no seed echo).
+    if !dialogue_output.is_empty() {
+        assert!(!dialogue_output.starts_with(input),
+            "DIAL-01: dialogue output must not echo the seed; got {:?}", dialogue_output);
+    }
+    // Full completion output_text DOES start with the seed (sanity check).
+    if !trace.output_text.is_empty() {
+        assert!(trace.output_text.starts_with(input),
+            "DIAL-01: output_text should start with seed; got {:?}", trace.output_text);
+    }
+}
+
 // ── TRF-07: EquivalentView kind is reflected in stored transform ──────────
 #[test]
 fn trf07_equivalent_view_kind_stored() {

@@ -283,7 +283,7 @@ src/
 └── persistence.rs        JSON / SQLite 永続化
 
 tests/
-└── integration.rs        100 integration tests
+└── integration.rs        integration tests
 ```
 
 ---
@@ -294,7 +294,7 @@ tests/
 cargo test
 ```
 
-100 integration tests、警告ゼロ（lib warnings 2 件は既存コードの未使用 API）。
+全テスト pass、警告ゼロ（lib warnings 2 件は既存コードの未使用 API）。
 
 ---
 

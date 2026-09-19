@@ -25,6 +25,10 @@ impl BlockLevel {
     pub fn label(self) -> &'static str {
         match self { Self::S => "S", Self::M => "M", Self::L => "L", Self::XL => "XL" }
     }
+    /// §15: [min, max] line range for deterministic block-size jitter.
+    pub fn jitter_range(self) -> (usize, usize) {
+        match self { Self::S => (3, 5), Self::M => (6, 10), Self::L => (12, 20), Self::XL => (24, 40) }
+    }
 }
 
 // ── Block-size adaptive decision ─────────────────────────────────────────

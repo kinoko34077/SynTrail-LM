@@ -3,8 +3,17 @@
 /// Deliberately separate from the model file (§11 / §12).
 /// Fingerprints guard against applying stale progress to a changed model or dataset.
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use super::adaptive::BlockLevel;
+
+/// §15: Generate a non-zero seed for deterministic block-size jitter.
+fn generate_split_seed() -> u64 {
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seed = (t.as_nanos() as u64).wrapping_mul(6364136223846793005)
+        .wrapping_add(t.as_millis() as u64);
+    if seed == 0 { 1 } else { seed }
+}
 
 const STATE_VERSION: &str = "1";
 
@@ -53,6 +62,9 @@ pub struct TrainerState {
     /// Both the model file and trainer state carry the same value when saved together.
     #[serde(default)]
     pub checkpoint_generation: u64,
+    /// §15: Deterministic block-boundary jitter seed. 0 = legacy fixed behavior.
+    #[serde(default)]
+    pub split_seed: u64,
 }
 
 impl TrainerState {
@@ -83,6 +95,7 @@ impl TrainerState {
             model_fingerprint,
             status: TrainerStatus::Ready,
             checkpoint_generation: 0,
+            split_seed: generate_split_seed(),
         }
     }
 

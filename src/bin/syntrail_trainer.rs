@@ -138,10 +138,11 @@ fn worker_main(
     let resume_pre_dpc = tr_state.current_block_pre_dpc;
     let is_resuming = resume_repeat > 0 && resume_block_start < total_bytes;
 
-    let mut splitter = BlockSplitter::with_cursor(
+    let mut splitter = BlockSplitter::with_seed(
         dataset.normalized.clone(),
         tr_state.block_level,
         if is_resuming { resume_block_start } else { tr_state.cursor },
+        tr_state.split_seed,
     );
 
     macro_rules! check_cmd {
@@ -224,10 +225,11 @@ fn worker_main(
         // Get the current block.
         let block = match if is_resuming && block_idx == resume_block_idx {
             // Re-read the in-progress block from its start.
-            let mut tmp = BlockSplitter::with_cursor(
+            let mut tmp = BlockSplitter::with_seed(
                 dataset.normalized.clone(),
                 tr_state.block_level,
                 resume_block_start,
+                tr_state.split_seed,
             );
             tmp.next_block()
         } else {

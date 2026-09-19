@@ -21,16 +21,23 @@ pub struct BlockSplitter {
     source: String,
     cursor: usize,
     level: BlockLevel,
+    /// §15: 0 = legacy fixed behavior; non-zero = deterministic jitter seed.
+    split_seed: u64,
 }
 
 impl BlockSplitter {
     pub fn new(source: String, level: BlockLevel) -> Self {
-        Self { source, cursor: 0, level }
+        Self { source, cursor: 0, level, split_seed: 0 }
     }
 
     /// Restore from a saved cursor (used on Resume).
     pub fn with_cursor(source: String, level: BlockLevel, cursor: usize) -> Self {
-        Self { source, cursor, level }
+        Self { source, cursor, level, split_seed: 0 }
+    }
+
+    /// §15: Restore from a saved cursor with a deterministic jitter seed.
+    pub fn with_seed(source: String, level: BlockLevel, cursor: usize, split_seed: u64) -> Self {
+        Self { source, cursor, level, split_seed }
     }
 
     pub fn is_done(&self) -> bool { self.cursor >= self.source.len() }
@@ -44,7 +51,8 @@ impl BlockSplitter {
 
         let start = self.cursor;
         let remaining = &self.source[start..];
-        let end_off = find_block_end(remaining, self.level.target_lines(), self.level.max_chars());
+        let target = jitter_target_lines(self.split_seed, start, self.level);
+        let end_off = find_block_end(remaining, target, self.level.max_chars());
         let end = start + end_off;
 
         let text = self.source[start..end].to_owned();
@@ -57,10 +65,24 @@ impl BlockSplitter {
         if self.is_done() { return None; }
         let start = self.cursor;
         let remaining = &self.source[start..];
-        let end_off = find_block_end(remaining, self.level.target_lines(), self.level.max_chars());
+        let target = jitter_target_lines(self.split_seed, start, self.level);
+        let end_off = find_block_end(remaining, target, self.level.max_chars());
         let end = start + end_off;
         Some(Block { text: self.source[start..end].to_owned(), start, end })
     }
+}
+
+/// §15: Deterministic block target-line count from seed + block_start + level.
+/// Returns `level.target_lines()` when seed is 0 (legacy fixed behavior).
+pub fn jitter_target_lines(seed: u64, block_start: usize, level: BlockLevel) -> usize {
+    if seed == 0 { return level.target_lines(); }
+    let (min, max) = level.jitter_range();
+    let level_id = match level { BlockLevel::S => 0u64, BlockLevel::M => 1, BlockLevel::L => 2, BlockLevel::XL => 3 };
+    let h = seed
+        .wrapping_add(block_start as u64)
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(level_id);
+    min + (h as usize) % (max - min + 1)
 }
 
 /// Compute how many bytes (from the *start* of `text`) belong to one block.
@@ -172,5 +194,85 @@ mod tests {
             assert_eq!(b2a.text, b2b.text, "cursor restore: block text differs");
         }
         let _ = b1;
+    }
+
+    // ── §16: Boundary Jitter acceptance tests ────────────────────────────
+
+    fn concat_with_seed(source: &str, level: BlockLevel, seed: u64) -> String {
+        let mut sp = BlockSplitter::with_seed(source.to_owned(), level, 0, seed);
+        let mut out = String::new();
+        while let Some(b) = sp.next_block() { out.push_str(&b.text); }
+        out
+    }
+
+    #[test]
+    fn tr_split_j01_concat_equals_source() {
+        let src = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt";
+        for seed in [0u64, 1, 42, 99999, u64::MAX / 2] {
+            assert_eq!(concat_with_seed(src, BlockLevel::S, seed), src,
+                "TR-SPLIT-J01: concat != source (seed={seed})");
+        }
+    }
+
+    #[test]
+    fn tr_split_j04_same_seed_cursor_level_same_block() {
+        let src = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj";
+        let seed = 12345u64;
+        let b1a = BlockSplitter::with_seed(src.to_owned(), BlockLevel::S, 0, seed)
+            .peek_block().unwrap().text;
+        let b1b = BlockSplitter::with_seed(src.to_owned(), BlockLevel::S, 0, seed)
+            .peek_block().unwrap().text;
+        assert_eq!(b1a, b1b, "TR-SPLIT-J04: same seed+cursor+level → different block");
+    }
+
+    #[test]
+    fn tr_split_j05_resume_mid_block_matches() {
+        let src = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl";
+        let seed = 777u64;
+        let mut sp = BlockSplitter::with_seed(src.to_owned(), BlockLevel::S, 0, seed);
+        let b1 = sp.next_block().unwrap();
+        let cursor = sp.cursor();
+        let b2a = sp.next_block().unwrap().text;
+        let b2b = BlockSplitter::with_seed(src.to_owned(), BlockLevel::S, cursor, seed)
+            .next_block().unwrap().text;
+        assert_eq!(b2a, b2b, "TR-SPLIT-J05: resume mid-block differs");
+        let _ = b1;
+    }
+
+    #[test]
+    fn tr_split_j06_different_seeds_change_boundaries() {
+        let src = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np";
+        let mut seen = std::collections::HashSet::new();
+        for seed in [1u64, 2, 3, 100, 999, 12345] {
+            let b = BlockSplitter::with_seed(src.to_owned(), BlockLevel::S, 0, seed)
+                .next_block().unwrap().end;
+            seen.insert(b);
+        }
+        assert!(seen.len() > 1, "TR-SPLIT-J06: all seeds produce identical boundary");
+    }
+
+    #[test]
+    fn tr_split_j07_max_chars_maintained() {
+        // A block of 1000-char lines — jitter must not exceed max_chars.
+        let long_line = "x".repeat(1000);
+        let src: Vec<&str> = (0..20).map(|_| long_line.as_str()).collect::<Vec<_>>();
+        let src_joined = src.join("\n");
+        for seed in [0u64, 42, 12345] {
+            let mut sp = BlockSplitter::with_seed(src_joined.clone(), BlockLevel::S, 0, seed);
+            while let Some(b) = sp.next_block() {
+                assert!(b.text.chars().count() <= BlockLevel::S.max_chars() + long_line.len() + 1,
+                    "TR-SPLIT-J07: block exceeds max_chars (seed={seed})");
+            }
+        }
+    }
+
+    #[test]
+    fn tr_split_j_legacy_zero_seed_fixed_boundaries() {
+        let src = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj";
+        let legacy = BlockSplitter::with_seed(src.to_owned(), BlockLevel::S, 0, 0)
+            .peek_block().unwrap().end;
+        let fixed  = BlockSplitter::with_cursor(src.to_owned(), BlockLevel::S, 0)
+            .peek_block().unwrap().end;
+        assert_eq!(legacy, fixed, "TR-SPLIT-J: seed=0 must match legacy with_cursor");
     }
 }

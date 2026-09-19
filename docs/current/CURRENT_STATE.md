@@ -1,6 +1,6 @@
 # 現在の実装状態
 
-最終確認: 2026-09-19 (§58 accuracy pass)  
+最終確認: 2026-09-19 (§8 SQLite BLOB pass)  
 crate version: 0.5.0  
 integration tests: 157 (+ 219 unit tests = 376 total)
 
@@ -60,6 +60,7 @@ integration tests: 157 (+ 219 unit tests = 376 total)
 - **STM container format** (STM1 header + Zstd compression; backward compat) ← §11/§12
 - **Lineage deduplication removed** (lineage_entries=[] in new saves; reconstructed from chunks) ← §19
 - **Source-grouped Prediction/Association storage** (context/source once per group) ← §25/§26
+- **SQLite BLOB snapshots** (bincode BLOB in blob_data column; legacy JSON fallback) ← §8
 
 ---
 

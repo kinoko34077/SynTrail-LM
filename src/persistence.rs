@@ -857,18 +857,17 @@ pub fn profile_storage(model: &ModelState) -> StorageProfile {
     }
 
     let sections = vec![
-        section!("primitives",           snap.primitives),
-        section!("chunks",               snap.chunks),
-        section!("prediction_edges",     snap.prediction_edges),
-        section!("association_edges",    snap.association_edges),
-        section!("merge_candidates",     snap.merge_candidates),
-        section!("identities",           snap.identities),
-        section!("identity_parent",      snap.identity_parent),
-        section!("views",                snap.views),
-        section!("lineage_entries",      snap.lineage_entries),
-        section!("representation_entries", snap.representation_entries),
-        section!("transforms",           snap.transforms),
-        section!("merge_right_reuse",    snap.merge_right_reuse),
+        section!("primitives",              snap.primitives),
+        section!("chunks",                  snap.chunks),
+        section!("prediction_edge_groups",  snap.prediction_edge_groups),
+        section!("association_edge_groups", snap.association_edge_groups),
+        section!("merge_candidates",        snap.merge_candidates),
+        section!("identities",              snap.identities),
+        section!("identity_parent",         snap.identity_parent),
+        section!("views",                   snap.views),
+        section!("representation_entries",  snap.representation_entries),
+        section!("transforms",              snap.transforms),
+        section!("merge_right_reuse",       snap.merge_right_reuse),
         section_scalar!("metrics",       snap.metrics),
     ];
 

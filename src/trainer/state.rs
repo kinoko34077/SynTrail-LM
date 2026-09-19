@@ -106,10 +106,13 @@ impl TrainerState {
         dir.join(format!("{}.syntrail-trainer.json", stem.to_string_lossy()))
     }
 
+    /// §38: Write to a temp file then rename so a crash mid-write never corrupts the state file.
     pub fn save(&self, dataset_path: &Path) -> Result<(), String> {
         let path = Self::state_file_path(dataset_path);
+        let tmp = path.with_extension("tmp");
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| e.to_string())
+        std::fs::write(&tmp, &json).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
     }
 
     pub fn load(dataset_path: &Path) -> Result<Self, String> {

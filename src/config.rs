@@ -65,13 +65,9 @@ pub struct Config {
     pub association_decay: f64,
     /// Decay for the avoidance field (§19).
     pub avoidance_decay: f64,
-    /// Generation tunables (route_top_k, cycle_penalty, recent_routes_max).
-    pub generation: GenerationConfig,
-    // ── v0.4 Residency (§10, §41) ──────────────────────────────────────────
-    /// Maximum number of HOT chunks. 0 = unlimited.
-    pub hot_budget: usize,
     // ── v0.5 Memory Budget (§14-§16) ──────────────────────────────────────
-    /// Memory budget tunables (HOT chunk cap etc.).
+    /// Memory budget tunables (HOT chunk cap etc.). Canonical HOT-chunk cap.
+    /// §20: Use memory_budget.hot_chunks_max — not a separate hot_budget field.
     pub memory_budget: MemoryBudgetConfig,
     // ── v0.5 Learning tunables (§17) ──────────────────────────────────────
     /// Learning tunables (factorization_scale etc.).
@@ -97,8 +93,6 @@ impl Config {
             association_top_k: 32,
             association_decay: 0.99,
             avoidance_decay: 0.99,
-            generation: GenerationConfig::default(),
-            hot_budget: 0,
             memory_budget: MemoryBudgetConfig::default(),
             learning: LearningConfig::default(),
         }

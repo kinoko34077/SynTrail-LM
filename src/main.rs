@@ -89,6 +89,7 @@ fn cmd_train(args: &[String]) {
         eprintln!("--input <file> required"); process::exit(1);
     });
     let model_path = flag_path(args, "--model").unwrap_or_else(default_model_path);
+    // §20: hot budget comes from memory_budget.hot_chunks_max (Config SSOT).
     let hot_budget: usize = flag_value(args, "--hot-budget")
         .and_then(|v| v.parse().ok()).unwrap_or(0);
     let text = std::fs::read_to_string(&input).unwrap_or_else(|e| {

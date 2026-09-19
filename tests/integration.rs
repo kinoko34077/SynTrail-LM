@@ -2603,3 +2603,67 @@ fn dial_03_dialogue_mode_trace_tagged() {
     assert_eq!(trace.generation_mode, GenerationMode::Dialogue,
         "DIAL-03: generate_with_trace_mode(Dialogue) must tag mode as Dialogue");
 }
+
+// ── CIDX-01: §7 — primitive gets identity immediately on first exposure ───────
+#[test]
+fn cidx_01_primitive_has_identity_after_expose() {
+    let mut m = ModelState::new();
+    m.train("ab");
+    // After training "ab", primitives for 'a' and 'b' must be in the direct index.
+    let pid_a = m.primitives.id('a').expect("CIDX-01: 'a' must be a primitive");
+    let pid_b = m.primitives.id('b').expect("CIDX-01: 'b' must be a primitive");
+    let unit_a = syntrail_lm::units::UnitId::primitive(pid_a);
+    let unit_b = syntrail_lm::units::UnitId::primitive(pid_b);
+    assert!(m.identities.identity_of_unit(unit_a).is_some(),
+        "CIDX-01: primitive 'a' must have a direct identity entry");
+    assert!(m.identities.identity_of_unit(unit_b).is_some(),
+        "CIDX-01: primitive 'b' must have a direct identity entry");
+    // Each primitive must have its own distinct identity.
+    let iid_a = m.identities.identity_of_unit(unit_a).unwrap();
+    let iid_b = m.identities.identity_of_unit(unit_b).unwrap();
+    assert_ne!(iid_a, iid_b, "CIDX-01: distinct characters must have distinct identities");
+}
+
+// ── CIDX-02: §7 — chunk gets identity right at formation (before single-element view) ─
+#[test]
+fn cidx_02_chunk_has_identity_at_formation() {
+    let mut m = ModelState::new();
+    // Train enough to trigger chunk formation.
+    for _ in 0..30 { m.train("ab"); }
+    assert!(m.chunk_count() > 0, "CIDX-02: chunk must have formed");
+    // Every chunk must be in the direct index.
+    for cid in 0..m.chunk_count() as u32 {
+        let unit = syntrail_lm::units::UnitId::chunk(cid);
+        assert!(m.identities.identity_of_unit(unit).is_some(),
+            "CIDX-02: chunk C({cid}) must have a direct identity entry");
+    }
+}
+
+// ── CIDX-03: §7 — unit identity survives save/load; rebuild_unit_identities works ─
+#[test]
+fn cidx_03_identity_index_survives_roundtrip() {
+    let mut m = ModelState::new();
+    for _ in 0..30 { m.train("abc"); }
+    assert!(m.chunk_count() > 0, "CIDX-03: chunk must have formed");
+
+    // Collect identities before save.
+    let before: Vec<_> = (0..m.chunk_count() as u32)
+        .map(|cid| {
+            let u = syntrail_lm::units::UnitId::chunk(cid);
+            m.identities.identity_of_unit(u)
+        })
+        .collect();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    persistence::save(&m, tmp.path()).unwrap();
+    let loaded = persistence::load(tmp.path()).unwrap();
+
+    // After load: same identity for each chunk.
+    let after: Vec<_> = (0..loaded.chunk_count() as u32)
+        .map(|cid| {
+            let u = syntrail_lm::units::UnitId::chunk(cid);
+            loaded.identities.identity_of_unit(u)
+        })
+        .collect();
+    assert_eq!(before, after, "CIDX-03: unit identity index must match after save/load");
+}

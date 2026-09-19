@@ -179,6 +179,15 @@ impl ModelState {
             return;
         }
 
+        // §7: register each primitive's single-element identity on first encounter.
+        for &pid in &prim_ids {
+            let unit = UnitId::primitive(pid);
+            if self.identities.identity_of_unit(unit).is_none() {
+                let iid = self.identities.intern_identity(&[pid]);
+                self.identities.register_unit_identity(unit, iid);
+            }
+        }
+
         let segmented = segment(&prim_ids, &self.chunks, SEGMENT_MIN_SCORE);
 
         for &unit in &segmented {
@@ -307,11 +316,8 @@ impl ModelState {
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             if let Some((unit, score)) = best {
                 if score > 0.0 {
-                    // §4: update gen_state context tracking (gen_state mutation is allowed).
-                    let prim_ids_direct: Vec<_> = self.lineage.decompose_to_primitives(context)
-                        .iter().filter_map(|u| u.as_primitive()).collect();
-                    state.current_identity = if prim_ids_direct.is_empty() { None }
-                        else { self.identities.find_identity(&prim_ids_direct) };
+                    // §4/§7: O(1) identity lookup via direct index.
+                    state.current_identity = self.identities.identity_of_unit(context);
                     state.current_rep = None;
                     return Some(NextChoice {
                         unit, score,
@@ -326,34 +332,31 @@ impl ModelState {
         // Representation predecessor chain (§5/§6): start from preferred Rn,
         // walk Rn → R(n-1) → … → R0.
         // §2: NO record_success/record_failure — Frozen Generation.
-        let prim_units = self.lineage.decompose_to_primitives(context);
-        let prim_ids: Vec<_> = prim_units.iter().filter_map(|u| u.as_primitive()).collect();
+        // §7: use the O(1) direct index for the representation-fallback identity lookup.
         let mut rep_route_source: Option<UnitId> = None;
         let mut rep_result: Option<(UnitId, f64)> = None;
         let mut winning_rep: Option<RepId> = None;
         let mut winning_identity: Option<IdentityId> = None;
-        if !prim_ids.is_empty() {
-            if let Some(id) = self.identities.find_identity(&prim_ids) {
-                winning_identity = Some(id);
-                let preferred_id = self.representations.preferred(id).map(|r| r.rep_id);
-                let mut rep_id_opt = preferred_id;
-                'chain: while let Some(rep_id) = rep_id_opt {
-                    if let Some(rep) = self.representations.get(rep_id) {
-                        for &u in rep.units.iter().rev() {
-                            if u != context {
-                                if let Some(r) = self.predictions.top1_with_score(u) {
-                                    winning_rep = Some(rep_id);
-                                    rep_result = Some(r);
-                                    rep_route_source = Some(u);
-                                    break 'chain;
-                                }
+        if let Some(id) = self.identities.identity_of_unit(context) {
+            winning_identity = Some(id);
+            let preferred_id = self.representations.preferred(id).map(|r| r.rep_id);
+            let mut rep_id_opt = preferred_id;
+            'chain: while let Some(rep_id) = rep_id_opt {
+                if let Some(rep) = self.representations.get(rep_id) {
+                    for &u in rep.units.iter().rev() {
+                        if u != context {
+                            if let Some(r) = self.predictions.top1_with_score(u) {
+                                winning_rep = Some(rep_id);
+                                rep_result = Some(r);
+                                rep_route_source = Some(u);
+                                break 'chain;
                             }
                         }
-                        // §2: do NOT call record_failure() here — Frozen Generation.
-                        rep_id_opt = rep.predecessor_rep_id;
-                    } else {
-                        break;
                     }
+                    // §2: do NOT call record_failure() here — Frozen Generation.
+                    rep_id_opt = rep.predecessor_rep_id;
+                } else {
+                    break;
                 }
             }
         }
@@ -388,6 +391,7 @@ impl ModelState {
         }
 
         // Full primitive decomposition fallback.
+        let prim_units = self.lineage.decompose_to_primitives(context);
         for &u in prim_units.iter().rev() {
             if u != context {
                 if let Some((unit, score)) = self.predictions.top1_with_score(u) {
@@ -825,6 +829,13 @@ impl ModelState {
                     let child_unit = UnitId::chunk(cid);
                     self.relations.record_derivation(left, child_unit);
                     self.relations.record_derivation(right, child_unit);
+                    // §7: register chunk→identity in the direct index.
+                    let prim_ids_chunk: Vec<_> = self.lineage.decompose_to_primitives(child_unit)
+                        .into_iter().filter_map(|u| u.as_primitive()).collect();
+                    if !prim_ids_chunk.is_empty() {
+                        let chunk_iid = self.identities.intern_identity(&prim_ids_chunk);
+                        self.identities.register_unit_identity(child_unit, chunk_iid);
+                    }
                     if let Some(chunk) = self.chunks.get_mut(cid) {
                         if chunk.use_count == 0 {
                             chunk.record_usage(self.tick);
@@ -879,6 +890,32 @@ impl ModelState {
 
     pub fn merge_candidates_iter(&self) -> impl Iterator<Item = (&(UnitId, UnitId), &u32)> {
         self.merge_candidates.iter()
+    }
+
+    /// §7: Rebuild the unit→identity direct index from primitives + chunks after load.
+    ///
+    /// Called from `from_snapshot` after all stores are restored.
+    pub fn rebuild_unit_identities(&mut self) {
+        // Primitives — IDs are 1-based (slot 0 is null); each has a single-element identity.
+        for pid in 1..=(self.primitives.len() as u32) {
+            let unit = UnitId::primitive(pid);
+            if self.identities.identity_of_unit(unit).is_none() {
+                let iid = self.identities.intern_identity(&[pid]);
+                self.identities.register_unit_identity(unit, iid);
+            }
+        }
+        // Chunks — derive identity from full primitive decomposition.
+        for (chunk_id, _left, _right) in self.lineage.all_entries() {
+            let unit = UnitId::chunk(chunk_id);
+            if self.identities.identity_of_unit(unit).is_none() {
+                let prim_ids: Vec<_> = self.lineage.decompose_to_primitives(unit)
+                    .into_iter().filter_map(|u| u.as_primitive()).collect();
+                if !prim_ids.is_empty() {
+                    let iid = self.identities.intern_identity(&prim_ids);
+                    self.identities.register_unit_identity(unit, iid);
+                }
+            }
+        }
     }
 
     /// §26: RelationStore is derived — rebuild it from canonical stores after load.
@@ -1143,8 +1180,10 @@ mod tests {
     fn expose_external_registers_identity_and_view() {
         let mut m = ModelState::new();
         m.expose_external("abc");
-        assert_eq!(m.identities.identity_count(), 1,
-            "one unique Primitive expansion → one Identity");
+        // The full "abc" sequence must have exactly one identity entry.
+        let prim_ids = m.primitives.encode_existing("abc");
+        assert!(m.identities.find_identity(&prim_ids).is_some(),
+            "one unique Primitive expansion → one Identity (§7 adds primitive identities too)");
         assert!(m.identities.view_count() >= 1,
             "at least one View should be registered");
     }
@@ -1176,18 +1215,24 @@ mod tests {
         let mut m = ModelState::new();
         m.expose_external("abc");
         m.expose_external("xyz");
-        // Two distinct Primitive expansions → two Identities
-        assert_eq!(m.identities.identity_count(), 2);
+        // Two distinct Primitive expansions → two distinct Identities.
+        // (§7 also registers individual primitive identities, so total count > 2.)
+        let id_abc = m.identities.find_identity(&m.primitives.encode_existing("abc"));
+        let id_xyz = m.identities.find_identity(&m.primitives.encode_existing("xyz"));
+        assert!(id_abc.is_some() && id_xyz.is_some(), "both texts must have identities");
+        assert_ne!(id_abc, id_xyz, "distinct texts must have distinct identities");
     }
 
     #[test]
     fn same_text_repeated_does_not_add_new_identity() {
         let mut m = ModelState::new();
         m.expose_external("hello");
+        let id_first = m.identities.find_identity(&m.primitives.encode_existing("hello"));
         m.expose_external("hello");
         m.expose_external("hello");
-        assert_eq!(m.identities.identity_count(), 1,
-            "same text repeated → same Identity");
+        let id_third = m.identities.find_identity(&m.primitives.encode_existing("hello"));
+        assert_eq!(id_first, id_third,
+            "same text repeated → same Identity (idempotent)");
     }
 
     // ── Phase 3: Representation Lineage ──────────────────────────────────

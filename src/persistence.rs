@@ -594,6 +594,8 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
     );
     // §26: rebuild RelationStore from canonical stores (Predictions, Associations, Lineage).
     model.rebuild_relations();
+    // §7: rebuild unit→identity direct index from primitives + chunks.
+    model.rebuild_unit_identities();
     model
 }
 

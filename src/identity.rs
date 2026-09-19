@@ -32,6 +32,10 @@ pub struct IdentityStore {
     unit_seq_to_id: HashMap<Vec<UnitId>, ViewId>,
     view_units: Vec<Vec<UnitId>>,
     view_identity: Vec<IdentityId>,
+
+    // §7: Content→Identity direct index — O(1) UnitId→IdentityId lookup.
+    // Populated at chunk/primitive registration time; derived on load.
+    unit_to_identity: HashMap<UnitId, IdentityId>,
 }
 
 impl IdentityStore {
@@ -55,6 +59,7 @@ impl IdentityStore {
     ///
     /// If the same unit sequence was already interned, returns its existing
     /// ViewId — the identity binding is immutable (first writer wins).
+    /// Single-element views also populate the §7 direct index.
     pub fn intern_view(&mut self, units: &[UnitId], identity: IdentityId) -> ViewId {
         if let Some(&id) = self.unit_seq_to_id.get(units) {
             return id;
@@ -63,6 +68,9 @@ impl IdentityStore {
         self.view_units.push(units.to_vec());
         self.unit_seq_to_id.insert(units.to_vec(), id);
         self.view_identity.push(identity);
+        if units.len() == 1 {
+            self.unit_to_identity.entry(units[0]).or_insert(identity);
+        }
         id
     }
 
@@ -117,6 +125,25 @@ impl IdentityStore {
         self.prim_seq_to_id.get(prims).copied()
     }
 
+    // ── §7: Content→Identity direct index ────────────────────────────────
+
+    /// Register a direct UnitId→IdentityId mapping (§7).
+    ///
+    /// Call this when a chunk is formed or a primitive is first encoded so
+    /// that `identity_of_unit` resolves in O(1) without lineage traversal.
+    /// First writer wins; idempotent for the same (unit, identity) pair.
+    pub fn register_unit_identity(&mut self, unit: UnitId, identity: IdentityId) {
+        self.unit_to_identity.entry(unit).or_insert(identity);
+    }
+
+    /// O(1) UnitId→IdentityId lookup (§7 direct index).
+    ///
+    /// Returns None if the unit was never explicitly registered via
+    /// `register_unit_identity` or `intern_view` (single-element).
+    pub fn identity_of_unit(&self, unit: UnitId) -> Option<IdentityId> {
+        self.unit_to_identity.get(&unit).copied()
+    }
+
     pub fn identity_count(&self) -> usize {
         self.identity_prims.len()
     }
@@ -167,6 +194,9 @@ impl IdentityStore {
         }
         for (units, identity) in views {
             let id = store.view_units.len() as ViewId;
+            if units.len() == 1 {
+                store.unit_to_identity.entry(units[0]).or_insert(identity);
+            }
             store.unit_seq_to_id.insert(units.clone(), id);
             store.view_units.push(units);
             store.view_identity.push(identity);

@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use crate::association::AssociationStore;
 use crate::chunks::ChunkRegistry;
 use crate::config::GenerationConfig;
-use crate::identity::IdentityStore;
+use crate::identity::{IdentityId, IdentityStore};
 use crate::lineage::LineageStore;
 use crate::prediction::PredictionStore;
 use crate::relation::{RelationKind, RelationStore};
 use crate::primitives::PrimitiveRegistry;
-use crate::representation::RepresentationStore;
+use crate::representation::{RepId, RepresentationStore};
 use crate::segmentation::{expand, segment};
 use crate::trace::{DecisionStep, RouteKind, TraceId, TurnTrace, now_secs};
 use crate::units::UnitId;
@@ -32,14 +32,24 @@ const FACTORIZATION_SCALE: f64 = 1.0;
 pub const EOS_CHAR: char = '\x03';
 
 /// P0: Per-call generation state for cycle detection and no-progress tracking.
+/// §4: also tracks the current identity/representation being generated from.
 pub struct GenerationState {
     pub step_count: usize,
     recent_routes: std::collections::VecDeque<(crate::units::UnitId, crate::units::UnitId)>,
+    /// Identity of the current context unit (updated each step).
+    pub current_identity: Option<IdentityId>,
+    /// Representation active at the current step (the one whose predecessor chain was used).
+    pub current_rep: Option<RepId>,
 }
 
 impl GenerationState {
     pub fn new() -> Self {
-        Self { step_count: 0, recent_routes: std::collections::VecDeque::new() }
+        Self {
+            step_count: 0,
+            recent_routes: std::collections::VecDeque::new(),
+            current_identity: None,
+            current_rep: None,
+        }
     }
 
     pub fn is_recent_route(&self, context: crate::units::UnitId, next: crate::units::UnitId) -> bool {
@@ -239,7 +249,8 @@ impl ModelState {
 
     /// P0: pick the best next unit for `context`, applying cycle penalty and lineage fallback.
     /// §3: records rep confidence feedback (success/failure) as we walk the predecessor chain.
-    fn pick_next_unit(&mut self, context: UnitId, state: &GenerationState) -> Option<(UnitId, f64)> {
+    /// §4: updates gen_state.current_identity and current_rep to reflect active context.
+    fn pick_next_unit(&mut self, context: UnitId, state: &mut GenerationState) -> Option<(UnitId, f64)> {
         // Direct prediction — top-K with cycle penalty.
         let candidates = self.predictions.top_k_with_score(context, self.gen_config.route_top_k);
         if !candidates.is_empty() {
@@ -250,20 +261,30 @@ impl ModelState {
                 })
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             if let Some(r @ (_, s)) = best {
-                if s > 0.0 { return Some(r); }
+                if s > 0.0 {
+                    // §4: direct hit — identity from context primitives, no specific rep.
+                    let prim_ids_direct: Vec<_> = self.lineage.decompose_to_primitives(context)
+                        .iter().filter_map(|u| u.as_primitive()).collect();
+                    state.current_identity = if prim_ids_direct.is_empty() { None }
+                        else { self.identities.find_identity(&prim_ids_direct) };
+                    state.current_rep = None;
+                    return Some(r);
+                }
             }
         }
 
-        // Representation predecessor chain (§5 + §3): start from preferred Rn,
+        // Representation predecessor chain (§5 + §3 + §4): start from preferred Rn,
         // walk Rn → R(n-1) → … → R0 before falling to structural lineage.
         // Phase 1: collect the chain and find the winning rep (immutable borrow).
         let prim_units = self.lineage.decompose_to_primitives(context);
         let prim_ids: Vec<_> = prim_units.iter().filter_map(|u| u.as_primitive()).collect();
         let mut rep_result: Option<(UnitId, f64)> = None;
-        let mut failed_reps: Vec<crate::representation::RepId> = Vec::new();
-        let mut winning_rep: Option<crate::representation::RepId> = None;
+        let mut failed_reps: Vec<RepId> = Vec::new();
+        let mut winning_rep: Option<RepId> = None;
+        let mut winning_identity: Option<IdentityId> = None;
         if !prim_ids.is_empty() {
             if let Some(id) = self.identities.find_identity(&prim_ids) {
+                winning_identity = Some(id);
                 let preferred_id = self.representations.preferred(id).map(|r| r.rep_id);
                 let mut rep_id_opt = preferred_id;
                 'chain: while let Some(rep_id) = rep_id_opt {
@@ -285,12 +306,14 @@ impl ModelState {
                 }
             }
         }
-        // Phase 2: apply confidence updates now that borrows are released.
+        // Phase 2: apply confidence updates and §4 identity/rep tracking.
         for rid in failed_reps {
             if let Some(e) = self.representations.get_mut(rid) { e.record_failure(); }
         }
         if let Some(rid) = winning_rep {
             if let Some(e) = self.representations.get_mut(rid) { e.record_success(); }
+            state.current_identity = winning_identity;
+            state.current_rep = winning_rep;
         }
         if rep_result.is_some() { return rep_result; }
 
@@ -354,7 +377,7 @@ impl ModelState {
                 .copied();
             let context = match context { Some(c) => c, None => break };
 
-            match self.pick_next_unit(context, &gen_state) {
+            match self.pick_next_unit(context, &mut gen_state) {
                 None => break,
                 Some((next, score)) => {
                     if eos == Some(next) {

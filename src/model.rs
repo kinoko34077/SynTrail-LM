@@ -330,8 +330,34 @@ impl ModelState {
                         stopped_by_eos = true;
                         break;
                     }
-                    // After cycle-penalty application, check if we're stuck.
+                    // Cycle confirmed — escalate through fallback chain (P1).
                     if gen_state.is_recent_route(context, next) {
+                        // 1. Recall: find associations, try prediction from each associate.
+                        let mut escaped = false;
+                        let associates = self.associations.recall(context, &self.chunks, 8);
+                        for (assoc, _) in associates {
+                            if assoc == context { continue; }
+                            if let Some((alt, alt_score)) = self.predictions.top1_with_score(assoc) {
+                                if !gen_state.is_recent_route(context, alt) && eos != Some(alt) {
+                                    steps.push(DecisionStep { step_index, unit: alt, context, score: alt_score });
+                                    gen_state.push_route(context, alt);
+                                    emitted_units.push(alt);
+                                    escaped = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if escaped { continue; }
+                        // 2. Generalize: association bridge for a novel next unit.
+                        if let Some((alt, alt_score)) = self.generalize(context) {
+                            if !gen_state.is_recent_route(context, alt) && eos != Some(alt) {
+                                steps.push(DecisionStep { step_index, unit: alt, context, score: alt_score });
+                                gen_state.push_route(context, alt);
+                                emitted_units.push(alt);
+                                continue;
+                            }
+                        }
+                        // 3. No escape — stop generation naturally.
                         stopped_by_cycle = true;
                         break;
                     }

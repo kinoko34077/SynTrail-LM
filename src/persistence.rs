@@ -335,7 +335,7 @@ pub fn save_with_generation(model: &ModelState, path: &Path, generation: u64) ->
 /// and skip the trainer-state pair verification on resume.
 ///
 /// Format dispatch:
-/// - `.stm` → bincode (full deserialize; no header-only path yet — §12 future)
+/// - `.stm` → STM container (§12: header + zstd-bincode; legacy raw bincode also handled)
 /// - `.db` / `.sqlite` → latest snapshot JSON in the DB
 /// - anything else → JSON
 pub fn load_checkpoint_generation(path: &Path) -> std::io::Result<u64> {

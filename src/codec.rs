@@ -12,8 +12,9 @@
 /// stored as-is; later elements store `current − previous`.  For IDs that
 /// are clustered (typical in segmented text), most deltas fit in 1-2 bytes.
 ///
-/// These encoders/decoders are used by the binary persistence layer
-/// (Phase 16) when writing model snapshots.  The JSON layer is unaffected.
+/// These encoders/decoders are NOT yet connected to the binary persistence
+/// layer — the snapshot still uses bincode with fixed-size integers.
+/// Integration is tracked as a P5 item (see CURRENT_STATE.md §58 note).
 use crate::units::UnitId;
 
 // ── LEB128 ────────────────────────────────────────────────────────────────

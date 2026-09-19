@@ -1,8 +1,8 @@
 # 現在の実装状態
 
-最終確認: 2026-09-19 (§50 accuracy pass)  
+最終確認: 2026-09-19 (§58 accuracy pass)  
 crate version: 0.5.0  
-integration tests: 149 (+ 219 unit tests = 368 total)
+integration tests: 157 (+ 219 unit tests = 376 total)
 
 ---
 
@@ -40,7 +40,7 @@ integration tests: 149 (+ 219 unit tests = 368 total)
 - **Flat Arrays / Arena Index** (Vec<PredictionEdge> + edge_index + source_index<usize>) ← Phase 15
 - **Binary Persistence** (save_binary/load_binary; save_auto/load_auto) ← Phase 16
 - **Fixed Point / Packing** (f32 in DTOs) ← Phase 17
-- **Variable-bit ID / Region Encoding** (LEB128 + zigzag delta codec) ← Phase 18
+- **Variable-bit ID codec** (LEB128 + delta encoding in codec.rs) ← Phase 18 (**codec.rs exists; NOT yet connected to binary snapshot — see P5 残課題**)
 - **Generalization / Novel Search** (generalize() + novel_candidates()) ← Phase 20
 - **Chat GUI** (eframe/egui; DocumentState dirty tracking, New Model / New Conversation)
 - **Adaptive Trainer** (S/M/L/XL block, 4→8→16→32 repeat, Pause/Resume/Stop/ErrorPaused)
@@ -53,6 +53,13 @@ integration tests: 149 (+ 219 unit tests = 368 total)
 - **Trainer Dirty Guard** (model_dirty, Save/Discard/Cancel before New/Open) ← §41
 - **TrainerMenu / OpenDataset** (trainer-specific native menu, FileCommand::OpenDataset) ← §39
 - **Native Menu as primary File UI** (toolbar file buttons hidden on Windows) ← §38
+- **Storage Profiler** (`inspect --storage`: per-section sizes, Zstd ratios, timing) ← §1/§2
+- **STM as default format** (CLI default model.stm; save dialog STM-first) ← §5/§6
+- **CLI extension-aware dispatch** (load_model_file/save_model_file used everywhere) ← §7
+- **Streaming saves** (BufWriter + serde_json::to_writer / bincode::serialize_into) ← §9/§10
+- **STM container format** (STM1 header + Zstd compression; backward compat) ← §11/§12
+- **Lineage deduplication removed** (lineage_entries=[] in new saves; reconstructed from chunks) ← §19
+- **Source-grouped Prediction/Association storage** (context/source once per group) ← §25/§26
 
 ---
 
@@ -65,7 +72,7 @@ integration tests: 149 (+ 219 unit tests = 368 total)
 | P4 | Phase I: Core/Overlay physical split final |
 | ~~P4~~ | Phase J: Generalization real unseen tests (GEN-01..04) — ✅ §48 |
 | P4 | Phase A残: docs/spec §64 8ファイル構成 + §65 template |
-| P5 | save_auto/load_auto が通常save経路に未統合 |
+| ~~P5~~ | save_auto/load_auto が通常save経路に未統合 — ✅ §7 (load_model_file/save_model_file で統合済) |
 | P5 | codec.rs が binary snapshot に未接続 |
 
 ---

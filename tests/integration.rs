@@ -1153,6 +1153,71 @@ fn gn03_novel_candidates_respects_limit() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// §48 — Generalization real tests: no direct edge, association bridge
+// ═══════════════════════════════════════════════════════════════
+
+// Setup: train "yz" to create Y→Z prediction + Y↔Z association;
+// train "yx" to create Y↔X association + Y→X prediction;
+// X has NO outgoing prediction edge (nothing follows X in training).
+// generalize(X) must reach Z via the bridge X↔Y → Y→Z.
+
+fn gen48_setup() -> (syntrail_lm::model::ModelState, syntrail_lm::units::UnitId, syntrail_lm::units::UnitId) {
+    use syntrail_lm::units::UnitId;
+    let mut m = syntrail_lm::model::ModelState::new();
+    for _ in 0..30 { m.train("yz"); }  // Y→Z edge; Y↔Z association
+    for _ in 0..30 { m.train("yx"); }  // Y↔X association; X has no successor
+    let p_x = m.primitives.id('x').unwrap();
+    let p_z = m.primitives.id('z').unwrap();
+    let ux = UnitId::primitive(p_x);
+    let uz = UnitId::primitive(p_z);
+    (m, ux, uz)
+}
+
+// ── GEN-01 (§48): X has no outgoing prediction edge ──────────────────────
+#[test]
+fn gen48_01_x_has_no_direct_prediction() {
+    let (m, ux, _) = gen48_setup();
+    let direct = m.predictions.top1_with_score(ux);
+    assert!(direct.is_none(),
+        "GEN-01: unit X must have no direct outgoing prediction edge in this setup");
+}
+
+// ── GEN-02 (§48): generalize(X) returns a result via association bridge ──
+#[test]
+fn gen48_02_generalize_returns_via_bridge() {
+    let (m, ux, _) = gen48_setup();
+    let result = m.generalize(ux);
+    assert!(result.is_some(),
+        "GEN-02: generalize(X) must return Some even when X has no direct edge");
+}
+
+// ── GEN-03 (§48): generalize(X) resolves to Z (unseen X→Z composition) ──
+#[test]
+fn gen48_03_generalize_reaches_unseen_z() {
+    let (m, ux, uz) = gen48_setup();
+    let (next, _score) = m.generalize(ux)
+        .expect("GEN-03: generalize(X) must succeed");
+    assert_eq!(next, uz,
+        "GEN-03: generalize(X) must reach Z through bridge X↔Y→Z");
+}
+
+// ── GEN-04 (§48): novel_candidates(X) includes Z with positive score ─────
+#[test]
+fn gen48_04_novel_candidates_includes_z() {
+    let (m, ux, uz) = gen48_setup();
+    let candidates = m.novel_candidates(ux, 8);
+    assert!(!candidates.is_empty(),
+        "GEN-04: novel_candidates(X) must return at least one result");
+    let found = candidates.iter().any(|(u, _)| *u == uz);
+    assert!(found,
+        "GEN-04: novel_candidates(X) must include Z (reachable via X↔Y→Z bridge)");
+    // All scores must be positive.
+    for (_, s) in &candidates {
+        assert!(*s > 0.0, "GEN-04: all candidate scores must be positive, got {s}");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // P0 Generation Tests — Cycle / No-Progress / EOS
 // ═══════════════════════════════════════════════════════════════
 

@@ -762,13 +762,16 @@ impl ModelState {
     }
 
     pub fn state_fingerprint(&self) -> String {
+        // §33: include edge-value hash so weight changes are detected,
+        // not just structural (count) changes.
         format!(
-            "tick={} prims={} chunks={} edges={} assoc={}",
+            "tick={} prims={} chunks={} edges={} assoc={} ehash={:016x}",
             self.tick,
             self.primitives.len(),
             self.chunks.len(),
             self.predictions.edge_count(),
             self.associations.edge_count(),
+            self.predictions.edge_value_hash(),
         )
     }
 

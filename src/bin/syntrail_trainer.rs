@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use syntrail_lm::app::{load_model_file, model_analytics, save_model_file, Analytics};
+use syntrail_lm::app::{load_model_file, model_analytics, save_model_file, save_model_file_with_generation, Analytics};
 use syntrail_lm::desktop::drop::{AcceptedKinds, DropResult, route_drop};
 use syntrail_lm::desktop::file_ops::{FileCommand, FileKind};
 use syntrail_lm::desktop::fonts::setup_fonts;
@@ -148,6 +148,7 @@ fn worker_main(
                     Ok(TrainerCommand::Pause) => {
                         tr_state.status = TrainerStatus::Paused;
                         tr_state.model_fingerprint = model.state_fingerprint();
+                        tr_state.checkpoint_generation = model.tick; // §32
                         // §30: Only enter Paused state if save succeeded; failure → ErrorPaused.
                         if !do_save(&model, &current_model_path, &tr_state, SaveKind::Pause, &ev_tx) {
                             // save failed — stay Running; SaveFailed already sent
@@ -231,6 +232,7 @@ fn worker_main(
             None => {
                 tr_state.status = TrainerStatus::Completed;
                 tr_state.model_fingerprint = model.state_fingerprint();
+                tr_state.checkpoint_generation = model.tick; // §32
                 do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx);
                 // §39: transfer model ownership to UI; no disk re-read needed.
                 let _ = ev_tx.send(TrainerEvent::Completed(block_idx, Box::new(model)));
@@ -296,8 +298,9 @@ fn worker_main(
                     accuracy: eval.prediction_accuracy,
                 }));
 
-                // Save at each checkpoint. §37/§30: failure stops the worker.
+                // Save at each checkpoint. §37/§30/§32: failure stops the worker.
                 tr_state.model_fingerprint = model.state_fingerprint();
+                tr_state.checkpoint_generation = model.tick; // §32
                 if !do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx) {
                     let _ = ev_tx.send(TrainerEvent::Stopped {
                         model: Box::new(model),
@@ -356,8 +359,9 @@ fn worker_main(
             syntrail_lm::trainer::adaptive::LevelChange::Keep => {}
         }
 
-        // Save after each block. §37/§30: failure stops the worker.
+        // Save after each block. §37/§30/§32: failure stops the worker.
         tr_state.model_fingerprint = model.state_fingerprint();
+        tr_state.checkpoint_generation = model.tick; // §32
         if !do_save(&model, &current_model_path, &tr_state, SaveKind::Checkpoint, &ev_tx) {
             let _ = ev_tx.send(TrainerEvent::Stopped {
                 model: Box::new(model),
@@ -373,7 +377,8 @@ fn worker_main(
     }
 }
 
-/// §29/§30: Save model + trainer state; send typed Saved/SaveFailed events.
+/// §29/§30/§32: Save model + trainer state; send typed Saved/SaveFailed events.
+/// For Checkpoint/Pause/Stop saves, embeds a checkpoint_generation in both files.
 /// Returns true on success, false on failure (failure event already sent).
 fn do_save(
     model: &ModelState,
@@ -383,7 +388,9 @@ fn do_save(
     ev_tx: &Sender<TrainerEvent>,
 ) -> bool {
     let recoverable = matches!(kind, SaveKind::Manual | SaveKind::SaveAs | SaveKind::Pause);
-    if let Err(e) = save_model_file(model, model_path) {
+    // §32: pair model + state file under a common generation ID for checkpoint saves.
+    let generation = tr_state.checkpoint_generation;
+    if let Err(e) = save_model_file_with_generation(model, model_path, generation) {
         let _ = ev_tx.send(TrainerEvent::SaveFailed {
             path: model_path.clone(),
             operation: kind,
@@ -405,7 +412,7 @@ fn do_save(
     true
 }
 
-/// §31: Save on worker exit; sends Stopped with the in-memory model regardless of save outcome.
+/// §31/§32: Save on worker exit; sends Stopped with the in-memory model regardless of save outcome.
 fn save_and_exit(
     model: ModelState,
     current_model_path: &PathBuf,
@@ -413,7 +420,9 @@ fn save_and_exit(
     ev_tx: &Sender<TrainerEvent>,
 ) {
     tr_state.model_fingerprint = model.state_fingerprint();
-    let save_result = if let Err(e) = save_model_file(&model, current_model_path) {
+    tr_state.checkpoint_generation = model.tick; // §32
+    let generation = tr_state.checkpoint_generation;
+    let save_result = if let Err(e) = save_model_file_with_generation(&model, current_model_path, generation) {
         eprintln!("save_and_exit: model save failed: {e}");
         let _ = ev_tx.send(TrainerEvent::SaveFailed {
             path: current_model_path.clone(),
@@ -565,7 +574,10 @@ impl TrainerApp {
         let tr_state = if resume {
             match &self.resume_state {
                 Some(Ok(saved)) => {
-                    match saved.verify_resume(dataset.fingerprint, &model_fp) {
+                    // §32: read checkpoint_generation from the model file to detect mismatched pairs.
+                    let model_gen = syntrail_lm::persistence::load_checkpoint_generation(&model_path)
+                        .ok(); // None if file doesn't exist or is legacy
+                    match saved.verify_resume_with_generation(dataset.fingerprint, &model_fp, model_gen) {
                         Ok(()) => saved.clone(),
                         Err(e) => {
                             self.status_msg = e;

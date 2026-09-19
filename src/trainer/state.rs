@@ -49,6 +49,10 @@ pub struct TrainerState {
     pub model_path: String,
     pub model_fingerprint: String,
     pub status: TrainerStatus,
+    /// §32: Generation ID linking this trainer state to a specific model checkpoint.
+    /// Both the model file and trainer state carry the same value when saved together.
+    #[serde(default)]
+    pub checkpoint_generation: u64,
 }
 
 impl TrainerState {
@@ -78,6 +82,7 @@ impl TrainerState {
             model_path: model_path.to_string_lossy().to_string(),
             model_fingerprint,
             status: TrainerStatus::Ready,
+            checkpoint_generation: 0,
         }
     }
 
@@ -114,6 +119,17 @@ impl TrainerState {
         dataset_fingerprint: u64,
         model_fingerprint: &str,
     ) -> Result<(), String> {
+        self.verify_resume_with_generation(dataset_fingerprint, model_fingerprint, None)
+    }
+
+    /// §32: Verify resume including checkpoint_generation pair check.
+    /// Pass `model_generation: Some(gen)` to also verify model+state were saved together.
+    pub fn verify_resume_with_generation(
+        &self,
+        dataset_fingerprint: u64,
+        model_fingerprint: &str,
+        model_generation: Option<u64>,
+    ) -> Result<(), String> {
         if self.dataset_fingerprint != dataset_fingerprint {
             return Err(
                 "Dataset has changed since last save (fingerprint mismatch). \
@@ -127,6 +143,18 @@ impl TrainerState {
                  Cannot auto-resume — the saved progress no longer matches the loaded model."
                     .to_owned(),
             );
+        }
+        // §32: generation check — skip when either side is zero (legacy files or generation unused).
+        if let Some(model_gen) = model_generation {
+            if self.checkpoint_generation != 0 && model_gen != 0
+                && self.checkpoint_generation != model_gen
+            {
+                return Err(format!(
+                    "Checkpoint generation mismatch (trainer={}, model={}). \
+                     The model and trainer state files were not saved together.",
+                    self.checkpoint_generation, model_gen
+                ));
+            }
         }
         Ok(())
     }

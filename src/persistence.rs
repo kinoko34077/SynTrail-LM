@@ -274,6 +274,9 @@ pub struct ModelSnapshot {
     /// §19: Transform entries (directed Identity relations).
     #[serde(default)]
     transforms: Vec<TransformEntryDto>,
+    /// §32: Links this model snapshot to the trainer state saved in the same operation.
+    #[serde(default)]
+    pub checkpoint_generation: u64,
 }
 
 fn default_top_k() -> usize { 32 }
@@ -283,13 +286,27 @@ fn default_decay() -> f64 { 0.99 }
 
 /// Save to JSON (human-readable).
 pub fn save(model: &ModelState, path: &Path) -> std::io::Result<()> {
-    let snapshot = to_snapshot(model);
+    save_with_generation(model, path, 0)
+}
+
+/// §32: Save to JSON and embed a checkpoint_generation for trainer-state pairing.
+pub fn save_with_generation(model: &ModelState, path: &Path, generation: u64) -> std::io::Result<()> {
+    let mut snapshot = to_snapshot(model);
+    snapshot.checkpoint_generation = generation;
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     // §38: write to temp file beside the target then rename atomically.
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, path)
+}
+
+/// §32: Read only the checkpoint_generation from a model file without loading the full model.
+pub fn load_checkpoint_generation(path: &Path) -> std::io::Result<u64> {
+    let json = std::fs::read_to_string(path)?;
+    let snapshot: ModelSnapshot = serde_json::from_str(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(snapshot.checkpoint_generation)
 }
 
 /// Load from JSON.
@@ -416,6 +433,7 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         identity_parent,
         representation_entries,
         transforms,
+        checkpoint_generation: 0,
     }
 }
 

@@ -60,6 +60,24 @@ pub fn save_model_file(model: &ModelState, path: &Path) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// §32: Save with a checkpoint_generation embedded for trainer-state pairing.
+pub fn save_model_file_with_generation(model: &ModelState, path: &Path, generation: u64) -> Result<(), Box<dyn Error>> {
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("stm") => { persistence::save_binary(model, path)?; }
+        Some("db") | Some("sqlite") => {
+            let db = Database::open(&path.to_string_lossy())?;
+            let mut snap = persistence::to_snapshot(model);
+            snap.checkpoint_generation = generation;
+            let json = serde_json::to_string(&snap)?;
+            let fp = model.state_fingerprint();
+            db.insert_snapshot(None, model.tick, &fp, &json, now_secs())?;
+        }
+        _ => { persistence::save_with_generation(model, path, generation)?; }
+    }
+    Ok(())
+}
+
 /// Extension-aware load: `.stm` → binary; `.db`/`.sqlite` → latest snapshot; anything else → JSON.
 pub fn load_model_file(path: &Path) -> Result<ModelState, Box<dyn Error>> {
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);

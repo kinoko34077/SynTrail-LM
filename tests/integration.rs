@@ -2436,6 +2436,80 @@ fn tr_resume_05_model_fingerprint_matches_state_fingerprint() {
     assert_eq!(fp, fp2, "TR-RESUME-05: state_fingerprint must be deterministic");
 }
 
+// ── TR-RESUME-07: checkpoint_generation matches after paired save (§32) ────
+#[test]
+fn tr_resume_07_checkpoint_generation_pairs_model_and_state() {
+    use syntrail_lm::trainer::state::TrainerState;
+    let dataset_tmp = tempfile::NamedTempFile::new().unwrap();
+    let model_tmp = tempfile::NamedTempFile::new().unwrap();
+    let mut model = ModelState::new();
+    for _ in 0..5 { model.train("hello"); }
+
+    let fp = model.state_fingerprint();
+    let mut state = TrainerState::new(dataset_tmp.path(), 42, 100, model_tmp.path(), fp.clone());
+    state.checkpoint_generation = model.tick; // §32: set generation = tick
+
+    // Save model with generation
+    syntrail_lm::persistence::save_with_generation(&model, model_tmp.path(), state.checkpoint_generation).unwrap();
+    state.save(dataset_tmp.path()).unwrap();
+
+    // Load generation from model file
+    let model_gen = syntrail_lm::persistence::load_checkpoint_generation(model_tmp.path()).unwrap();
+    assert_eq!(model_gen, state.checkpoint_generation,
+        "TR-RESUME-07: checkpoint_generation in model file must match trainer state");
+
+    // verify_resume_with_generation must pass
+    assert!(state.verify_resume_with_generation(42, &fp, Some(model_gen)).is_ok(),
+        "TR-RESUME-07: verify_resume_with_generation must accept matching generation");
+}
+
+// ── TR-RESUME-08: checkpoint_generation mismatch is rejected (§32) ─────────
+#[test]
+fn tr_resume_08_checkpoint_generation_mismatch_rejected() {
+    use syntrail_lm::trainer::state::TrainerState;
+    let dataset_tmp = tempfile::NamedTempFile::new().unwrap();
+    let model_tmp = tempfile::NamedTempFile::new().unwrap();
+    let fp = "tick=5 prims=3 chunks=0 edges=0 assoc=0 ehash=0000000000000000".to_owned();
+    let mut state = TrainerState::new(dataset_tmp.path(), 7, 50, model_tmp.path(), fp.clone());
+    state.checkpoint_generation = 100;
+
+    // Model file carries a DIFFERENT generation (e.g. from an earlier save).
+    let result = state.verify_resume_with_generation(7, &fp, Some(99));
+    assert!(result.is_err(),
+        "TR-RESUME-08: verify_resume_with_generation must reject generation mismatch");
+}
+
+// ── TR-RESUME-09: state_fingerprint detects edge weight change (§33) ───────
+#[test]
+fn tr_resume_09_fingerprint_detects_edge_weight_change() {
+    let mut m = ModelState::new();
+    for _ in 0..5 { m.train("ab"); }
+    let fp1 = m.state_fingerprint();
+
+    // Apply feedback — changes edge weights but not counts
+    use syntrail_lm::feedback::{FeedbackSign, FeedbackSource};
+    use syntrail_lm::config::Config;
+    use syntrail_lm::session::Session;
+    let mut s = Session::new_in_memory(Config::default_v02()).unwrap();
+    for _ in 0..5 { s.model.train("ab"); }
+    let fp_before = s.model.state_fingerprint();
+    // Train more to change weights
+    s.model.train("ab");
+    let fp_after = s.model.state_fingerprint();
+    assert_ne!(fp_before, fp_after,
+        "TR-RESUME-09: state_fingerprint must change when edge weights change (ehash component)");
+}
+
+// ── TR-RESUME-10: ehash field present in fingerprint string (§33) ───────────
+#[test]
+fn tr_resume_10_fingerprint_contains_ehash() {
+    let mut m = ModelState::new();
+    m.train("abc");
+    let fp = m.state_fingerprint();
+    assert!(fp.contains("ehash="),
+        "TR-RESUME-10: state_fingerprint must contain 'ehash=' component: {fp}");
+}
+
 // ── TR-RESUME-06: TrainerState.model_path updated on SaveAs (§28) ─────────
 #[test]
 fn tr_resume_06_model_path_updated_on_save_as() {

@@ -237,6 +237,24 @@ impl PredictionStore {
         self.edges.len()
     }
 
+    /// §33: Deterministic hash over edge use-counts and weights.
+    /// Catches value changes that the count-only fingerprint misses.
+    pub fn edge_value_hash(&self) -> u64 {
+        // Fold (context, next, use_count, usage_strength bits) in index order.
+        // Index order is insertion order — stable within one model lifetime.
+        let mut h: u64 = 0x9e3779b97f4a7c15; // Fibonacci hashing seed
+        for e in &self.edges {
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(e.context.raw() as u64);
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(e.next_unit.raw() as u64);
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(e.use_count as u64);
+            h = h.wrapping_mul(6364136223846793005)
+                 .wrapping_add(e.usage_strength.to_bits());
+            h = h.wrapping_mul(6364136223846793005)
+                 .wrapping_add(e.feedback_value.to_bits());
+        }
+        h
+    }
+
     /// Iterate all edges for serialisation.
     pub fn iter_all(&self) -> impl Iterator<Item = &PredictionEdge> {
         self.edges.iter()

@@ -2991,3 +2991,23 @@ fn stm17_02_implicit_rep_id_roundtrip() {
         "STM17-02: representation entry count must survive save/load"
     );
 }
+
+#[test]
+fn stm_version_07_unknown_version_rejected() {
+    // STM-VERSION-02: unknown future version must return an error, not silently misread.
+    let m = make_trained_model();
+    let mut bytes = Vec::new();
+    // Write a valid STM v3 file
+    let tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    persistence::save_binary(&m, tmp.path()).unwrap();
+    bytes = std::fs::read(tmp.path()).unwrap();
+    // Patch version byte to 42 (unknown future version)
+    bytes[4] = 42;
+    let patched = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    std::fs::write(patched.path(), &bytes).unwrap();
+    let result = persistence::load_binary(patched.path());
+    assert!(result.is_err(), "STM-VERSION-02: version 42 must be rejected");
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("42") || msg.contains("not supported") || msg.contains("Unsupported"),
+        "STM-VERSION-02: error must mention the version: {}", msg);
+}

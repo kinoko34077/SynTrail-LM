@@ -98,7 +98,7 @@ impl From<TierDto> for Tier {
 }
 
 /// Phase 17: strength fields in DTOs use f32 for compact serialisation.
-/// Runtime model still uses f64; the cast is lossless for values in [0, 1e6].
+/// Runtime model still uses f64; stored as f32 for compact persistence (Persistence Quantization).
 /// §17: id field removed — position in snapshot array is the implicit id.
 #[derive(Serialize, Deserialize)]
 struct ChunkDto {
@@ -726,15 +726,20 @@ fn stm_read_container(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
         } else {
             encoded.to_vec()
         };
-        // version 3 = packed UnitId + implicit IDs (current); version 2 = varint struct UnitId
-        if version >= 3 {
+        // Strict version dispatch — unknown future versions are rejected (§7).
+        if version == 3 {
             bincode_deserialize_varint(&payload)
         } else if version == 2 {
             let v2 = bincode_deserialize_varint_v2(&payload)?;
             Ok(from_v2_snapshot(v2))
-        } else {
+        } else if version == 1 {
             bincode::deserialize(&payload)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("STM version {} is not supported by this build (max: {})", version, STM_VERSION),
+            ))
         }
     } else {
         // Legacy: raw bincode without header
@@ -1151,37 +1156,52 @@ pub struct SectionStats {
 #[derive(Debug)]
 pub struct StorageProfile {
     pub sections: Vec<SectionStats>,
-    pub json_total_bytes: usize,
-    pub bincode_total_bytes: usize,
-    pub zstd_json_bytes: usize,
-    pub zstd_bincode_bytes: usize,
+    /// JSON pretty-printed total bytes.
+    pub json_pretty_bytes: usize,
+    /// JSON compact total bytes.
+    pub json_compact_bytes: usize,
+    /// Legacy fixed-int bincode (pre-v2) total bytes.
+    pub legacy_bincode_bytes: usize,
+    /// STM v3 varint+packed payload bytes (before Zstd).
+    pub stm_raw_bytes: usize,
+    /// STM v3 Zstd-compressed payload bytes.
+    pub stm_compressed_bytes: usize,
+    /// Actual .stm file bytes including 10-byte container header.
+    pub stm_actual_bytes: usize,
+    /// JSON serialize timing (ms).
     pub json_save_ms: u64,
     pub json_load_ms: u64,
-    pub bincode_save_ms: u64,
-    pub bincode_load_ms: u64,
+    /// STM v3 serialize timing (ms).
+    pub stm_save_ms: u64,
+    pub stm_load_ms: u64,
+    /// Actual file size on disk (filled in by caller).
     pub file_size_on_disk: u64,
 }
 
-/// §1/§2: Profile the storage of a model and print a report to stdout.
+/// §3/§4: Profile the storage of a model against real STM v3 encoding.
 ///
-/// Measures per-section sizes (bincode), JSON/bincode totals, Zstd ratios,
-/// and save/load timing.  No files are written to disk during profiling.
+/// Generates the snapshot exactly once and reuses it for all measurements.
+/// Section sizes use varint bincode (actual STM v3 encoding), not fixed-int.
 pub fn profile_storage(model: &ModelState) -> StorageProfile {
+    use bincode::Options;
     use std::time::Instant;
 
+    // §4: single snapshot generation — reused for all measurements.
     let snap = to_snapshot(model);
 
-    // ── Per-section bincode + JSON sizes ─────────────────────────────────
+    let varint = || bincode::DefaultOptions::new().with_varint_encoding();
+
+    // ── Per-section varint bincode + JSON sizes ───────────────────────────
     macro_rules! section {
         ($name:expr, $field:expr) => {{
-            let bc = bincode::serialize(&$field).map(|v| v.len()).unwrap_or(0);
+            let bc = varint().serialize(&$field).map(|v| v.len()).unwrap_or(0);
             let js = serde_json::to_string(&$field).map(|s| s.len()).unwrap_or(0);
             SectionStats { name: $name, count: $field.len(), bincode_bytes: bc, json_bytes: js }
         }};
     }
     macro_rules! section_scalar {
         ($name:expr, $field:expr) => {{
-            let bc = bincode::serialize(&$field).map(|v| v.len()).unwrap_or(0);
+            let bc = varint().serialize(&$field).map(|v| v.len()).unwrap_or(0);
             let js = serde_json::to_string(&$field).map(|s| s.len()).unwrap_or(0);
             SectionStats { name: $name, count: 1, bincode_bytes: bc, json_bytes: js }
         }};
@@ -1199,83 +1219,91 @@ pub fn profile_storage(model: &ModelState) -> StorageProfile {
         section!("representation_entries",  snap.representation_entries),
         section!("transforms",              snap.transforms),
         section!("merge_right_reuse",       snap.merge_right_reuse),
-        section_scalar!("metrics",       snap.metrics),
+        section_scalar!("metrics",          snap.metrics),
     ];
 
-    // ── Total JSON / bincode ───────────────────────────────────────────────
-    let snap2 = to_snapshot(model);
-    let json_bytes = serde_json::to_string(&snap2).map(|s| s.len()).unwrap_or(0);
-    let snap3 = to_snapshot(model);
-    let bincode_bytes = bincode::serialize(&snap3).map(|v| v.len()).unwrap_or(0);
+    // ── Format totals ─────────────────────────────────────────────────────
+    let json_pretty_bytes  = serde_json::to_string_pretty(&snap).map(|s| s.len()).unwrap_or(0);
+    let json_compact_bytes = serde_json::to_string(&snap).map(|s| s.len()).unwrap_or(0);
+    let legacy_bincode_bytes = bincode::serialize(&snap).map(|v| v.len()).unwrap_or(0);
 
-    // ── Zstd compressed sizes ──────────────────────────────────────────────
-    let snap_json_str = serde_json::to_string(&to_snapshot(model)).unwrap_or_default();
-    let zstd_json_bytes = zstd::encode_all(snap_json_str.as_bytes(), 3)
-        .map(|v| v.len()).unwrap_or(0);
-    let snap_bc = bincode::serialize(&to_snapshot(model)).unwrap_or_default();
-    let zstd_bincode_bytes = zstd::encode_all(snap_bc.as_slice(), 3)
-        .map(|v| v.len()).unwrap_or(0);
+    // STM v3 raw payload = varint bincode of the snapshot (as stm_write_container does)
+    let stm_raw = varint().serialize(&snap).unwrap_or_default();
+    let stm_raw_bytes = stm_raw.len();
+    let stm_compressed = zstd::bulk::compress(&stm_raw, 3).unwrap_or_default();
+    let stm_compressed_bytes = stm_compressed.len();
+    // Actual .stm = 10-byte header + compressed payload
+    let stm_actual_bytes = 10 + stm_compressed_bytes;
 
-    // ── Save / load timing (in-memory, no disk) ────────────────────────────
+    // ── Save / load timing (in-memory, no disk) ───────────────────────────
     let t0 = Instant::now();
-    let _jb = serde_json::to_string(&to_snapshot(model)).unwrap_or_default();
+    let json_str = serde_json::to_string(&snap).unwrap_or_default();
     let json_save_ms = t0.elapsed().as_millis() as u64;
 
     let t0 = Instant::now();
-    let _: Result<ModelState, _> = serde_json::from_str(&_jb)
-        .map(|s: ModelSnapshot| from_snapshot(s));
+    let _ = serde_json::from_str::<ModelSnapshot>(&json_str).map(from_snapshot);
     let json_load_ms = t0.elapsed().as_millis() as u64;
 
+    // STM v3 save timing: varint serialize + Zstd
     let t0 = Instant::now();
-    let bc_bytes = bincode::serialize(&to_snapshot(model)).unwrap_or_default();
-    let bincode_save_ms = t0.elapsed().as_millis() as u64;
+    let stm_payload = varint().serialize(&snap).unwrap_or_default();
+    let _stm_comp = zstd::bulk::compress(&stm_payload, 3).unwrap_or_default();
+    let stm_save_ms = t0.elapsed().as_millis() as u64;
 
+    // STM v3 load timing: Zstd decompress + varint deserialize
     let t0 = Instant::now();
-    let _: Result<ModelState, _> = bincode::deserialize::<ModelSnapshot>(&bc_bytes)
-        .map(from_snapshot);
-    let bincode_load_ms = t0.elapsed().as_millis() as u64;
+    let decomp = zstd::bulk::decompress(&_stm_comp, 256 * 1024 * 1024).unwrap_or_default();
+    let _ = varint().deserialize::<ModelSnapshot>(&decomp).map(from_snapshot);
+    let stm_load_ms = t0.elapsed().as_millis() as u64;
 
     StorageProfile {
         sections,
-        json_total_bytes: json_bytes,
-        bincode_total_bytes: bincode_bytes,
-        zstd_json_bytes,
-        zstd_bincode_bytes,
+        json_pretty_bytes,
+        json_compact_bytes,
+        legacy_bincode_bytes,
+        stm_raw_bytes,
+        stm_compressed_bytes,
+        stm_actual_bytes,
         json_save_ms,
         json_load_ms,
-        bincode_save_ms,
-        bincode_load_ms,
-        file_size_on_disk: 0, // filled in by caller from actual file
+        stm_save_ms,
+        stm_load_ms,
+        file_size_on_disk: 0,
     }
 }
 
 /// Print the storage profile in tabular form.
 pub fn print_storage_profile(profile: &StorageProfile) {
-    println!("{:<28} {:>8} {:>12} {:>12}", "Section", "Count", "Bincode", "JSON");
+    // Per-section table (varint bincode = actual STM v3 encoding)
+    println!("{:<28} {:>8} {:>12} {:>12}", "Section", "Count", "STM v3", "JSON");
     println!("{}", "-".repeat(64));
     for s in &profile.sections {
         println!("{:<28} {:>8} {:>12} {:>12}",
             s.name, s.count, fmt_bytes(s.bincode_bytes), fmt_bytes(s.json_bytes));
     }
-    println!("{}", "-".repeat(64));
-    println!("{:<28} {:>8} {:>12} {:>12}", "TOTAL", "",
-        fmt_bytes(profile.bincode_total_bytes), fmt_bytes(profile.json_total_bytes));
     println!();
-    println!("Compressed (Zstd-3):");
-    println!("  JSON  → Zstd : {} ({:.1}×)",
-        fmt_bytes(profile.zstd_json_bytes),
-        ratio(profile.json_total_bytes, profile.zstd_json_bytes));
-    println!("  STM   → Zstd : {} ({:.1}×)",
-        fmt_bytes(profile.zstd_bincode_bytes),
-        ratio(profile.bincode_total_bytes, profile.zstd_bincode_bytes));
-    println!();
-    println!("Serialize timing (in-memory):");
-    println!("  JSON   save: {}ms   load: {}ms", profile.json_save_ms, profile.json_load_ms);
-    println!("  Bincode save: {}ms  load: {}ms", profile.bincode_save_ms, profile.bincode_load_ms);
+    // Format comparison table
+    println!("{:<28} {:>14}", "Format", "Size");
+    println!("{}", "-".repeat(44));
+    println!("{:<28} {:>14}", "JSON pretty",        fmt_bytes(profile.json_pretty_bytes));
+    println!("{:<28} {:>14}", "JSON compact",       fmt_bytes(profile.json_compact_bytes));
+    println!("{:<28} {:>14}", "Legacy bincode",     fmt_bytes(profile.legacy_bincode_bytes));
+    println!("{:<28} {:>14}", "STM v3 raw",         fmt_bytes(profile.stm_raw_bytes));
+    println!("{:<28} {:>14}", "STM v3 compressed",  fmt_bytes(profile.stm_compressed_bytes));
+    println!("{:<28} {:>14}", "Actual .stm",        fmt_bytes(profile.stm_actual_bytes));
     if profile.file_size_on_disk > 0 {
-        println!();
-        println!("File on disk: {}", fmt_bytes(profile.file_size_on_disk as usize));
+        println!("{:<28} {:>14}", "File on disk",   fmt_bytes(profile.file_size_on_disk as usize));
     }
+    println!();
+    println!("Compression ratios (vs STM v3 raw):");
+    println!("  STM v3 raw → Zstd: {:.1}×",
+        ratio(profile.stm_raw_bytes, profile.stm_compressed_bytes));
+    println!("  JSON compact → STM v3 raw: {:.1}×",
+        ratio(profile.json_compact_bytes, profile.stm_raw_bytes));
+    println!();
+    println!("Timing (in-memory):");
+    println!("  JSON  save: {}ms  load: {}ms", profile.json_save_ms, profile.json_load_ms);
+    println!("  STM   save: {}ms  load: {}ms", profile.stm_save_ms, profile.stm_load_ms);
 }
 
 fn fmt_bytes(n: usize) -> String {

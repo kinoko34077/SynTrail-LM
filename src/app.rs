@@ -64,7 +64,7 @@ pub fn save_model_file(model: &ModelState, path: &Path) -> Result<(), Box<dyn Er
 pub fn save_model_file_with_generation(model: &ModelState, path: &Path, generation: u64) -> Result<(), Box<dyn Error>> {
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     match ext.as_deref() {
-        Some("stm") => { persistence::save_binary(model, path)?; }
+        Some("stm") => { persistence::save_binary_with_generation(model, path, generation)?; }
         Some("db") | Some("sqlite") => {
             let db = Database::open(&path.to_string_lossy())?;
             let mut snap = persistence::to_snapshot(model);

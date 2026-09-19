@@ -15,6 +15,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::association::{AssociationEdge, AssociationStore};
+use crate::db::Database;
 use crate::chunks::{Chunk, ChunkRegistry, Residency};
 use crate::identity::IdentityStore;
 use crate::lineage::LineageStore;
@@ -305,12 +306,44 @@ pub fn save_with_generation(model: &ModelState, path: &Path, generation: u64) ->
     std::fs::rename(&tmp, path)
 }
 
-/// §32: Read only the checkpoint_generation from a model file without loading the full model.
+/// §4 (Storage P0): Read checkpoint_generation from any supported model format.
+///
+/// Previously JSON-only, causing STM generation reads to silently return 0
+/// and skip the trainer-state pair verification on resume.
+///
+/// Format dispatch:
+/// - `.stm` → bincode (full deserialize; no header-only path yet — §12 future)
+/// - `.db` / `.sqlite` → latest snapshot JSON in the DB
+/// - anything else → JSON
 pub fn load_checkpoint_generation(path: &Path) -> std::io::Result<u64> {
-    let json = std::fs::read_to_string(path)?;
-    let snapshot: ModelSnapshot = serde_json::from_str(&json)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(snapshot.checkpoint_generation)
+    let ext = path.extension().and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("stm") => {
+            // Full bincode deserialize — header-only read deferred to §12.
+            let bytes = std::fs::read(path)?;
+            let snapshot: ModelSnapshot = bincode::deserialize(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Ok(snapshot.checkpoint_generation)
+        }
+        Some("db") | Some("sqlite") => {
+            let db = Database::open(&path.to_string_lossy())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let json = db.load_latest_snapshot_json()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no snapshot in DB"))?;
+            let snapshot: ModelSnapshot = serde_json::from_str(&json)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Ok(snapshot.checkpoint_generation)
+        }
+        _ => {
+            // JSON path (original behaviour).
+            let json = std::fs::read_to_string(path)?;
+            let snapshot: ModelSnapshot = serde_json::from_str(&json)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Ok(snapshot.checkpoint_generation)
+        }
+    }
 }
 
 /// Load from JSON.
@@ -321,17 +354,22 @@ pub fn load(path: &Path) -> std::io::Result<ModelState> {
     Ok(from_snapshot(snapshot))
 }
 
-/// Phase 16: save to binary format (bincode).
-///
-/// Produces a compact binary file; roughly 5-10× smaller and 10× faster
-/// to write/read than the JSON equivalent for large models.
+/// Phase 16: save to binary format (bincode); generation=0 (legacy/unversioned).
 pub fn save_binary(model: &ModelState, path: &Path) -> std::io::Result<()> {
-    let snapshot = to_snapshot(model);
+    save_binary_with_generation(model, path, 0)
+}
+
+/// §3 (Storage P0): save to binary format with checkpoint_generation embedded.
+///
+/// Fixes the bug where `.stm` saves via `save_binary` lost the generation,
+/// making `TrainerState.checkpoint_generation != STM.checkpoint_generation`.
+pub fn save_binary_with_generation(model: &ModelState, path: &Path, generation: u64) -> std::io::Result<()> {
+    let mut snapshot = to_snapshot(model);
+    snapshot.checkpoint_generation = generation;
     let bytes = bincode::serialize(&snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    // §38: write to temp file beside the target then rename atomically.
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
+    std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, path)
 }
 

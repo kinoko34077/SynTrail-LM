@@ -2762,3 +2762,75 @@ fn drop43_02_two_models_is_multiple_files() {
         "DROP-02: two model files should yield MultipleFiles"
     );
 }
+
+// ── STM-CKPT-01/02/03: STM checkpoint_generation (Storage P0 §3/§4) ────────
+
+fn make_trained_model() -> ModelState {
+    let mut m = ModelState::new();
+    m.expose_external("hello world");
+    m
+}
+
+#[test]
+fn stm_ckpt_01_stm_save_embeds_generation() {
+    // STM-CKPT-01: save_binary_with_generation → STM stores the generation.
+    let mut m = make_trained_model();
+    m.tick = 42;
+    let tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    persistence::save_binary_with_generation(&m, tmp.path(), 42).unwrap();
+    let loaded_gen = persistence::load_checkpoint_generation(tmp.path()).unwrap();
+    assert_eq!(loaded_gen, 42, "STM-CKPT-01: generation must survive .stm save/load");
+}
+
+#[test]
+fn stm_ckpt_02_mismatched_generation_rejected() {
+    // STM-CKPT-02: trainer verify_resume_with_generation rejects mismatched STM.
+    use syntrail_lm::trainer::state::TrainerState;
+    use syntrail_lm::trainer::dataset::Dataset;
+    let m = make_trained_model();
+    let stm_tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    persistence::save_binary_with_generation(&m, stm_tmp.path(), 10).unwrap();
+
+    let dataset_tmp = tempfile::Builder::new().suffix(".txt").tempfile().unwrap();
+    std::fs::write(dataset_tmp.path(), "hello world").unwrap();
+    let ds = Dataset::load(dataset_tmp.path()).unwrap();
+    let mut state = TrainerState::new(
+        dataset_tmp.path(),
+        ds.fingerprint,
+        ds.normalized.len(),
+        stm_tmp.path(),
+        m.state_fingerprint(),
+    );
+    state.checkpoint_generation = 99; // intentionally mismatched
+
+    let model_gen = persistence::load_checkpoint_generation(stm_tmp.path()).unwrap();
+    let result = state.verify_resume_with_generation(ds.fingerprint, &m.state_fingerprint(), Some(model_gen));
+    assert!(result.is_err(), "STM-CKPT-02: mismatched generation must be rejected");
+    assert!(result.unwrap_err().contains("generation"), "error must mention generation");
+}
+
+#[test]
+fn stm_ckpt_03_legacy_generation_zero_is_allowed() {
+    // STM-CKPT-03: legacy STM (generation=0) skips the check per §32 rule.
+    use syntrail_lm::trainer::state::TrainerState;
+    use syntrail_lm::trainer::dataset::Dataset;
+    let m = make_trained_model();
+    let stm_tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    persistence::save_binary(&m, stm_tmp.path()).unwrap(); // generation=0
+
+    let dataset_tmp = tempfile::Builder::new().suffix(".txt").tempfile().unwrap();
+    std::fs::write(dataset_tmp.path(), "hello world").unwrap();
+    let ds = Dataset::load(dataset_tmp.path()).unwrap();
+    let state = TrainerState::new(
+        dataset_tmp.path(),
+        ds.fingerprint,
+        ds.normalized.len(),
+        stm_tmp.path(),
+        m.state_fingerprint(),
+    );
+
+    let model_gen = persistence::load_checkpoint_generation(stm_tmp.path()).unwrap();
+    assert_eq!(model_gen, 0, "legacy STM has generation=0");
+    let result = state.verify_resume_with_generation(ds.fingerprint, &m.state_fingerprint(), Some(model_gen));
+    assert!(result.is_ok(), "STM-CKPT-03: legacy generation=0 must be allowed: {:?}", result.err());
+}

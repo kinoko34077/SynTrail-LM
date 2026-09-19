@@ -36,7 +36,7 @@ pub fn route_drop(paths: Vec<PathBuf>, accepted: &AcceptedKinds) -> DropResult {
     if paths.len() == 2 && accepted.model && accepted.dataset {
         let kinds: Vec<_> = paths.iter().map(|p| FileKind::detect(p)).collect();
         let model_idx = kinds.iter().position(|k| k.is_model());
-        let dataset_idx = kinds.iter().position(|k| *k == FileKind::DatasetText);
+        let dataset_idx = kinds.iter().position(|k| k.is_dataset());
         if let (Some(mi), Some(di)) = (model_idx, dataset_idx) {
             if mi != di {
                 let mut it = paths.into_iter();
@@ -60,7 +60,7 @@ pub fn route_drop(paths: Vec<PathBuf>, accepted: &AcceptedKinds) -> DropResult {
         {
             DropResult::Command(FileCommand::LoadPath(path))
         }
-        FileKind::DatasetText if accepted.dataset => {
+        FileKind::DatasetText | FileKind::DatasetSupervised if accepted.dataset => {
             DropResult::Command(FileCommand::LoadPath(path))
         }
         _ => DropResult::Unsupported(path),

@@ -8,6 +8,8 @@ pub enum FileKind {
     ModelDatabase,
     ModelBinary,
     DatasetText,
+    /// §35: JSONL supervised dataset (§29 canonical import format).
+    DatasetSupervised,
     TrainerState,
     Unknown,
 }
@@ -32,6 +34,7 @@ impl FileKind {
             Some("db") | Some("sqlite") => FileKind::ModelDatabase,
             Some("stm") => FileKind::ModelBinary,
             Some("txt") => FileKind::DatasetText,
+            Some("jsonl") => FileKind::DatasetSupervised,
             _ => FileKind::Unknown,
         }
     }
@@ -39,6 +42,11 @@ impl FileKind {
     /// Returns true for any model file kind (JSON, DB, or binary).
     pub fn is_model(self) -> bool {
         matches!(self, FileKind::ModelJson | FileKind::ModelDatabase | FileKind::ModelBinary)
+    }
+
+    /// §35: Returns true for any dataset kind (text or supervised).
+    pub fn is_dataset(self) -> bool {
+        matches!(self, FileKind::DatasetText | FileKind::DatasetSupervised)
     }
 }
 

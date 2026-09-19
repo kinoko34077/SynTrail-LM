@@ -23,6 +23,7 @@ use syntrail_lm::trainer::dataset::Dataset;
 use syntrail_lm::trainer::scheduler::{CheckpointOutcome, TrainingScheduler};
 use syntrail_lm::trainer::splitter::BlockSplitter;
 use syntrail_lm::trainer::state::{TrainerState, TrainerStatus};
+use syntrail_lm::trainer::supervised::SupervisedDataset;
 
 #[cfg(all(target_os = "windows", feature = "gui"))]
 use syntrail_lm::desktop::platform::windows::TrainerMenu;
@@ -517,6 +518,8 @@ struct TrainerApp {
     // Loaded objects (only valid in Ready/before start)
     loaded_model: Option<ModelState>,
     loaded_dataset: Option<Dataset>,
+    /// §35: Supervised dataset loaded from .jsonl; mutually exclusive with loaded_dataset.
+    loaded_supervised: Option<SupervisedDataset>,
     // Detected existing trainer state
     resume_state: Option<Result<TrainerState, String>>,
     #[cfg(all(target_os = "windows", feature = "gui"))]
@@ -540,6 +543,7 @@ impl TrainerApp {
             status_msg: "Select a model and a text file to begin.".to_owned(),
             loaded_model: None,
             loaded_dataset: None,
+            loaded_supervised: None,
             resume_state: None,
             #[cfg(all(target_os = "windows", feature = "gui"))]
             native_menu: TrainerMenu::build(),
@@ -572,6 +576,7 @@ impl TrainerApp {
                 );
                 // Check for existing trainer state.
                 self.resume_state = Some(TrainerState::load(&p));
+                self.loaded_supervised = None; // §35: text and supervised are mutually exclusive
                 self.loaded_dataset = Some(ds);
                 self.check_ready();
             }
@@ -585,17 +590,43 @@ impl TrainerApp {
 
     fn check_ready(&mut self) {
         let model_ok = self.loaded_model.is_some();
-        let dataset_ok = self.loaded_dataset.is_some();
+        let dataset_ok = self.loaded_dataset.is_some() || self.loaded_supervised.is_some();
         self.state = AppState::Ready { model_loaded: model_ok, dataset_loaded: dataset_ok };
         // §23: show diagnostic summary when both model and dataset are loaded.
         if model_ok && dataset_ok {
             let m = self.loaded_model.as_ref().unwrap();
-            let ds = self.loaded_dataset.as_ref().unwrap();
+            let ds_info = if let Some(ds) = &self.loaded_dataset {
+                format!("{} chars (text)", ds.normalized.chars().count())
+            } else if let Some(sup) = &self.loaded_supervised {
+                format!("{} samples (supervised)", sup.samples.len())
+            } else {
+                "?".to_owned()
+            };
             self.status_msg = format!(
-                "Ready — model: {} chunks / {} primitives / tick {} | dataset: {} chars",
-                m.chunk_count(), m.primitive_count(), m.tick,
-                ds.normalized.chars().count()
+                "Ready — model: {} chunks / {} primitives / tick {} | dataset: {}",
+                m.chunk_count(), m.primitive_count(), m.tick, ds_info
             );
+        }
+    }
+
+    /// §35: Load a .jsonl file as a SupervisedDataset; clears any loaded text dataset.
+    fn try_load_supervised(&mut self, path: PathBuf) {
+        match SupervisedDataset::load_jsonl(&path) {
+            Ok(sup) => {
+                self.status_msg = format!(
+                    "Supervised dataset loaded: {} samples from {}",
+                    sup.samples.len(), path.display()
+                );
+                self.dataset_path = path.to_string_lossy().to_string();
+                self.loaded_dataset = None;
+                self.resume_state = None;
+                self.loaded_supervised = Some(sup);
+                self.check_ready();
+            }
+            Err(e) => {
+                self.status_msg = format!("Supervised dataset load failed: {e}");
+                self.loaded_supervised = None;
+            }
         }
     }
 
@@ -822,6 +853,7 @@ impl eframe::App for TrainerApp {
                             }
                             self.loaded_model = None;
                             self.loaded_dataset = None;
+                            self.loaded_supervised = None;
                             self.resume_state = None;
                             self.state = AppState::Idle;
                             self.doc.dirty = false;
@@ -930,6 +962,9 @@ impl eframe::App for TrainerApp {
                                 self.dataset_path = p.to_string_lossy().to_string();
                                 self.try_load_dataset();
                             }
+                            FileKind::DatasetSupervised => {
+                                self.try_load_supervised(p);
+                            }
                             _ => {
                                 // §22: guard dirty model before D&D replacement.
                                 if self.doc.dirty {
@@ -975,9 +1010,13 @@ impl eframe::App for TrainerApp {
                         }
                         self.doc.path = Some(model.clone());
                         self.doc.dirty = false;
-                        self.dataset_path = dataset.to_string_lossy().to_string();
                         self.try_load_model();
-                        self.try_load_dataset();
+                        if FileKind::detect(&dataset) == FileKind::DatasetSupervised {
+                            self.try_load_supervised(dataset);
+                        } else {
+                            self.dataset_path = dataset.to_string_lossy().to_string();
+                            self.try_load_dataset();
+                        }
                     }
                     DropResult::MultipleFiles => {
                         self.status_msg = "Drop one file at a time (or one model + one dataset together).".to_owned();
@@ -1037,6 +1076,21 @@ impl eframe::App for TrainerApp {
                     }
                 }
             });
+
+            // §35: Dataset Type indicator — never show JSONL as text.
+            if !self.dataset_path.is_empty() {
+                let type_label = if self.loaded_supervised.is_some() {
+                    "Supervised"
+                } else if self.loaded_dataset.is_some() {
+                    "Text"
+                } else {
+                    let kind = FileKind::detect(std::path::Path::new(&self.dataset_path));
+                    if kind == FileKind::DatasetSupervised { "Supervised" } else { "Text" }
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("Dataset Type: {type_label}")).small());
+                });
+            }
 
             // §17/§18: Start Position selector + preview (new training only, hidden while training).
             let dataset_loaded = matches!(&self.state, AppState::Ready { dataset_loaded: true, .. })

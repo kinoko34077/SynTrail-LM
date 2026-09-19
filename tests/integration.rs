@@ -2848,7 +2848,7 @@ fn stm12_01_container_roundtrip() {
     // Verify STM1 magic in file
     let bytes = std::fs::read(tmp.path()).unwrap();
     assert_eq!(&bytes[..4], b"STM1", "STM12-01: file must start with STM1 magic");
-    assert_eq!(bytes[4], 3, "STM12-01: version must be 3 (packed UnitId + implicit IDs)");
+    assert_eq!(bytes[4], 4, "STM12-01: version must be 4 (u64 tick-delta lossless)");
     assert_eq!(bytes[5] & 1, 1, "STM12-01: zstd flag must be set");
 
     // Verify model round-trips correctly
@@ -2993,11 +2993,29 @@ fn stm17_02_implicit_rep_id_roundtrip() {
 }
 
 #[test]
+#[test]
+fn stm14_01_tick_delta_lossless_large_values() {
+    // STM14-01: tick deltas stored as u64 — no u32 saturation on large values.
+    use syntrail_lm::persistence::{save_binary, load_binary};
+    let m = make_trained_model();
+    let tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
+    save_binary(&m, tmp.path()).unwrap();
+    // Version byte must be 4
+    let bytes = std::fs::read(tmp.path()).unwrap();
+    assert_eq!(bytes[4], 4, "STM14-01: saved file must be STM v4");
+    // Round-trip: chunk count and tick survive
+    let m2 = load_binary(tmp.path()).unwrap();
+    assert_eq!(m.tick, m2.tick, "STM14-01: tick must survive v4 round-trip");
+    assert_eq!(m.chunk_count(), m2.chunk_count(),
+        "STM14-01: chunk count must survive v4 round-trip");
+}
+
+#[test]
 fn stm_version_07_unknown_version_rejected() {
     // STM-VERSION-02: unknown future version must return an error, not silently misread.
     let m = make_trained_model();
     let mut bytes = Vec::new();
-    // Write a valid STM v3 file
+    // Write a valid STM v4 file
     let tmp = tempfile::Builder::new().suffix(".stm").tempfile().unwrap();
     persistence::save_binary(&m, tmp.path()).unwrap();
     bytes = std::fs::read(tmp.path()).unwrap();

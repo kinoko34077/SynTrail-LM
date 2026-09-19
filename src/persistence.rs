@@ -120,10 +120,10 @@ struct ChunkDto {
     /// v0.4: 0=Hot (default), 1=Sleep
     #[serde(default)]
     residency: u8,
-    /// §28: ticks-since-last-use delta (0 = use raw last_used for legacy compat).
-    /// Encoded as (model.tick - last_used) + 1; 0 means "not set or last_used==0".
+    /// §14: lossless tick delta — u64 varint; 0 = use raw last_used (legacy compat).
+    /// Encoded as (model.tick - last_used) + 1.
     #[serde(default)]
-    last_used_delta: u32,
+    last_used_delta: u64,
 }
 
 impl From<&Chunk> for ChunkDto {
@@ -185,9 +185,9 @@ struct PredEdgeEntryDto {
     avoidance: f32,
     #[serde(default)]
     last_used_tick: u64,
-    /// §28: ticks-since-last-use delta (0 = use raw last_used_tick for legacy compat).
+    /// §14: lossless tick delta — u64 varint; 0 = use raw last_used_tick (legacy compat).
     #[serde(default)]
-    last_used_tick_delta: u32,
+    last_used_tick_delta: u64,
     #[serde(default)]
     external_route_evidence: f32,
 }
@@ -199,9 +199,9 @@ struct AssocEdgeEntryDto {
     strength: f64,
     use_count: u32,
     last_used: u64,
-    /// §28: ticks-since-last-use delta (0 = use raw last_used for legacy compat).
+    /// §14: lossless tick delta — u64 varint; 0 = use raw last_used (legacy compat).
     #[serde(default)]
-    last_used_delta: u32,
+    last_used_delta: u64,
 }
 
 /// Phase B: Representation Lineage entry DTO.
@@ -457,8 +457,8 @@ pub fn load(path: &Path) -> std::io::Result<ModelState> {
 // Legacy files (no STM1 header) are detected by checking the first 4 bytes
 // and are deserialized as raw bincode for backward compatibility.
 const STM_MAGIC: &[u8; 4] = b"STM1";
-// Version 3 = varint bincode + packed UnitId + implicit chunk/rep IDs (§16/§17).
-const STM_VERSION: u8 = 3;
+// Version 4 = v3 + u64 tick-delta fields (lossless; §14). v3 = varint + packed UnitId + implicit IDs.
+const STM_VERSION: u8 = 4;
 const STM_FLAG_ZSTD: u8 = 0b0000_0001;
 
 fn bincode_serialize_into_varint<W: std::io::Write>(w: &mut W, snap: &ModelSnapshot) -> std::io::Result<()> {
@@ -473,14 +473,19 @@ fn bincode_serialize_into_varint<W: std::io::Write>(w: &mut W, snap: &ModelSnaps
 /// Eliminates the 256 MB bulk-decompress limit; bincode reads directly from the decoder.
 fn stm_dispatch_version_stream<R: std::io::Read>(version: u8, reader: &mut R) -> std::io::Result<ModelSnapshot> {
     use bincode::Options;
+    let varint = || bincode::DefaultOptions::new().with_varint_encoding();
     match version {
-        STM_VERSION => bincode::DefaultOptions::new()
-            .with_varint_encoding()
+        STM_VERSION => varint()
             .deserialize_from(reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        3 => {
+            let v3: v3_compat::ModelSnapshot = varint()
+                .deserialize_from(reader)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Ok(from_v3_snapshot(v3))
+        }
         2 => {
-            let v2: v2_compat::ModelSnapshot = bincode::DefaultOptions::new()
-                .with_varint_encoding()
+            let v2: v2_compat::ModelSnapshot = varint()
                 .deserialize_from(reader)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             Ok(from_v2_snapshot(v2))
@@ -660,7 +665,7 @@ fn from_v2_snapshot(v2: v2_compat::ModelSnapshot) -> ModelSnapshot {
         chunks: v2.chunks.into_iter().map(|c| ChunkDto {
             left: cv(c.left), right: cv(c.right), tier: c.tier,
             use_count: c.use_count, usage_strength: c.usage_strength,
-            last_used: c.last_used, last_used_delta: c.last_used_delta,
+            last_used: c.last_used, last_used_delta: c.last_used_delta as u64,
             expanded_length: c.expanded_length,
             feedback_value: c.feedback_value, feedback_count: c.feedback_count,
             residency: c.residency,
@@ -704,13 +709,155 @@ fn from_v2_snapshot(v2: v2_compat::ModelSnapshot) -> ModelSnapshot {
                 next_unit: cv(e.next_unit), use_count: e.use_count,
                 usage_strength: e.usage_strength, feedback_value: e.feedback_value,
                 feedback_count: e.feedback_count, avoidance: e.avoidance,
-                last_used_tick: e.last_used_tick, last_used_tick_delta: e.last_used_tick_delta,
+                last_used_tick: e.last_used_tick, last_used_tick_delta: e.last_used_tick_delta as u64,
                 external_route_evidence: e.external_route_evidence,
             }).collect())).collect(),
         association_edge_groups: v2.association_edge_groups.into_iter()
             .map(|(src, edges)| (cv(src), edges.into_iter().map(|e| AssocEdgeEntryDto {
                 target: cv(e.target), strength: e.strength,
-                use_count: e.use_count, last_used: e.last_used, last_used_delta: e.last_used_delta,
+                use_count: e.use_count, last_used: e.last_used, last_used_delta: e.last_used_delta as u64,
+            }).collect())).collect(),
+    }
+}
+
+// ── STM v3 backward-compat deserialization (§14) ──────────────────────────────
+// V3 uses u32 tick-delta fields; v4 uses u64. All other v3 types are identical to v4.
+
+mod v3_compat {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct ChunkDto {
+        pub left: super::UnitIdDto,
+        pub right: super::UnitIdDto,
+        pub tier: super::TierDto,
+        #[serde(alias = "success_count")]
+        pub use_count: u32,
+        #[serde(alias = "strength")]
+        pub usage_strength: f32,
+        pub last_used: u64,
+        pub expanded_length: u32,
+        #[serde(default)]
+        pub feedback_value: f32,
+        #[serde(default)]
+        pub feedback_count: u32,
+        #[serde(default)]
+        pub residency: u8,
+        #[serde(default)]
+        pub last_used_delta: u32,
+    }
+
+    #[derive(Deserialize)]
+    pub struct PredEdgeEntryDto {
+        pub next_unit: super::UnitIdDto,
+        pub use_count: u32,
+        pub usage_strength: f32,
+        #[serde(default)]
+        pub feedback_value: f32,
+        #[serde(default)]
+        pub feedback_count: u32,
+        #[serde(default)]
+        pub avoidance: f32,
+        #[serde(default)]
+        pub last_used_tick: u64,
+        #[serde(default)]
+        pub last_used_tick_delta: u32,
+        #[serde(default)]
+        pub external_route_evidence: f32,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AssocEdgeEntryDto {
+        pub target: super::UnitIdDto,
+        pub strength: f64,
+        pub use_count: u32,
+        pub last_used: u64,
+        #[serde(default)]
+        pub last_used_delta: u32,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ModelSnapshot {
+        pub version: String,
+        pub tick: u64,
+        pub primitives: Vec<(u32, u32)>,
+        pub chunks: Vec<ChunkDto>,
+        pub prediction_edges: Vec<super::PredictionEdgeDto>,
+        pub merge_candidates: Vec<super::MergeCandidateDto>,
+        pub metrics: super::MetricsDto,
+        #[serde(default)]
+        pub next_trace_id: crate::trace::TraceId,
+        #[serde(default)]
+        pub association_edges: Vec<super::AssociationEdgeDto>,
+        #[serde(default = "super::default_top_k")]
+        pub association_top_k: usize,
+        #[serde(default = "super::default_decay")]
+        pub association_decay: f64,
+        #[serde(default)]
+        pub identities: Vec<Vec<u32>>,
+        #[serde(default)]
+        pub views: Vec<super::ViewDto>,
+        #[serde(default)]
+        pub lineage_entries: Vec<(u32, super::UnitIdDto, super::UnitIdDto)>,
+        #[serde(default)]
+        pub identity_parent: Vec<u32>,
+        #[serde(default)]
+        pub representation_entries: Vec<super::RepresentationEntryDto>,
+        #[serde(default)]
+        pub transforms: Vec<super::TransformEntryDto>,
+        #[serde(default)]
+        pub merge_right_reuse: Vec<(super::UnitIdDto, Vec<super::UnitIdDto>)>,
+        #[serde(default)]
+        pub checkpoint_generation: u64,
+        #[serde(default)]
+        pub prediction_edge_groups: Vec<(super::UnitIdDto, Vec<PredEdgeEntryDto>)>,
+        #[serde(default)]
+        pub association_edge_groups: Vec<(super::UnitIdDto, Vec<AssocEdgeEntryDto>)>,
+    }
+}
+
+fn from_v3_snapshot(v3: v3_compat::ModelSnapshot) -> ModelSnapshot {
+    ModelSnapshot {
+        version: v3.version,
+        tick: v3.tick,
+        primitives: v3.primitives,
+        chunks: v3.chunks.into_iter().map(|c| ChunkDto {
+            left: c.left, right: c.right, tier: c.tier,
+            use_count: c.use_count, usage_strength: c.usage_strength,
+            last_used: c.last_used, last_used_delta: c.last_used_delta as u64,
+            expanded_length: c.expanded_length,
+            feedback_value: c.feedback_value, feedback_count: c.feedback_count,
+            residency: c.residency,
+        }).collect(),
+        prediction_edges: v3.prediction_edges,
+        merge_candidates: v3.merge_candidates,
+        metrics: v3.metrics,
+        next_trace_id: v3.next_trace_id,
+        association_edges: v3.association_edges,
+        association_top_k: v3.association_top_k,
+        association_decay: v3.association_decay,
+        identities: v3.identities,
+        views: v3.views,
+        lineage_entries: v3.lineage_entries,
+        identity_parent: v3.identity_parent,
+        representation_entries: v3.representation_entries,
+        transforms: v3.transforms,
+        merge_right_reuse: v3.merge_right_reuse,
+        checkpoint_generation: v3.checkpoint_generation,
+        prediction_edge_groups: v3.prediction_edge_groups.into_iter()
+            .map(|(ctx, edges)| (ctx, edges.into_iter().map(|e| PredEdgeEntryDto {
+                next_unit: e.next_unit, use_count: e.use_count,
+                usage_strength: e.usage_strength, feedback_value: e.feedback_value,
+                feedback_count: e.feedback_count, avoidance: e.avoidance,
+                last_used_tick: e.last_used_tick,
+                last_used_tick_delta: e.last_used_tick_delta as u64,
+                external_route_evidence: e.external_route_evidence,
+            }).collect())).collect(),
+        association_edge_groups: v3.association_edge_groups.into_iter()
+            .map(|(src, edges)| (src, edges.into_iter().map(|e| AssocEdgeEntryDto {
+                target: e.target, strength: e.strength,
+                use_count: e.use_count, last_used: e.last_used,
+                last_used_delta: e.last_used_delta as u64,
             }).collect())).collect(),
     }
 }
@@ -857,20 +1004,19 @@ pub fn load_auto(path: &Path) -> std::io::Result<ModelState> {
     }
 }
 
-/// §28: Encode an absolute tick as a delta from model_tick.
-/// Returns 0 when `actual == 0` (never-used sentinel); otherwise (model_tick - actual) + 1.
-/// Saturates at u32::MAX - 1 so the +1 never wraps.
+/// §28/§14: Encode an absolute tick as a u64 delta from model_tick (lossless).
+/// Returns 0 for the never-used sentinel (actual == 0); otherwise (model_tick - actual) + 1.
 #[inline]
-fn encode_tick_delta(actual: u64, model_tick: u64) -> u32 {
+fn encode_tick_delta(actual: u64, model_tick: u64) -> u64 {
     if actual == 0 { return 0; }
-    model_tick.saturating_sub(actual).min(u32::MAX as u64 - 1) as u32 + 1
+    model_tick.saturating_sub(actual).saturating_add(1)
 }
 
-/// §28: Decode a delta back to an absolute tick.
+/// §28/§14: Decode a u64 delta back to an absolute tick.
 /// `delta > 0`: `snap_tick - (delta - 1)`. `delta == 0`: use legacy `raw` value.
 #[inline]
-fn decode_tick_delta(delta: u32, snap_tick: u64, raw: u64) -> u64 {
-    if delta > 0 { snap_tick.saturating_sub(delta as u64 - 1) } else { raw }
+fn decode_tick_delta(delta: u64, snap_tick: u64, raw: u64) -> u64 {
+    if delta > 0 { snap_tick.saturating_sub(delta - 1) } else { raw }
 }
 
 pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {

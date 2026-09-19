@@ -95,9 +95,9 @@ impl TransformStore {
     /// If the inverse already exists in the store, the existing id is returned.
     /// Otherwise a new derived Transform is created and stored.
     pub fn inverse(&mut self, tid: TransformId) -> Option<TransformId> {
-        let (src, tgt) = {
+        let (src, tgt, orig_value, orig_evidence) = {
             let t = self.transforms.get(tid as usize)?;
-            (t.source, t.target)
+            (t.source, t.target, t.value, t.evidence)
         };
         if let Some(&inv_id) = self.by_pair.get(&(tgt, src)) {
             return Some(inv_id);
@@ -108,8 +108,9 @@ impl TransformStore {
             source: tgt,
             target: src,
             kind: TransformKind::Inverse(tid),
-            value: 0.0,
-            evidence: 0.0,
+            // §18: numeric inverse — negate the original scalar value.
+            value: -orig_value,
+            evidence: orig_evidence,
         });
         self.by_pair.insert((tgt, src), inv_id);
         Some(inv_id)
@@ -119,13 +120,13 @@ impl TransformStore {
     ///
     /// Returns `None` if the chain does not connect (`f.target != g.source`).
     pub fn compose(&mut self, f: TransformId, g: TransformId) -> Option<TransformId> {
-        let (f_src, f_tgt) = {
+        let (f_src, f_tgt, f_val, f_ev) = {
             let t = self.transforms.get(f as usize)?;
-            (t.source, t.target)
+            (t.source, t.target, t.value, t.evidence)
         };
-        let (g_src, g_tgt) = {
+        let (g_src, g_tgt, g_val, g_ev) = {
             let t = self.transforms.get(g as usize)?;
-            (t.source, t.target)
+            (t.source, t.target, t.value, t.evidence)
         };
         if f_tgt != g_src {
             return None;
@@ -139,8 +140,9 @@ impl TransformStore {
             source: f_src,
             target: g_tgt,
             kind: TransformKind::Composed(f, g),
-            value: 0.0,
-            evidence: 0.0,
+            // §18: composed numeric value = f.value + g.value (additive in log space).
+            value: f_val + g_val,
+            evidence: f_ev.min(g_ev),
         });
         self.by_pair.insert((f_src, g_tgt), cid);
         Some(cid)
@@ -168,6 +170,24 @@ impl TransformStore {
     /// Iterate all transforms for serialisation.
     pub fn iter_all(&self) -> impl Iterator<Item = &Transform> {
         self.transforms.iter()
+    }
+
+    /// §19: Restore a persisted entry during deserialization.
+    /// Does NOT trigger merge_identities — caller is responsible for Identity store state.
+    pub fn restore_entry(
+        &mut self,
+        source: IdentityId,
+        target: IdentityId,
+        kind: TransformKind,
+        value: f64,
+        evidence: f64,
+    ) {
+        if self.by_pair.contains_key(&(source, target)) {
+            return;
+        }
+        let id = self.transforms.len() as TransformId;
+        self.transforms.push(Transform { id, source, target, kind, value, evidence });
+        self.by_pair.insert((source, target), id);
     }
 }
 

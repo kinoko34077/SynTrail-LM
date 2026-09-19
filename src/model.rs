@@ -142,6 +142,8 @@ pub struct ModelState {
     pub memory_budget: crate::config::MemoryBudgetConfig,
     /// Learning tunables (§17).
     pub learning: crate::config::LearningConfig,
+    /// §18/§19: Transform store — directed relations between Identities.
+    pub transforms: crate::transform::TransformStore,
 }
 
 impl ModelState {
@@ -816,6 +818,7 @@ impl ModelState {
         lineage: LineageStore,
         relations: RelationStore,
         representations: RepresentationStore,
+        transforms: crate::transform::TransformStore,
         tick: u64,
         merge_candidates: HashMap<(UnitId, UnitId), u32>,
         metrics: Metrics,
@@ -830,6 +833,7 @@ impl ModelState {
             lineage,
             relations,
             representations,
+            transforms,
             tick,
             merge_candidates,
             merge_right_reuse: HashMap::new(), // not persisted; rebuilt during training

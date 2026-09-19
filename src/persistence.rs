@@ -25,6 +25,7 @@ use crate::primitives::PrimitiveRegistry;
 use crate::representation::{RepresentationEntry, RepresentationStore};
 use crate::tier::Tier;
 use crate::trace::TraceId;
+use crate::transform::{TransformKind, TransformStore};
 use crate::units::UnitId;
 
 // ── Serialisable mirror types ──────────────────────────────────────────────
@@ -220,6 +221,20 @@ struct ViewDto {
     identity: u32,
 }
 
+/// §19: Transform persistence DTO.
+/// kind_tag: 0=EquivalentView, 1=Mapping, 2=Inverse, 3=Composed.
+/// kind_arg1/arg2: TransformId references for Inverse/Composed.
+#[derive(Serialize, Deserialize)]
+struct TransformEntryDto {
+    source: u32,
+    target: u32,
+    kind_tag: u8,
+    kind_arg1: u32,
+    kind_arg2: u32,
+    value: f64,
+    evidence: f64,
+}
+
 /// Top-level snapshot written to disk.
 #[derive(Serialize, Deserialize)]
 pub struct ModelSnapshot {
@@ -256,6 +271,9 @@ pub struct ModelSnapshot {
     /// Phase B: Representation Lineage entries.
     #[serde(default)]
     representation_entries: Vec<RepresentationEntryDto>,
+    /// §19: Transform entries (directed Identity relations).
+    #[serde(default)]
+    transforms: Vec<TransformEntryDto>,
 }
 
 fn default_top_k() -> usize { 32 }
@@ -360,6 +378,26 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
     let representation_entries: Vec<RepresentationEntryDto> =
         model.representations.iter_all().map(RepresentationEntryDto::from).collect();
 
+    let transforms: Vec<TransformEntryDto> = model.transforms.iter_all()
+        .map(|t| {
+            let (kind_tag, kind_arg1, kind_arg2) = match &t.kind {
+                TransformKind::EquivalentView => (0u8, 0u32, 0u32),
+                TransformKind::Mapping       => (1u8, 0u32, 0u32),
+                TransformKind::Inverse(a)    => (2u8, *a,   0u32),
+                TransformKind::Composed(a,b) => (3u8, *a,   *b),
+            };
+            TransformEntryDto {
+                source: t.source,
+                target: t.target,
+                kind_tag,
+                kind_arg1,
+                kind_arg2,
+                value: t.value,
+                evidence: t.evidence,
+            }
+        })
+        .collect();
+
     ModelSnapshot {
         version: "0.5".to_owned(),
         tick: model.tick,
@@ -377,6 +415,7 @@ pub fn to_snapshot(model: &ModelState) -> ModelSnapshot {
         lineage_entries,
         identity_parent,
         representation_entries,
+        transforms,
     }
 }
 
@@ -477,6 +516,19 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         .collect();
     let representations = RepresentationStore::from_bulk(representation_bulk);
 
+    // §19: rebuild TransformStore from DTOs.
+    let mut transforms = TransformStore::new();
+    for dto in snap.transforms {
+        let kind = match dto.kind_tag {
+            0 => TransformKind::EquivalentView,
+            1 => TransformKind::Mapping,
+            2 => TransformKind::Inverse(dto.kind_arg1),
+            3 => TransformKind::Composed(dto.kind_arg1, dto.kind_arg2),
+            _ => TransformKind::Mapping,
+        };
+        transforms.restore_entry(dto.source, dto.target, kind, dto.value, dto.evidence);
+    }
+
     ModelState::from_parts(
         primitives,
         chunks,
@@ -486,6 +538,7 @@ pub fn from_snapshot(snap: ModelSnapshot) -> ModelState {
         lineage,
         relations,
         representations,
+        transforms,
         snap.tick,
         merge_candidates,
         Metrics {

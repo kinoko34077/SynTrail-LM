@@ -2006,3 +2006,37 @@ fn trf07_equivalent_view_kind_stored() {
     assert!(matches!(t.kind, TransformKind::EquivalentView),
         "TRF-07: stored kind must be EquivalentView");
 }
+
+// ── TRF-08: §18/§19 — Transform value/evidence preserved through JSON roundtrip ──
+#[test]
+fn trf08_transform_persistence_roundtrip() {
+    use syntrail_lm::persistence::{save, load};
+    use syntrail_lm::identity::IdentityStore;
+    use syntrail_lm::transform::TransformKind;
+    use tempfile::NamedTempFile;
+
+    let mut model = ModelState::new();
+    // Register two identities and a Mapping transform with non-zero value/evidence.
+    let a = model.identities.intern_identity(&[10]);
+    let b = model.identities.intern_identity(&[20]);
+    let tid = model.transforms.register(a, b, TransformKind::Mapping, &mut model.identities);
+    {
+        let t = model.transforms.get_mut(tid).unwrap();
+        t.value = 1.5;
+        t.evidence = 0.75;
+    }
+
+    let file = NamedTempFile::new().unwrap();
+    save(&model, file.path()).unwrap();
+    let loaded = load(file.path()).unwrap();
+
+    assert_eq!(loaded.transforms.transform_count(), 1,
+        "TRF-08: transform count must be 1 after roundtrip");
+    let t = loaded.transforms.get(tid).unwrap();
+    assert!(matches!(t.kind, TransformKind::Mapping),
+        "TRF-08: kind must survive roundtrip");
+    assert!((t.value - 1.5).abs() < 1e-9,
+        "TRF-08: value must survive roundtrip; got {}", t.value);
+    assert!((t.evidence - 0.75).abs() < 1e-9,
+        "TRF-08: evidence must survive roundtrip; got {}", t.evidence);
+}

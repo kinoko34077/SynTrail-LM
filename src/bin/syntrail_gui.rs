@@ -377,7 +377,19 @@ impl eframe::App for SynTrailApp {
                     action = Action::LoadPath(p);
                 }
                 DropResult::MultipleFiles => {
-                    // P2 feedback behavior is handled separately from this worker repair.
+                    self.status =
+                        "Drop failed: Chat accepts one model file at a time.".to_string();
+                }
+                DropResult::Unsupported(path) => {
+                    self.status = format!(
+                        "Drop failed: unsupported Chat file type: {}. Drop one supported model file.",
+                        path.display()
+                    );
+                }
+                DropResult::ModelAndDataset { .. } => {
+                    self.status =
+                        "Drop failed: Chat accepts one model file; dataset pairing is Trainer-only."
+                            .to_string();
                 }
                 _ => {}
             }

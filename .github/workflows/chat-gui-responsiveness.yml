@@ -5,6 +5,7 @@ on:
     paths:
       - "src/bin/syntrail_gui.rs"
       - "tests/chat_gui_responsiveness.rs"
+      - "tests/chat_gui_drop_feedback.rs"
       - ".github/workflows/chat-gui-responsiveness.yml"
   push:
     branches:
@@ -12,6 +13,7 @@ on:
     paths:
       - "src/bin/syntrail_gui.rs"
       - "tests/chat_gui_responsiveness.rs"
+      - "tests/chat_gui_drop_feedback.rs"
       - ".github/workflows/chat-gui-responsiveness.yml"
 
 permissions:
@@ -27,7 +29,9 @@ jobs:
           toolchain: stable
           components: rustfmt
       - name: Focused chat GUI regressions
-        run: cargo test --test chat_gui_responsiveness
+        run: |
+          cargo test --test chat_gui_responsiveness
+          cargo test --test chat_gui_drop_feedback
       - name: Format changed GUI file
         run: rustfmt --edition 2024 --check src/bin/syntrail_gui.rs
       - name: Full test suite

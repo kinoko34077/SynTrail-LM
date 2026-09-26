@@ -19,7 +19,6 @@ use syntrail_lm::desktop::platform::windows::NativeMenu;
 
 const DEFAULT_MODEL: &str = "model.json";
 const DEFAULT_HISTORY: &str = "history.sqlite";
-const DEFAULT_REFRESH: u32 = 5;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -86,8 +85,6 @@ struct SynTrailApp {
     chat_history: Vec<ChatEntry>,
     feedback_state: FeedbackState,
     analytics: Analytics,
-    refresh_interval: u32,
-    turns_since_refresh: u32,
     status: String,
     #[cfg(all(target_os = "windows", feature = "gui"))]
     native_menu: NativeMenu,
@@ -109,8 +106,6 @@ impl SynTrailApp {
             chat_history,
             feedback_state: FeedbackState::None,
             analytics,
-            refresh_interval: DEFAULT_REFRESH,
-            turns_since_refresh: 0,
             status: "Ready".to_string(),
             #[cfg(all(target_os = "windows", feature = "gui"))]
             native_menu: NativeMenu::build(),
@@ -185,11 +180,7 @@ impl SynTrailApp {
                             text: output,
                         });
                         self.feedback_state = FeedbackState::Pending(turn_id);
-                        self.turns_since_refresh += 1;
-                        if self.turns_since_refresh >= self.refresh_interval {
-                            self.analytics = a;
-                            self.turns_since_refresh = 0;
-                        }
+                        self.analytics = a;
                     }
                     Err(error) => {
                         self.chat_history.pop();
@@ -377,9 +368,18 @@ impl eframe::App for SynTrailApp {
                     action = Action::LoadPath(p);
                 }
                 DropResult::MultipleFiles => {
-                    // P2 feedback behavior is handled separately from this worker repair.
+                    self.status = "Drop rejected: multiple files are not supported in Chat. Drop one model file at a time.".to_string();
                 }
-                _ => {}
+                DropResult::Unsupported(path) => {
+                    self.status = format!(
+                        "Unsupported dropped file: {}. Chat accepts one model file at a time.",
+                        path.display()
+                    );
+                }
+                DropResult::ModelAndDataset { .. } | DropResult::Command(_) => {
+                    self.status = "Drop rejected: Chat accepts one supported model file at a time."
+                        .to_string();
+                }
             }
         }
 
@@ -555,11 +555,6 @@ impl eframe::App for SynTrailApp {
                                 ui.end_row();
                             });
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Refresh /");
-                            ui.add(egui::DragValue::new(&mut self.refresh_interval).range(1..=200));
-                            ui.label("turns");
-                        });
                         if ui.button("Update Now").clicked() {
                             action = Action::RefreshAnalytics;
                         }

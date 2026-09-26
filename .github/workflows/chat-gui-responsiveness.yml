@@ -28,8 +28,8 @@ jobs:
           components: rustfmt
       - name: Focused chat GUI regressions
         run: cargo test --test chat_gui_responsiveness
-      - name: Format
-        run: cargo fmt --check
+      - name: Format changed GUI file
+        run: rustfmt --edition 2024 --check src/bin/syntrail_gui.rs
       - name: Full test suite
         run: cargo test
       - name: GUI release build

@@ -1,0 +1,36 @@
+name: Chat GUI responsiveness verify
+
+on:
+  pull_request:
+    paths:
+      - "src/bin/syntrail_gui.rs"
+      - "tests/chat_gui_responsiveness.rs"
+      - ".github/workflows/chat-gui-responsiveness.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/bin/syntrail_gui.rs"
+      - "tests/chat_gui_responsiveness.rs"
+      - ".github/workflows/chat-gui-responsiveness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Focused chat GUI regressions
+        run: cargo test --test chat_gui_responsiveness
+      - name: Format
+        run: cargo fmt --check
+      - name: Full test suite
+        run: cargo test
+      - name: GUI release build
+        run: cargo build --release --features gui --bin syntrail-gui

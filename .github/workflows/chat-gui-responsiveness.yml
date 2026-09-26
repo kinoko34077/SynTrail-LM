@@ -32,5 +32,9 @@ jobs:
         run: rustfmt --edition 2024 --check src/bin/syntrail_gui.rs
       - name: Full test suite
         run: cargo test
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxdo-dev
       - name: GUI release build
         run: cargo build --release --features gui --bin syntrail-gui

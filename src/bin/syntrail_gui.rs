@@ -10,7 +10,7 @@ use std::time::Duration;
 use syntrail_lm::app::{Analytics, AppHandle};
 use syntrail_lm::db::TurnRow;
 use syntrail_lm::desktop::dialogs::{confirm_discard_dialog, open_model_dialog, save_model_dialog};
-use syntrail_lm::desktop::drop::{route_drop, AcceptedKinds, DropResult};
+use syntrail_lm::desktop::drop::{AcceptedKinds, DropResult, route_drop};
 use syntrail_lm::desktop::fonts::setup_fonts;
 use syntrail_lm::feedback::FeedbackSign;
 
@@ -173,11 +173,13 @@ impl SynTrailApp {
                 match done.result {
                     Ok((turn_id, output)) => {
                         let Some(handle) = self.handle.as_ref() else {
-                            self.status = "Generation completed but model handle was not restored.".to_string();
+                            self.status = "Generation completed but model handle was not restored."
+                                .to_string();
                             return;
                         };
                         let a = handle.get_analytics();
-                        self.status = format!("Turn {}  |  {} decisions", turn_id, a.last_decision_count);
+                        self.status =
+                            format!("Turn {}  |  {} decisions", turn_id, a.last_decision_count);
                         self.chat_history.push(ChatEntry {
                             is_user: false,
                             text: output,
@@ -210,7 +212,8 @@ impl SynTrailApp {
 
     fn do_feedback(&mut self, turn_id: i64, sign: FeedbackSign) {
         let Some(handle) = self.handle.as_mut() else {
-            self.status = "Generation in progress — feedback is temporarily unavailable.".to_string();
+            self.status =
+                "Generation in progress — feedback is temporarily unavailable.".to_string();
             return;
         };
         match handle.apply_feedback(turn_id, sign) {
@@ -232,7 +235,8 @@ impl SynTrailApp {
             return;
         }
         let Some(handle) = self.handle.as_mut() else {
-            self.status = "Generation in progress — model replacement is temporarily unavailable.".to_string();
+            self.status = "Generation in progress — model replacement is temporarily unavailable."
+                .to_string();
             return;
         };
         match handle.load_model_from(&path) {
@@ -284,7 +288,8 @@ impl SynTrailApp {
             return;
         }
         let Some(handle) = self.handle.as_mut() else {
-            self.status = "Generation in progress — model replacement is temporarily unavailable.".to_string();
+            self.status = "Generation in progress — model replacement is temporarily unavailable."
+                .to_string();
             return;
         };
         handle.reset_model();
@@ -296,7 +301,8 @@ impl SynTrailApp {
 
     fn do_new_conversation(&mut self) {
         let Some(handle) = self.handle.as_mut() else {
-            self.status = "Generation in progress — conversation reset is temporarily unavailable.".to_string();
+            self.status = "Generation in progress — conversation reset is temporarily unavailable."
+                .to_string();
             return;
         };
         handle.new_conversation();

@@ -4,6 +4,9 @@
 /// Run:    cargo run   --features gui --bin syntrail-gui
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::Duration;
 use syntrail_lm::app::{Analytics, AppHandle};
 use syntrail_lm::db::TurnRow;
 use syntrail_lm::desktop::dialogs::{confirm_discard_dialog, open_model_dialog, save_model_dialog};
@@ -36,7 +39,6 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-
 // ── Data types ────────────────────────────────────────────────────────────
 
 struct ChatEntry {
@@ -63,10 +65,23 @@ enum Action {
     Send,
 }
 
+struct GenerationResult {
+    handle: AppHandle,
+    result: Result<(i64, String), String>,
+}
+
+enum ChatRequestState {
+    Idle,
+    Generating(Receiver<GenerationResult>),
+}
+
 // ── App ───────────────────────────────────────────────────────────────────
 
 struct SynTrailApp {
-    handle: AppHandle,
+    /// Generation temporarily owns the handle on a background thread.
+    handle: Option<AppHandle>,
+    request_state: ChatRequestState,
+    model_path_display: String,
     input: String,
     chat_history: Vec<ChatEntry>,
     feedback_state: FeedbackState,
@@ -85,8 +100,11 @@ impl SynTrailApp {
             .unwrap_or_else(|e| panic!("Failed to init AppHandle: {e}"));
         let chat_history = load_history_entries(&handle);
         let analytics = handle.get_analytics();
+        let model_path_display = handle.doc.path_str().to_string();
         Self {
-            handle,
+            handle: Some(handle),
+            request_state: ChatRequestState::Idle,
+            model_path_display,
             input: String::new(),
             chat_history,
             feedback_state: FeedbackState::None,
@@ -99,38 +117,113 @@ impl SynTrailApp {
         }
     }
 
-    fn send_message(&mut self) {
-        let raw = self.input.clone();  // pass raw string to model (§100)
-        if raw.trim().is_empty() { return; }
+    fn is_generating(&self) -> bool {
+        matches!(self.request_state, ChatRequestState::Generating(_))
+    }
+
+    fn start_generation(&mut self) {
+        if self.is_generating() {
+            self.status = "Generation in progress — wait for the current response.".to_string();
+            return;
+        }
+
+        let raw = self.input.clone(); // pass raw string to model (§100)
+        if raw.trim().is_empty() {
+            return;
+        }
+
+        let Some(mut handle) = self.handle.take() else {
+            self.status = "Generation unavailable: model handle is not ready.".to_string();
+            return;
+        };
+        self.model_path_display = handle.doc.path_str().to_string();
         self.input.clear();
         self.feedback_state = FeedbackState::None; // auto-skip prior feedback
-        self.chat_history.push(ChatEntry { is_user: true, text: raw.clone() });
+        self.chat_history.push(ChatEntry {
+            is_user: true,
+            text: raw.clone(),
+        });
+        self.status = "Generating…".to_string();
 
-        match self.handle.generate_turn(&raw) {
-            Ok((turn_id, output)) => {
-                let a = self.handle.get_analytics();
-                self.status = format!("Turn {}  |  {} decisions", turn_id, a.last_decision_count);
-                self.chat_history.push(ChatEntry { is_user: false, text: output });
-                self.feedback_state = FeedbackState::Pending(turn_id);
-                self.turns_since_refresh += 1;
-                if self.turns_since_refresh >= self.refresh_interval {
-                    self.analytics = a;
-                    self.turns_since_refresh = 0;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            // Always return ownership of AppHandle even if generation itself panics.
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.generate_turn(&raw)
+            })) {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("Generation worker panicked".to_string()),
+            };
+            let _ = tx.send(GenerationResult { handle, result });
+        });
+        self.request_state = ChatRequestState::Generating(rx);
+    }
+
+    fn poll_generation(&mut self, ctx: &egui::Context) {
+        let received = match &self.request_state {
+            ChatRequestState::Idle => return,
+            ChatRequestState::Generating(rx) => rx.try_recv(),
+        };
+
+        match received {
+            Ok(done) => {
+                self.handle = Some(done.handle);
+                self.request_state = ChatRequestState::Idle;
+                match done.result {
+                    Ok((turn_id, output)) => {
+                        let Some(handle) = self.handle.as_ref() else {
+                            self.status = "Generation completed but model handle was not restored."
+                                .to_string();
+                            return;
+                        };
+                        let a = handle.get_analytics();
+                        self.status =
+                            format!("Turn {}  |  {} decisions", turn_id, a.last_decision_count);
+                        self.chat_history.push(ChatEntry {
+                            is_user: false,
+                            text: output,
+                        });
+                        self.feedback_state = FeedbackState::Pending(turn_id);
+                        self.turns_since_refresh += 1;
+                        if self.turns_since_refresh >= self.refresh_interval {
+                            self.analytics = a;
+                            self.turns_since_refresh = 0;
+                        }
+                    }
+                    Err(error) => {
+                        self.chat_history.pop();
+                        self.status = format!("Generation failed: {error}");
+                    }
                 }
+                ctx.request_repaint();
             }
-            Err(e) => {
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(33));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.request_state = ChatRequestState::Idle;
                 self.chat_history.pop();
-                self.status = format!("Generation failed: {e}");
+                self.status = "Generation failed: worker disconnected before returning the model handle. Restart the app before continuing.".to_string();
+                ctx.request_repaint();
             }
         }
     }
 
     fn do_feedback(&mut self, turn_id: i64, sign: FeedbackSign) {
-        match self.handle.apply_feedback(turn_id, sign) {
+        let Some(handle) = self.handle.as_mut() else {
+            self.status =
+                "Generation in progress — feedback is temporarily unavailable.".to_string();
+            return;
+        };
+        match handle.apply_feedback(turn_id, sign) {
             Ok(()) => {
-                let label = match sign { FeedbackSign::Positive => "○", FeedbackSign::Negative => "×" };
+                let label = match sign {
+                    FeedbackSign::Positive => "○",
+                    FeedbackSign::Negative => "×",
+                };
                 self.status = format!("Feedback {label} → turn {turn_id}");
-                self.analytics = self.handle.get_analytics();
+                self.analytics = handle.get_analytics();
             }
             Err(e) => self.status = format!("Feedback failed: {e}"),
         }
@@ -138,10 +231,17 @@ impl SynTrailApp {
     }
 
     fn do_load(&mut self, path: PathBuf) {
-        if !self.confirm_discard_if_dirty() { return; }
-        match self.handle.load_model_from(&path) {
+        if !self.confirm_discard_if_dirty() {
+            return;
+        }
+        let Some(handle) = self.handle.as_mut() else {
+            self.status = "Generation in progress — model replacement is temporarily unavailable."
+                .to_string();
+            return;
+        };
+        match handle.load_model_from(&path) {
             Ok(()) => {
-                self.analytics = self.handle.get_analytics();
+                self.analytics = handle.get_analytics();
                 self.chat_history.clear();
                 self.feedback_state = FeedbackState::None;
                 self.status = format!("Loaded: {}", path.display());
@@ -151,14 +251,22 @@ impl SynTrailApp {
     }
 
     fn do_save(&mut self) {
-        match self.handle.save_model() {
-            Ok(()) => self.status = format!("Saved: {}", self.handle.doc.path_str()),
+        let Some(handle) = self.handle.as_mut() else {
+            self.status = "Generation in progress — save is temporarily unavailable.".to_string();
+            return;
+        };
+        match handle.save_model() {
+            Ok(()) => self.status = format!("Saved: {}", handle.doc.path_str()),
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
     fn do_save_as(&mut self, path: PathBuf) {
-        match self.handle.save_model_to(&path) {
+        let Some(handle) = self.handle.as_mut() else {
+            self.status = "Generation in progress — save is temporarily unavailable.".to_string();
+            return;
+        };
+        match handle.save_model_to(&path) {
             Ok(()) => self.status = format!("Saved: {}", path.display()),
             Err(e) => self.status = format!("Save failed: {e}"),
         }
@@ -166,21 +274,38 @@ impl SynTrailApp {
 
     /// Returns true if the user confirmed or no confirmation was needed.
     fn confirm_discard_if_dirty(&self) -> bool {
-        if !self.handle.doc.dirty { return true; }
+        let Some(handle) = self.handle.as_ref() else {
+            return false;
+        };
+        if !handle.doc.dirty {
+            return true;
+        }
         confirm_discard_dialog()
     }
 
     fn do_new(&mut self) {
-        if !self.confirm_discard_if_dirty() { return; }
-        self.handle.reset_model();
+        if !self.confirm_discard_if_dirty() {
+            return;
+        }
+        let Some(handle) = self.handle.as_mut() else {
+            self.status = "Generation in progress — model replacement is temporarily unavailable."
+                .to_string();
+            return;
+        };
+        handle.reset_model();
         self.chat_history.clear();
         self.feedback_state = FeedbackState::None;
-        self.analytics = self.handle.get_analytics();
+        self.analytics = handle.get_analytics();
         self.status = "New model (unsaved)".to_string();
     }
 
     fn do_new_conversation(&mut self) {
-        self.handle.new_conversation();
+        let Some(handle) = self.handle.as_mut() else {
+            self.status = "Generation in progress — conversation reset is temporarily unavailable."
+                .to_string();
+            return;
+        };
+        handle.new_conversation();
         self.chat_history.clear();
         self.feedback_state = FeedbackState::None;
         self.status = "New conversation".to_string();
@@ -191,8 +316,14 @@ fn load_history_entries(handle: &AppHandle) -> Vec<ChatEntry> {
     let rows: Vec<TurnRow> = handle.history(60).unwrap_or_default();
     let mut v = Vec::with_capacity(rows.len() * 2);
     for row in rows.into_iter().rev() {
-        v.push(ChatEntry { is_user: true,  text: row.input_text });
-        v.push(ChatEntry { is_user: false, text: row.output_text });
+        v.push(ChatEntry {
+            is_user: true,
+            text: row.input_text,
+        });
+        v.push(ChatEntry {
+            is_user: false,
+            text: row.output_text,
+        });
     }
     v
 }
@@ -201,7 +332,13 @@ fn load_history_entries(handle: &AppHandle) -> Vec<ChatEntry> {
 
 impl eframe::App for SynTrailApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_generation(ctx);
+        if let Some(handle) = self.handle.as_ref() {
+            self.model_path_display = handle.doc.path_str().to_string();
+        }
+
         let mut action = Action::None;
+        let is_generating = self.is_generating();
 
         // Native menu: attach on first frame, then poll each frame (§88–94)
         #[cfg(all(target_os = "windows", feature = "gui"))]
@@ -215,20 +352,24 @@ impl eframe::App for SynTrailApp {
             }
             if let Some(cmd) = self.native_menu.poll() {
                 action = match cmd {
-                    syntrail_lm::desktop::FileCommand::New            => Action::New,
+                    syntrail_lm::desktop::FileCommand::New => Action::New,
                     syntrail_lm::desktop::FileCommand::NewConversation => Action::NewConversation,
-                    syntrail_lm::desktop::FileCommand::Open           => Action::OpenLoadDialog,
-                    syntrail_lm::desktop::FileCommand::Save           => Action::Save,
-                    syntrail_lm::desktop::FileCommand::SaveAs         => Action::OpenSaveDialog,
-                    syntrail_lm::desktop::FileCommand::LoadPath(p)    => Action::LoadPath(p),
-                    syntrail_lm::desktop::FileCommand::OpenDataset    => Action::None,
+                    syntrail_lm::desktop::FileCommand::Open => Action::OpenLoadDialog,
+                    syntrail_lm::desktop::FileCommand::Save => Action::Save,
+                    syntrail_lm::desktop::FileCommand::SaveAs => Action::OpenSaveDialog,
+                    syntrail_lm::desktop::FileCommand::LoadPath(p) => Action::LoadPath(p),
+                    syntrail_lm::desktop::FileCommand::OpenDataset => Action::None,
                 };
             }
         }
 
         // File drag-and-drop — routed via desktop::drop::route_drop.
         let dropped: Vec<_> = ctx.input(|i| {
-            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
         });
         if !dropped.is_empty() {
             match route_drop(dropped, &AcceptedKinds::chat()) {
@@ -236,14 +377,13 @@ impl eframe::App for SynTrailApp {
                     action = Action::LoadPath(p);
                 }
                 DropResult::MultipleFiles => {
-                    // silently ignore multiple-file drops for Chat
+                    // P2 feedback behavior is handled separately from this worker repair.
                 }
                 _ => {}
             }
         }
 
-        // Current model path for display
-        let model_path_str = self.handle.doc.path_str().to_string();
+        let model_path_str = self.model_path_display.clone();
 
         // ── Top toolbar ───────────────────────────────────────────────────
         // §38: File-operation buttons shown only on platforms without a native menu.
@@ -252,11 +392,21 @@ impl eframe::App for SynTrailApp {
             ui.horizontal(|ui| {
                 #[cfg(not(all(target_os = "windows", feature = "gui")))]
                 {
-                    if ui.button("New Model").clicked()        { action = Action::New; }
-                    if ui.button("New Conversation").clicked() { action = Action::NewConversation; }
-                    if ui.button("Open…").clicked()            { action = Action::OpenLoadDialog; }
-                    if ui.button("Save").clicked()             { action = Action::Save; }
-                    if ui.button("Save As…").clicked()         { action = Action::OpenSaveDialog; }
+                    if ui.button("New Model").clicked() {
+                        action = Action::New;
+                    }
+                    if ui.button("New Conversation").clicked() {
+                        action = Action::NewConversation;
+                    }
+                    if ui.button("Open…").clicked() {
+                        action = Action::OpenLoadDialog;
+                    }
+                    if ui.button("Save").clicked() {
+                        action = Action::Save;
+                    }
+                    if ui.button("Save As…").clicked() {
+                        action = Action::OpenSaveDialog;
+                    }
                     ui.separator();
                 }
                 ui.label(egui::RichText::new(&model_path_str).small().weak());
@@ -277,13 +427,15 @@ impl eframe::App for SynTrailApp {
                     ui.label(egui::RichText::new(&self.status).small());
                     if let FeedbackState::Pending(tid) = self.feedback_state {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("  ×  ")
+                            if ui
+                                .add_enabled(!is_generating, egui::Button::new("  ×  "))
                                 .on_hover_text("Negative feedback (−1)")
                                 .clicked()
                             {
                                 action = Action::Feedback(tid, FeedbackSign::Negative);
                             }
-                            if ui.button("  ○  ")
+                            if ui
+                                .add_enabled(!is_generating, egui::Button::new("  ○  "))
                                 .on_hover_text("Positive feedback (+1)")
                                 .clicked()
                             {
@@ -300,11 +452,16 @@ impl eframe::App for SynTrailApp {
                             .desired_rows(3)
                             .desired_width(avail - 82.0),
                     );
-                    let enter_pressed = response.has_focus()
+                    let enter_pressed = !is_generating
+                        && response.has_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                    if ui.add_sized([72.0, 60.0], egui::Button::new("Send")).clicked()
-                        || enter_pressed
-                    {
+                    let send_clicked = ui
+                        .add_enabled(
+                            !is_generating,
+                            egui::Button::new("Send").min_size(egui::vec2(72.0, 60.0)),
+                        )
+                        .clicked();
+                    if send_clicked || enter_pressed {
                         action = Action::Send;
                     }
                 });
@@ -321,34 +478,82 @@ impl eframe::App for SynTrailApp {
                     .id_salt("analytics_scroll")
                     .show(ui, |ui| {
                         let a = &self.analytics;
-                        egui::Grid::new("ag").num_columns(2).striped(true).show(ui, |ui| {
-                            ui.label("Generation");      ui.label(a.generation.to_string());          ui.end_row();
-                            ui.label("Tick");            ui.label(a.tick.to_string());                ui.end_row();
-                            ui.end_row(); ui.end_row();
-                            ui.label("Primitive");       ui.label(a.primitive_count.to_string());     ui.end_row();
-                            ui.label("Chunk");           ui.label(a.chunk_count.to_string());         ui.end_row();
-                            ui.label("HOT");             ui.label(a.hot_count.to_string());           ui.end_row();
-                            ui.label("SLEEP");           ui.label(a.sleep_count.to_string());         ui.end_row();
-                            ui.end_row(); ui.end_row();
-                            ui.label("Association");     ui.label(a.association_count.to_string());   ui.end_row();
-                            ui.label("Route (edges)");   ui.label(a.edge_count.to_string());          ui.end_row();
-                            ui.end_row(); ui.end_row();
-                            ui.label("T0");              ui.label(a.t0_count.to_string());            ui.end_row();
-                            ui.label("T1");              ui.label(a.t1_count.to_string());            ui.end_row();
-                            ui.label("T2");              ui.label(a.t2_count.to_string());            ui.end_row();
-                            ui.end_row(); ui.end_row();
-                            ui.label("Avg Exp Len");     ui.label(format!("{:.2}", a.avg_expanded_length)); ui.end_row();
-                            ui.end_row(); ui.end_row();
-                            ui.label("Total Chars");     ui.label(a.total_characters.to_string());   ui.end_row();
-                            ui.label("Total Decisions"); ui.label(a.total_decisions.to_string());    ui.end_row();
-                            ui.label("dpc");             ui.label(format!("{:.6}", a.dpc));          ui.end_row();
-                            ui.end_row(); ui.end_row();
-                            ui.label("Last Decisions");  ui.label(a.last_decision_count.to_string()); ui.end_row();
-                            ui.label("Last Out Chars");  ui.label(a.last_output_chars.to_string()); ui.end_row();
-                            ui.end_row(); ui.end_row();
-                            ui.label("Positive FB");     ui.label(a.pos_feedback_count.to_string()); ui.end_row();
-                            ui.label("Negative FB");     ui.label(a.neg_feedback_count.to_string()); ui.end_row();
-                        });
+                        egui::Grid::new("ag")
+                            .num_columns(2)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label("Generation");
+                                ui.label(a.generation.to_string());
+                                ui.end_row();
+                                ui.label("Tick");
+                                ui.label(a.tick.to_string());
+                                ui.end_row();
+                                ui.end_row();
+                                ui.end_row();
+                                ui.label("Primitive");
+                                ui.label(a.primitive_count.to_string());
+                                ui.end_row();
+                                ui.label("Chunk");
+                                ui.label(a.chunk_count.to_string());
+                                ui.end_row();
+                                ui.label("HOT");
+                                ui.label(a.hot_count.to_string());
+                                ui.end_row();
+                                ui.label("SLEEP");
+                                ui.label(a.sleep_count.to_string());
+                                ui.end_row();
+                                ui.end_row();
+                                ui.end_row();
+                                ui.label("Association");
+                                ui.label(a.association_count.to_string());
+                                ui.end_row();
+                                ui.label("Route (edges)");
+                                ui.label(a.edge_count.to_string());
+                                ui.end_row();
+                                ui.end_row();
+                                ui.end_row();
+                                ui.label("T0");
+                                ui.label(a.t0_count.to_string());
+                                ui.end_row();
+                                ui.label("T1");
+                                ui.label(a.t1_count.to_string());
+                                ui.end_row();
+                                ui.label("T2");
+                                ui.label(a.t2_count.to_string());
+                                ui.end_row();
+                                ui.end_row();
+                                ui.end_row();
+                                ui.label("Avg Exp Len");
+                                ui.label(format!("{:.2}", a.avg_expanded_length));
+                                ui.end_row();
+                                ui.end_row();
+                                ui.end_row();
+                                ui.label("Total Chars");
+                                ui.label(a.total_characters.to_string());
+                                ui.end_row();
+                                ui.label("Total Decisions");
+                                ui.label(a.total_decisions.to_string());
+                                ui.end_row();
+                                ui.label("dpc");
+                                ui.label(format!("{:.6}", a.dpc));
+                                ui.end_row();
+                                ui.end_row();
+                                ui.end_row();
+                                ui.label("Last Decisions");
+                                ui.label(a.last_decision_count.to_string());
+                                ui.end_row();
+                                ui.label("Last Out Chars");
+                                ui.label(a.last_output_chars.to_string());
+                                ui.end_row();
+                                ui.end_row();
+                                ui.end_row();
+                                ui.label("Positive FB");
+                                ui.label(a.pos_feedback_count.to_string());
+                                ui.end_row();
+                                ui.label("Negative FB");
+                                ui.label(a.neg_feedback_count.to_string());
+                                ui.end_row();
+                            });
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("Refresh /");
@@ -382,16 +587,27 @@ impl eframe::App for SynTrailApp {
                 });
         });
 
+        // The background worker exclusively owns AppHandle during generation.
+        // Reject all actions that require that handle rather than blocking the UI on it.
+        if is_generating && !matches!(action, Action::None) {
+            self.status = "Generation in progress — wait for the current response.".to_string();
+            action = Action::None;
+        }
+
         // ── Deferred action dispatch ──────────────────────────────────────
         match action {
             Action::None => {}
-            Action::New             => self.do_new(),
+            Action::New => self.do_new(),
             Action::NewConversation => self.do_new_conversation(),
-            Action::Save            => self.do_save(),
-            Action::Send            => self.send_message(),
-            Action::Feedback(id, s)  => self.do_feedback(id, s),
-            Action::RefreshAnalytics => self.analytics = self.handle.get_analytics(),
-            Action::LoadPath(path)   => self.do_load(path),
+            Action::Save => self.do_save(),
+            Action::Send => self.start_generation(),
+            Action::Feedback(id, s) => self.do_feedback(id, s),
+            Action::RefreshAnalytics => {
+                if let Some(handle) = self.handle.as_ref() {
+                    self.analytics = handle.get_analytics();
+                }
+            }
+            Action::LoadPath(path) => self.do_load(path),
 
             // File dialogs — blocking native dialog; runs after frame is rendered
             Action::OpenLoadDialog => {
@@ -404,6 +620,10 @@ impl eframe::App for SynTrailApp {
                     self.do_save_as(path);
                 }
             }
+        }
+
+        if self.is_generating() {
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
     }
 }

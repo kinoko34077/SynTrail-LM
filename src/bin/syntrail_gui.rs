@@ -377,9 +377,8 @@ impl eframe::App for SynTrailApp {
                     );
                 }
                 DropResult::ModelAndDataset { .. } | DropResult::Command(_) => {
-                    self.status =
-                        "Drop rejected: Chat accepts one supported model file at a time."
-                            .to_string();
+                    self.status = "Drop rejected: Chat accepts one supported model file at a time."
+                        .to_string();
                 }
             }
         }

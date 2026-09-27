@@ -710,7 +710,7 @@ impl eframe::App for SynTrailApp {
 
 #[cfg(test)]
 mod close_request_tests {
-    use super::{close_request_decision, CloseRequestDecision};
+    use super::{CloseRequestDecision, close_request_decision};
 
     #[test]
     fn generation_close_is_deferred() {

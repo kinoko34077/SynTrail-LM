@@ -67,3 +67,19 @@ fn completed_turn_commits_the_already_computed_analytics_snapshot_immediately() 
     assert!(!source.contains("refresh_interval"),
         "the old N-turn display interval must not remain as a misleading UI control");
 }
+
+#[test]
+fn close_during_generation_is_canceled_and_deferred_until_handle_returns() {
+    let source = gui_source();
+
+    assert!(source.contains("viewport().close_requested()"),
+        "the GUI must observe native close requests before allowing the viewport to exit");
+    assert!(source.contains("ViewportCommand::CancelClose"),
+        "a close request during generation must be canceled");
+    assert!(source.contains("close_requested_during_generation"),
+        "a canceled close must be remembered until the worker returns AppHandle");
+    assert!(source.contains("ViewportCommand::Close"),
+        "the deferred close must continue after the normal dirty-model confirmation");
+    assert!(source.contains("Finishing generation"),
+        "the user must see why closing is temporarily deferred");
+}

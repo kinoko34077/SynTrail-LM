@@ -74,6 +74,27 @@ enum ChatRequestState {
     Generating(Receiver<GenerationResult>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseRequestDecision {
+    Allow,
+    Defer,
+    Cancel,
+}
+
+fn close_request_decision(
+    is_generating: bool,
+    is_dirty: bool,
+    discard_confirmed: bool,
+) -> CloseRequestDecision {
+    if is_generating {
+        CloseRequestDecision::Defer
+    } else if !is_dirty || discard_confirmed {
+        CloseRequestDecision::Allow
+    } else {
+        CloseRequestDecision::Cancel
+    }
+}
+
 // ── App ───────────────────────────────────────────────────────────────────
 
 struct SynTrailApp {
@@ -86,6 +107,7 @@ struct SynTrailApp {
     feedback_state: FeedbackState,
     analytics: Analytics,
     status: String,
+    close_requested_during_generation: bool,
     #[cfg(all(target_os = "windows", feature = "gui"))]
     native_menu: NativeMenu,
 }
@@ -107,6 +129,7 @@ impl SynTrailApp {
             feedback_state: FeedbackState::None,
             analytics,
             status: "Ready".to_string(),
+            close_requested_during_generation: false,
             #[cfg(all(target_os = "windows", feature = "gui"))]
             native_menu: NativeMenu::build(),
         }
@@ -114,6 +137,62 @@ impl SynTrailApp {
 
     fn is_generating(&self) -> bool {
         matches!(self.request_state, ChatRequestState::Generating(_))
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        let is_generating = self.is_generating();
+        let is_dirty = self
+            .handle
+            .as_ref()
+            .map(|handle| handle.doc.dirty)
+            .unwrap_or(false);
+        let discard_confirmed = if is_generating || !is_dirty {
+            false
+        } else {
+            confirm_discard_dialog()
+        };
+
+        match close_request_decision(is_generating, is_dirty, discard_confirmed) {
+            CloseRequestDecision::Allow => {}
+            CloseRequestDecision::Defer => {
+                self.close_requested_during_generation = true;
+                self.status =
+                    "Finishing generation… close will continue when the current response returns."
+                        .to_string();
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            CloseRequestDecision::Cancel => {
+                self.status = "Close canceled.".to_string();
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+    }
+
+    fn continue_deferred_close(&mut self, ctx: &egui::Context) {
+        if !self.close_requested_during_generation || self.is_generating() {
+            return;
+        }
+        self.close_requested_during_generation = false;
+
+        let is_dirty = self
+            .handle
+            .as_ref()
+            .map(|handle| handle.doc.dirty)
+            .unwrap_or(false);
+        let discard_confirmed = if is_dirty {
+            confirm_discard_dialog()
+        } else {
+            false
+        };
+        match close_request_decision(false, is_dirty, discard_confirmed) {
+            CloseRequestDecision::Allow => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            CloseRequestDecision::Cancel => {
+                self.status = "Close canceled.".to_string();
+            }
+            CloseRequestDecision::Defer => unreachable!("generation already returned"),
+        }
     }
 
     fn start_generation(&mut self) {
@@ -187,6 +266,7 @@ impl SynTrailApp {
                         self.status = format!("Generation failed: {error}");
                     }
                 }
+                self.continue_deferred_close(ctx);
                 ctx.request_repaint();
             }
             Err(TryRecvError::Empty) => {
@@ -194,6 +274,7 @@ impl SynTrailApp {
             }
             Err(TryRecvError::Disconnected) => {
                 self.request_state = ChatRequestState::Idle;
+                self.close_requested_during_generation = false;
                 self.chat_history.pop();
                 self.status = "Generation failed: worker disconnected before returning the model handle. Restart the app before continuing.".to_string();
                 ctx.request_repaint();
@@ -323,7 +404,11 @@ fn load_history_entries(handle: &AppHandle) -> Vec<ChatEntry> {
 
 impl eframe::App for SynTrailApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
         self.poll_generation(ctx);
+        if close_requested {
+            self.handle_close_request(ctx);
+        }
         if let Some(handle) = self.handle.as_ref() {
             self.model_path_display = handle.doc.path_str().to_string();
         }
@@ -620,5 +705,38 @@ impl eframe::App for SynTrailApp {
         if self.is_generating() {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
+    }
+}
+
+#[cfg(test)]
+mod close_request_tests {
+    use super::{close_request_decision, CloseRequestDecision};
+
+    #[test]
+    fn generation_close_is_deferred() {
+        assert_eq!(
+            close_request_decision(true, false, false),
+            CloseRequestDecision::Defer
+        );
+    }
+
+    #[test]
+    fn clean_or_confirmed_dirty_close_is_allowed() {
+        assert_eq!(
+            close_request_decision(false, false, false),
+            CloseRequestDecision::Allow
+        );
+        assert_eq!(
+            close_request_decision(false, true, true),
+            CloseRequestDecision::Allow
+        );
+    }
+
+    #[test]
+    fn declined_dirty_close_is_canceled() {
+        assert_eq!(
+            close_request_decision(false, true, false),
+            CloseRequestDecision::Cancel
+        );
     }
 }

@@ -1,6 +1,6 @@
 # 現在の実装状態
 
-最終確認: 2026-09-29 (Issue #10 model-load resource envelope verified)  
+最終確認: 2026-09-29 (Issue #10 model-load resource envelope verified)
 crate version: 0.5.0  
 integration tests: 185 (+ 243 unit tests = 428 total)
 

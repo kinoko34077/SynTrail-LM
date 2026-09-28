@@ -39,13 +39,13 @@ impl Session {
     pub fn open(db_path: &str, config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let db = Database::open(db_path)?;
         // §3: prefer blob_data (bincode) over json_blob; both are valid snapshot formats.
-        let model = match db.load_latest_snapshot()? {
+        let model = match db.load_latest_snapshot_bounded(persistence::MAX_MODEL_INPUT_BYTES)? {
             Some(SnapshotPayload::Binary(blob)) => {
-                let snap: persistence::ModelSnapshot = bincode::deserialize(&blob)?;
+                let snap = persistence::decode_legacy_bincode_snapshot_bytes(&blob)?;
                 persistence::from_snapshot(snap)
             }
             Some(SnapshotPayload::Json(json)) => {
-                let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
+                let snap = persistence::decode_json_snapshot_bytes(json.as_bytes())?;
                 persistence::from_snapshot(snap)
             }
             None => ModelState::new(),
@@ -175,11 +175,10 @@ impl Session {
         &mut self,
         snapshot_id: i64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let snap: persistence::ModelSnapshot = if let Some(blob) = self.db.load_snapshot_blob(snapshot_id)? {
-            bincode::deserialize(&blob)?
-        } else {
-            let json = self.db.load_snapshot_json(snapshot_id)?;
-            serde_json::from_str(&json)?
+        let snap = match self.db.load_snapshot_bounded(snapshot_id, persistence::MAX_MODEL_INPUT_BYTES)? {
+            Some(SnapshotPayload::Binary(blob)) => persistence::decode_legacy_bincode_snapshot_bytes(&blob)?,
+            Some(SnapshotPayload::Json(json)) => persistence::decode_json_snapshot_bytes(json.as_bytes())?,
+            None => return Err("snapshot not found".into()),
         };
         self.model = persistence::from_snapshot(snap);
         Ok(())

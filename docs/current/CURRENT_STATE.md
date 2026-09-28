@@ -66,7 +66,8 @@ integration tests: 165 (+ 219 unit tests = 384 total)
 - **STM v3: packed UnitId + implicit IDs** (UnitIdDto = varint u32, no chunk.id/rep_id) ← §16/§17
 - **Streaming STM save** (Encoder → BufWriter; seek-patch payload_len; no intermediate Vec) ← §9/§10
 - **Streaming STM load** (BufReader → header → Decoder → deserialize_from; no full-file read) ← §11
-- **256 MB decompression limit removed** (streaming zstd::stream decoder; no hard cap) ← §12/§13
+- **Model-load resource envelope** (JSON / STM v1-v4 / legacy raw bincode / SQLite snapshot: serialized input 1 GiB; bincode/STM decoded-byte budget 1 GiB; all formatsにcollection limits; SQLite byte-length preflight; rejection preserves active model) ← §12/§13 / Issue #10
+- **Bulk decompression buffer remains removed** (limits are acceptance budgets; Zstd decode stays streaming) ← §12/§13
 - **Lossless tick delta** (delta fields u32→u64 varint; STM_VERSION 3→4; v3_compat module) ← §14
 
 ---

@@ -95,6 +95,23 @@ in-memory sparse arrays
 
 を有力とする。全モデルJSON書換えを永続的な最終形とはしない。
 
+### 41.1 現行snapshot load resource envelope
+
+**状態: 実装済・検証済**
+
+現行の JSON / STM / SQLite snapshot 読込には、保存形式の将来設計とは独立した受入上限を設ける。これは一括展開bufferの予約値ではなく、外部・永続データをModelStateとして受理するための安全境界である。
+
+- serialized file input / DB snapshot payload: 最大 **1 GiB**
+- bincode / STM decoded byte budget: 最大 **1 GiB**
+- snapshot各top-level collection: 最大 **2^24 items**
+- nested collection単体: 最大 **2^24 items**
+- nested items合計: 最大 **2^26 items**
+- STM v1-v4およびlegacy raw bincodeはstreaming decodeを維持し、Zstd展開全体を一括buffer化しない
+- SQLiteはBLOB/TEXTをprocess memoryへmaterializeする前にSQLite上のbyte lengthを検査する
+- 受入上限違反・不正snapshotはrecoverable load errorとし、既存のactive modelを置換しない
+
+この上限はStable ID幅そのものの仕様ではない。将来の実モデル規模・profile結果が1 GiB / collection envelopeへ接近した場合は、保存方式・分割snapshot・journal化を含めて再評価する。
+
 ---
 
 ## 5層アーキテクチャ（全体像）

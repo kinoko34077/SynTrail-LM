@@ -352,6 +352,206 @@ pub struct ModelSnapshot {
 fn default_top_k() -> usize { 32 }
 fn default_decay() -> f64 { 0.99 }
 
+const MIB: u64 = 1024 * 1024;
+/// Application-level load budget. This is an acceptance limit, not a bulk-buffer size.
+pub const MAX_MODEL_INPUT_BYTES: u64 = 1024 * MIB;
+pub const MAX_DECODED_SNAPSHOT_BYTES: u64 = 1024 * MIB;
+pub const MAX_TOP_LEVEL_SNAPSHOT_ITEMS: usize = 1 << 24;
+pub const MAX_NESTED_SNAPSHOT_ITEMS: usize = 1 << 24;
+pub const MAX_TOTAL_NESTED_SNAPSHOT_ITEMS: usize = 1 << 26;
+
+#[derive(Debug, Clone, Copy)]
+struct ModelLoadLimits {
+    input_bytes: u64,
+    decoded_bytes: u64,
+    top_level_items: usize,
+    nested_items: usize,
+    total_nested_items: usize,
+}
+
+impl Default for ModelLoadLimits {
+    fn default() -> Self {
+        Self {
+            input_bytes: MAX_MODEL_INPUT_BYTES,
+            decoded_bytes: MAX_DECODED_SNAPSHOT_BYTES,
+            top_level_items: MAX_TOP_LEVEL_SNAPSHOT_ITEMS,
+            nested_items: MAX_NESTED_SNAPSHOT_ITEMS,
+            total_nested_items: MAX_TOTAL_NESTED_SNAPSHOT_ITEMS,
+        }
+    }
+}
+
+fn resource_limit_error(detail: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("model resource limit exceeded: {}", detail.into()),
+    )
+}
+
+fn check_top_level(name: &str, len: usize, limits: ModelLoadLimits) -> std::io::Result<()> {
+    if len > limits.top_level_items {
+        return Err(resource_limit_error(format!(
+            "{name} has {len} items (max {})",
+            limits.top_level_items
+        )));
+    }
+    Ok(())
+}
+
+fn add_nested_total(
+    name: &str,
+    len: usize,
+    total: &mut usize,
+    limits: ModelLoadLimits,
+) -> std::io::Result<()> {
+    if len > limits.nested_items {
+        return Err(resource_limit_error(format!(
+            "{name} has {len} nested items (max {})",
+            limits.nested_items
+        )));
+    }
+    *total = total
+        .checked_add(len)
+        .ok_or_else(|| resource_limit_error("nested item count overflow"))?;
+    if *total > limits.total_nested_items {
+        return Err(resource_limit_error(format!(
+            "nested item total {} exceeds max {}",
+            *total, limits.total_nested_items
+        )));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_limits(
+    snapshot: &ModelSnapshot,
+    limits: ModelLoadLimits,
+) -> std::io::Result<()> {
+    for (name, len) in [
+        ("primitives", snapshot.primitives.len()),
+        ("chunks", snapshot.chunks.len()),
+        ("prediction_edges", snapshot.prediction_edges.len()),
+        ("merge_candidates", snapshot.merge_candidates.len()),
+        ("association_edges", snapshot.association_edges.len()),
+        ("identities", snapshot.identities.len()),
+        ("views", snapshot.views.len()),
+        ("lineage_entries", snapshot.lineage_entries.len()),
+        ("identity_parent", snapshot.identity_parent.len()),
+        (
+            "representation_entries",
+            snapshot.representation_entries.len(),
+        ),
+        ("transforms", snapshot.transforms.len()),
+        ("merge_right_reuse", snapshot.merge_right_reuse.len()),
+        (
+            "prediction_edge_groups",
+            snapshot.prediction_edge_groups.len(),
+        ),
+        (
+            "association_edge_groups",
+            snapshot.association_edge_groups.len(),
+        ),
+    ] {
+        check_top_level(name, len, limits)?;
+    }
+
+    let mut nested_total = 0usize;
+    for units in &snapshot.identities {
+        add_nested_total("identity.units", units.len(), &mut nested_total, limits)?;
+    }
+    for view in &snapshot.views {
+        add_nested_total("view.units", view.units.len(), &mut nested_total, limits)?;
+    }
+    for rep in &snapshot.representation_entries {
+        add_nested_total(
+            "representation.units",
+            rep.units.len(),
+            &mut nested_total,
+            limits,
+        )?;
+    }
+    for (_, units) in &snapshot.merge_right_reuse {
+        add_nested_total(
+            "merge_right_reuse.units",
+            units.len(),
+            &mut nested_total,
+            limits,
+        )?;
+    }
+    for (_, edges) in &snapshot.prediction_edge_groups {
+        add_nested_total(
+            "prediction_edge_group.edges",
+            edges.len(),
+            &mut nested_total,
+            limits,
+        )?;
+    }
+    for (_, edges) in &snapshot.association_edge_groups {
+        add_nested_total(
+            "association_edge_group.edges",
+            edges.len(),
+            &mut nested_total,
+            limits,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_input_len(input_len: u64, limits: ModelLoadLimits) -> std::io::Result<()> {
+    if input_len > limits.input_bytes {
+        return Err(resource_limit_error(format!(
+            "input is {input_len} bytes (max {})",
+            limits.input_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_file_size(path: &Path, limits: ModelLoadLimits) -> std::io::Result<u64> {
+    let len = std::fs::metadata(path)?.len();
+    ensure_input_len(len, limits)?;
+    Ok(len)
+}
+
+fn decode_json_snapshot_reader<R: std::io::Read>(
+    reader: R,
+    input_len: u64,
+    limits: ModelLoadLimits,
+) -> std::io::Result<ModelSnapshot> {
+    ensure_input_len(input_len, limits)?;
+    let snapshot: ModelSnapshot = serde_json::from_reader(reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    validate_snapshot_limits(&snapshot, limits)?;
+    Ok(snapshot)
+}
+
+pub(crate) fn decode_json_snapshot_bytes(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
+    decode_json_snapshot_reader(
+        std::io::Cursor::new(bytes),
+        bytes.len() as u64,
+        ModelLoadLimits::default(),
+    )
+}
+
+pub(crate) fn decode_legacy_bincode_snapshot_bytes(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
+    use bincode::Options;
+    let limits = ModelLoadLimits::default();
+    ensure_input_len(bytes.len() as u64, limits)?;
+    let snapshot: ModelSnapshot = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(limits.decoded_bytes)
+        .deserialize(bytes)
+        .map_err(|e| {
+            if matches!(*e, bincode::ErrorKind::SizeLimit) {
+                resource_limit_error(format!("decoded snapshot exceeds {} bytes", limits.decoded_bytes))
+            } else {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            }
+        })?;
+    validate_snapshot_limits(&snapshot, limits)?;
+    Ok(snapshot)
+}
+
 // ── ModelState → snapshot ──────────────────────────────────────────────────
 
 /// Save to JSON (human-readable).
@@ -381,68 +581,52 @@ pub fn save_with_generation(model: &ModelState, path: &Path, generation: u64) ->
 ///
 /// Format dispatch:
 /// - `.stm` → STM container (§12: header + zstd-bincode; legacy raw bincode also handled)
-/// - `.db` / `.sqlite` → latest snapshot JSON in the DB
+/// - `.db` / `.sqlite` → latest bounded snapshot payload (BLOB preferred; JSON fallback)
 /// - anything else → JSON
 pub fn load_checkpoint_generation(path: &Path) -> std::io::Result<u64> {
-    let ext = path.extension().and_then(|e| e.to_str())
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("stm") => {
-            use std::io::{BufReader, Read};
-            let file = std::fs::File::open(path)?;
-            let mut reader = BufReader::new(file);
-            let mut magic = [0u8; 4];
-            reader.read_exact(&mut magic)?;
-            if &magic != STM_MAGIC {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an STM file"));
-            }
-            let mut hdr = [0u8; 6];
-            reader.read_exact(&mut hdr)?;
-            let version = hdr[0];
-            let flags = hdr[1];
-            let payload_len = u32::from_le_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]);
-            let snapshot = if flags & STM_FLAG_ZSTD != 0 {
-                let mut decoder = zstd::stream::read::Decoder::new(reader.take(payload_len as u64))
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                stm_dispatch_version_stream(version, &mut decoder)?
-            } else {
-                stm_dispatch_version_stream(version, &mut reader.take(payload_len as u64))?
-            };
-            Ok(snapshot.checkpoint_generation)
-        }
+    let limits = ModelLoadLimits::default();
+    let snapshot = match ext.as_deref() {
+        Some("stm") => load_binary_snapshot_with_limits(path, limits)?,
         Some("db") | Some("sqlite") => {
             let db = Database::open(&path.to_string_lossy())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            // §3: unified latest snapshot: blob_data (bincode) preferred over json_blob.
-            let snapshot: ModelSnapshot = match db.load_latest_snapshot()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            match db
+                .load_latest_snapshot_bounded(limits.input_bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
             {
-                Some(crate::db::SnapshotPayload::Binary(blob)) =>
-                    bincode::deserialize(&blob)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-                Some(crate::db::SnapshotPayload::Json(json)) =>
-                    serde_json::from_str(&json)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-                None =>
-                    return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no snapshot in DB")),
-            };
-            Ok(snapshot.checkpoint_generation)
+                Some(crate::db::SnapshotPayload::Binary(blob)) => {
+                    decode_legacy_bincode_snapshot_bytes(&blob)?
+                }
+                Some(crate::db::SnapshotPayload::Json(json)) => {
+                    decode_json_snapshot_bytes(json.as_bytes())?
+                }
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no snapshot in DB",
+                    ));
+                }
+            }
         }
         _ => {
-            // JSON path (original behaviour).
-            let json = std::fs::read_to_string(path)?;
-            let snapshot: ModelSnapshot = serde_json::from_str(&json)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(snapshot.checkpoint_generation)
+            let input_len = ensure_file_size(path, limits)?;
+            let file = std::fs::File::open(path)?;
+            decode_json_snapshot_reader(std::io::BufReader::new(file), input_len, limits)?
         }
-    }
+    };
+    Ok(snapshot.checkpoint_generation)
 }
 
-/// Load from JSON.
+/// Load from JSON using streaming parsing and the application load budget.
 pub fn load(path: &Path) -> std::io::Result<ModelState> {
-    let json = std::fs::read_to_string(path)?;
-    let snapshot: ModelSnapshot = serde_json::from_str(&json)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let limits = ModelLoadLimits::default();
+    let input_len = ensure_file_size(path, limits)?;
+    let file = std::fs::File::open(path)?;
+    let snapshot = decode_json_snapshot_reader(std::io::BufReader::new(file), input_len, limits)?;
     Ok(from_snapshot(snapshot))
 }
 
@@ -450,7 +634,7 @@ pub fn load(path: &Path) -> std::io::Result<ModelState> {
 //
 // Layout (10-byte header + payload):
 //   [0..4]  magic:       b"STM1"
-//   [4]     version:     1 = fixed-int bincode; 2 = varint (§27); 3 = packed UnitId + implicit IDs (§16/§17)
+//   [4]     version:     1 = fixed-int bincode; 2 = varint (§27); 3 = packed UnitId + implicit IDs (§16/§17); 4 = lossless u64 tick deltas
 //   [5]     flags:       bit 0 = zstd compressed; remaining bits reserved
 //   [6..10] payload_len: u32 little-endian (byte length of payload)
 //   [10..]  payload:     bincode(ModelSnapshot), optionally zstd-compressed
@@ -471,33 +655,59 @@ fn bincode_serialize_into_varint<W: std::io::Write>(w: &mut W, snap: &ModelSnaps
 }
 
 /// §11/§12/§13: Version-dispatching deserializer from a streaming reader.
-/// Eliminates the 256 MB bulk-decompress limit; bincode reads directly from the decoder.
-fn stm_dispatch_version_stream<R: std::io::Read>(version: u8, reader: &mut R) -> std::io::Result<ModelSnapshot> {
+/// Keeps the old 256 MB bulk-decompression buffer removed while enforcing an application
+/// acceptance budget on bytes consumed by bincode and on decoded collection structure.
+fn stm_dispatch_version_stream_with_limits<R: std::io::Read>(
+    version: u8,
+    reader: &mut R,
+    limits: ModelLoadLimits,
+) -> std::io::Result<ModelSnapshot> {
     use bincode::Options;
-    let varint = || bincode::DefaultOptions::new().with_varint_encoding();
-    match version {
-        STM_VERSION => varint()
-            .deserialize_from(reader)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    let map_err = |e: bincode::Error| {
+        if matches!(*e, bincode::ErrorKind::SizeLimit) {
+            resource_limit_error(format!(
+                "decoded snapshot exceeds {} bytes",
+                limits.decoded_bytes
+            ))
+        } else {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        }
+    };
+    let varint = || {
+        bincode::DefaultOptions::new()
+            .with_varint_encoding()
+            .with_limit(limits.decoded_bytes)
+    };
+    let snapshot = match version {
+        STM_VERSION => varint().deserialize_from(reader).map_err(map_err)?,
         3 => {
-            let v3: v3_compat::ModelSnapshot = varint()
-                .deserialize_from(reader)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(from_v3_snapshot(v3))
+            let v3: v3_compat::ModelSnapshot =
+                varint().deserialize_from(reader).map_err(map_err)?;
+            from_v3_snapshot(v3)
         }
         2 => {
-            let v2: v2_compat::ModelSnapshot = varint()
-                .deserialize_from(reader)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(from_v2_snapshot(v2))
+            let v2: v2_compat::ModelSnapshot =
+                varint().deserialize_from(reader).map_err(map_err)?;
+            from_v2_snapshot(v2)
         }
-        1 => bincode::deserialize_from(reader)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!("STM version {} is not supported by this build (max: {})", version, STM_VERSION),
-        )),
-    }
+        1 => bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(limits.decoded_bytes)
+            .deserialize_from(reader)
+            .map_err(map_err)?,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "STM version {} is not supported by this build (max: {})",
+                    version, STM_VERSION
+                ),
+            ));
+        }
+    };
+    validate_snapshot_limits(&snapshot, limits)?;
+    Ok(snapshot)
 }
 
 // ── STM v2 backward-compat deserialization (§16/§17) ─────────────────────────
@@ -871,7 +1081,7 @@ fn stm_write_container<W: std::io::Write + std::io::Seek>(
     snapshot: &ModelSnapshot,
     compress: bool,
 ) -> std::io::Result<()> {
-    use std::io::{Seek, SeekFrom};
+    use std::io::SeekFrom;
 
     let flags = if compress { STM_FLAG_ZSTD } else { 0u8 };
     writer.write_all(STM_MAGIC)?;
@@ -899,32 +1109,66 @@ fn stm_write_container<W: std::io::Write + std::io::Seek>(
     Ok(())
 }
 
-/// §12/§13: Streaming container reader — no 256 MB hard decompression limit.
-/// Uses a Zstd streaming decoder so bincode reads directly without a full decompressed buffer.
-fn stm_read_container(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
+/// §12/§13: Streaming container reader with no full decompressed buffer.
+/// Zstd remains streaming; the decoded-byte limit is an acceptance budget enforced by bincode.
+fn stm_read_container_with_limits(
+    bytes: &[u8],
+    limits: ModelLoadLimits,
+) -> std::io::Result<ModelSnapshot> {
+    use bincode::Options;
+    ensure_input_len(bytes.len() as u64, limits)?;
     if bytes.len() >= 4 && &bytes[..4] == STM_MAGIC {
         if bytes.len() < 10 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "STM header truncated"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "STM header truncated",
+            ));
         }
         let version = bytes[4];
         let flags = bytes[5];
         let payload_len = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
+        ensure_input_len(payload_len as u64, limits)?;
         if bytes.len() < 10 + payload_len {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "STM payload truncated"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "STM payload truncated",
+            ));
         }
         let encoded = &bytes[10..10 + payload_len];
         if flags & STM_FLAG_ZSTD != 0 {
             let mut decoder = zstd::stream::read::Decoder::new(encoded)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            stm_dispatch_version_stream(version, &mut decoder)
+            stm_dispatch_version_stream_with_limits(version, &mut decoder, limits)
         } else {
-            stm_dispatch_version_stream(version, &mut std::io::Cursor::new(encoded))
+            stm_dispatch_version_stream_with_limits(
+                version,
+                &mut std::io::Cursor::new(encoded),
+                limits,
+            )
         }
     } else {
-        // Legacy: raw bincode without header
-        bincode::deserialize(bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let snapshot: ModelSnapshot = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(limits.decoded_bytes)
+            .deserialize(bytes)
+            .map_err(|e| {
+                if matches!(*e, bincode::ErrorKind::SizeLimit) {
+                    resource_limit_error(format!(
+                        "decoded snapshot exceeds {} bytes",
+                        limits.decoded_bytes
+                    ))
+                } else {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                }
+            })?;
+        validate_snapshot_limits(&snapshot, limits)?;
+        Ok(snapshot)
     }
+}
+
+fn stm_read_container(bytes: &[u8]) -> std::io::Result<ModelSnapshot> {
+    stm_read_container_with_limits(bytes, ModelLoadLimits::default())
 }
 
 /// Phase 16: save to binary format (bincode); generation=0 (legacy/unversioned).
@@ -951,39 +1195,72 @@ pub fn save_binary_with_generation(model: &ModelState, path: &Path, generation: 
 
 /// §11: Streaming STM load — reads the header then pipes compressed bytes through a
 /// Zstd streaming decoder directly into bincode without loading the full file into RAM.
-pub fn load_binary(path: &Path) -> std::io::Result<ModelState> {
+fn load_binary_snapshot_with_limits(
+    path: &Path,
+    limits: ModelLoadLimits,
+) -> std::io::Result<ModelSnapshot> {
+    use bincode::Options;
     use std::io::{BufReader, Read};
 
+    let input_len = ensure_file_size(path, limits)?;
     let file = std::fs::File::open(path)?;
     let mut reader = BufReader::new(file);
-
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
 
     if &magic == STM_MAGIC {
-        let mut header_rest = [0u8; 6]; // version + flags + payload_len(4)
+        let mut header_rest = [0u8; 6];
         reader.read_exact(&mut header_rest)?;
         let version = header_rest[0];
         let flags = header_rest[1];
-        let payload_len = u32::from_le_bytes([header_rest[2], header_rest[3], header_rest[4], header_rest[5]]);
-        let snapshot = if flags & STM_FLAG_ZSTD != 0 {
-            let mut decoder = zstd::stream::read::Decoder::new(reader.take(payload_len as u64))
+        let payload_len = u32::from_le_bytes([
+            header_rest[2],
+            header_rest[3],
+            header_rest[4],
+            header_rest[5],
+        ]) as u64;
+        ensure_input_len(payload_len, limits)?;
+        if payload_len > input_len.saturating_sub(10) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "STM payload truncated",
+            ));
+        }
+        if flags & STM_FLAG_ZSTD != 0 {
+            let mut decoder = zstd::stream::read::Decoder::new(reader.take(payload_len))
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            stm_dispatch_version_stream(version, &mut decoder)?
+            stm_dispatch_version_stream_with_limits(version, &mut decoder, limits)
         } else {
-            stm_dispatch_version_stream(version, &mut reader.take(payload_len as u64))?
-        };
-        Ok(from_snapshot(snapshot))
+            stm_dispatch_version_stream_with_limits(version, &mut reader.take(payload_len), limits)
+        }
     } else {
-        // Legacy: raw bincode — read remaining bytes and prepend the 4 magic bytes
-        let mut remaining = Vec::new();
-        reader.read_to_end(&mut remaining)?;
-        let mut bytes = magic.to_vec();
-        bytes.extend_from_slice(&remaining);
-        let snapshot = bincode::deserialize(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(from_snapshot(snapshot))
+        let chained = std::io::Cursor::new(magic).chain(reader);
+        let snapshot: ModelSnapshot = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(limits.decoded_bytes)
+            .deserialize_from(chained)
+            .map_err(|e| {
+                if matches!(*e, bincode::ErrorKind::SizeLimit) {
+                    resource_limit_error(format!(
+                        "decoded snapshot exceeds {} bytes",
+                        limits.decoded_bytes
+                    ))
+                } else {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                }
+            })?;
+        validate_snapshot_limits(&snapshot, limits)?;
+        Ok(snapshot)
     }
+}
+
+/// Streaming STM load with bounded input/decoded/collection budgets.
+pub fn load_binary(path: &Path) -> std::io::Result<ModelState> {
+    Ok(from_snapshot(load_binary_snapshot_with_limits(
+        path,
+        ModelLoadLimits::default(),
+    )?))
 }
 
 /// Convenience: dispatch to JSON or binary based on the file extension.
@@ -1619,6 +1896,72 @@ mod tests {
         save_auto(&model, file.path()).unwrap();
         let loaded = load_auto(file.path()).unwrap();
         assert_eq!(loaded.primitive_count(), model.primitive_count());
+    }
+
+    fn issue10_tiny_limits() -> ModelLoadLimits {
+        ModelLoadLimits {
+            input_bytes: 256,
+            decoded_bytes: 256,
+            top_level_items: 2,
+            nested_items: 2,
+            total_nested_items: 4,
+        }
+    }
+
+    #[test]
+    fn issue10_json_input_budget_rejects_before_parse() {
+        let snapshot = to_snapshot(&trained_model());
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let mut limits = issue10_tiny_limits();
+        limits.input_bytes = (bytes.len() as u64).saturating_sub(1);
+        let err = decode_json_snapshot_reader(
+            std::io::Cursor::new(bytes),
+            limits.input_bytes + 1,
+            limits,
+        )
+        .err()
+        .expect("expected resource-limit rejection");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("resource limit"));
+    }
+
+    #[test]
+    fn issue10_compressed_stm_decoded_budget_is_bounded() {
+        let snapshot = to_snapshot(&trained_model());
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        stm_write_container(&mut encoded, &snapshot, true).unwrap();
+        let bytes = encoded.into_inner();
+        let mut limits = ModelLoadLimits::default();
+        limits.decoded_bytes = 64;
+        let err = stm_read_container_with_limits(&bytes, limits)
+            .err()
+            .expect("expected resource-limit rejection");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("resource limit"));
+    }
+
+    #[test]
+    fn issue10_legacy_bincode_huge_collection_length_is_rejected_without_allocation() {
+        // ModelSnapshot starts with String version, u64 tick, then Vec primitives.
+        // A tiny file can therefore declare an impossible vector cardinality.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(5u64).to_le_bytes());
+        bytes.extend_from_slice(b"0.5.0");
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        let err = decode_legacy_bincode_snapshot_bytes(&bytes)
+            .err().expect("expected pathological collection-length rejection");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn issue10_snapshot_collection_budget_rejects_small_fixture() {
+        let mut snapshot = to_snapshot(&ModelState::new());
+        snapshot.primitives = vec![(1, 65), (2, 66), (3, 67)];
+        let err = validate_snapshot_limits(&snapshot, issue10_tiny_limits()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("primitives"));
     }
 
     #[test]

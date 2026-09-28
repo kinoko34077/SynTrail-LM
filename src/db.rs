@@ -14,6 +14,22 @@ pub enum SnapshotPayload {
     Json(String),
 }
 
+fn snapshot_limit_error(
+    column: usize,
+    data_type: rusqlite::types::Type,
+    len: u64,
+    max: u64,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        data_type,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("model resource limit exceeded: snapshot payload is {len} bytes (max {max})"),
+        )),
+    )
+}
+
 use crate::feedback::{FeedbackEvent, FeedbackSign, FeedbackSource};
 use crate::trace::{DecisionStep, RouteKind, TurnTrace};
 
@@ -265,6 +281,38 @@ impl Database {
         }
     }
 
+    /// Load one snapshot only after checking its stored payload size in SQLite.
+    pub fn load_snapshot_bounded(&self, snapshot_id: i64, max_bytes: u64) -> Result<Option<SnapshotPayload>> {
+        use rusqlite::types::Type;
+        let mut stmt = self.conn.prepare(
+            "SELECT length(CAST(json_blob AS BLOB)), length(blob_data), json_blob, blob_data \
+             FROM snapshots WHERE snapshot_id = ?1"
+        )?;
+        let mut rows = stmt.query(params![snapshot_id])?;
+        let Some(row) = rows.next()? else { return Ok(None); };
+
+        let blob_len: Option<i64> = row.get(1)?;
+        if let Some(len) = blob_len {
+            let len = u64::try_from(len).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, Type::Integer, Box::new(e))
+            })?;
+            if len > max_bytes {
+                return Err(snapshot_limit_error(3, Type::Blob, len, max_bytes));
+            }
+            return Ok(Some(SnapshotPayload::Binary(row.get(3)?)));
+        }
+
+        let json_len: i64 = row.get(0)?;
+        let json_len = u64::try_from(json_len).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(e))
+        })?;
+        if json_len > max_bytes {
+            return Err(snapshot_limit_error(2, Type::Text, json_len, max_bytes));
+        }
+        let json: String = row.get(2)?;
+        if json.is_empty() { Ok(None) } else { Ok(Some(SnapshotPayload::Json(json))) }
+    }
+
     /// §8: Load the most recent snapshot as binary blob, if it was stored as BLOB.
     pub fn load_latest_snapshot_blob(&self) -> Result<Option<Vec<u8>>> {
         let mut stmt = self.conn.prepare(
@@ -279,23 +327,48 @@ impl Database {
     }
 
     /// §3: Unified latest-snapshot loader — prefers blob_data, falls back to json_blob.
-    /// Single query; callers should use this instead of calling blob + json separately.
     pub fn load_latest_snapshot(&self) -> Result<Option<SnapshotPayload>> {
+        self.load_latest_snapshot_bounded(u64::MAX)
+    }
+
+    /// Load the latest snapshot only after proving its stored payload is within `max_bytes`.
+    /// Length is checked in SQLite before materializing the BLOB/TEXT into process memory.
+    pub fn load_latest_snapshot_bounded(&self, max_bytes: u64) -> Result<Option<SnapshotPayload>> {
+        use rusqlite::types::Type;
         let mut stmt = self.conn.prepare(
-            "SELECT json_blob, blob_data FROM snapshots ORDER BY snapshot_id DESC LIMIT 1"
+            "SELECT length(CAST(json_blob AS BLOB)), length(blob_data), json_blob, blob_data \
+             FROM snapshots ORDER BY snapshot_id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query([])?;
-        if let Some(row) = rows.next()? {
-            let blob: Option<Vec<u8>> = row.get(1)?;
-            if let Some(b) = blob {
-                return Ok(Some(SnapshotPayload::Binary(b)));
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        let blob_len: Option<i64> = row.get(1)?;
+        if let Some(len) = blob_len {
+            let len = u64::try_from(len).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, Type::Integer, Box::new(e))
+            })?;
+            if len > max_bytes {
+                return Err(snapshot_limit_error(3, Type::Blob, len, max_bytes));
             }
-            let json: String = row.get(0)?;
-            if !json.is_empty() {
-                return Ok(Some(SnapshotPayload::Json(json)));
-            }
+            let blob: Vec<u8> = row.get(3)?;
+            return Ok(Some(SnapshotPayload::Binary(blob)));
         }
-        Ok(None)
+
+        let json_len: i64 = row.get(0)?;
+        let json_len = u64::try_from(json_len).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(e))
+        })?;
+        if json_len > max_bytes {
+            return Err(snapshot_limit_error(2, Type::Text, json_len, max_bytes));
+        }
+        let json: String = row.get(2)?;
+        if json.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(SnapshotPayload::Json(json)))
+        }
     }
 
     // ── History query ─────────────────────────────────────────────────────
@@ -517,5 +590,22 @@ mod tests {
         assert_eq!(json, "{}");
         let latest = db.load_latest_snapshot_json().unwrap();
         assert_eq!(latest, Some("{}".to_string()));
+    }
+
+    #[test]
+    fn issue10_bounded_snapshot_load_rejects_before_materializing_payload() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_snapshot(None, 1, "fp", "0123456789abcdef", 1000)
+            .unwrap();
+        let err = db.load_latest_snapshot_bounded(8).err().expect("expected bounded-load rejection");
+        assert!(err.to_string().contains("model resource limit exceeded"));
+
+        db.insert_snapshot_blob(None, 2, "fp2", &[0u8; 32], 1001)
+            .unwrap();
+        let err = db.load_latest_snapshot_bounded(16).err().expect("expected bounded-load rejection");
+        assert!(err.to_string().contains("model resource limit exceeded"));
+
+        let err = db.load_snapshot_bounded(2, 16).err().expect("expected id-scoped bounded-load rejection");
+        assert!(err.to_string().contains("model resource limit exceeded"));
     }
 }

@@ -88,13 +88,13 @@ pub fn load_model_file(path: &Path) -> Result<ModelState, Box<dyn Error>> {
         Some("db") | Some("sqlite") => {
             let db = Database::open(&path.to_string_lossy())?;
             // §3: unified latest snapshot: blob_data (bincode) preferred over json_blob.
-            match db.load_latest_snapshot()? {
+            match db.load_latest_snapshot_bounded(persistence::MAX_MODEL_INPUT_BYTES)? {
                 Some(crate::db::SnapshotPayload::Binary(blob)) => {
-                    let snap: persistence::ModelSnapshot = bincode::deserialize(&blob)?;
+                    let snap = persistence::decode_legacy_bincode_snapshot_bytes(&blob)?;
                     Ok(persistence::from_snapshot(snap))
                 }
                 Some(crate::db::SnapshotPayload::Json(json)) => {
-                    let snap: persistence::ModelSnapshot = serde_json::from_str(&json)?;
+                    let snap = persistence::decode_json_snapshot_bytes(json.as_bytes())?;
                     Ok(persistence::from_snapshot(snap))
                 }
                 None => Err("no snapshot found in database".into()),
@@ -292,5 +292,39 @@ impl AppHandle {
     /// Return the last `limit` turns from history (newest first).
     pub fn history(&self, limit: usize) -> Result<Vec<TurnRow>, rusqlite::Error> {
         self.session.history(limit)
+    }
+}
+
+#[cfg(test)]
+mod issue10_tests {
+    use super::*;
+    use std::fs::OpenOptions;
+
+    #[test]
+    fn rejected_oversized_load_preserves_active_model_and_document_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("active.stm");
+        let history_path = dir.path().join("history.sqlite");
+        let mut handle =
+            AppHandle::new(model_path.clone(), history_path.to_str().unwrap()).unwrap();
+        handle.session.model.train("preserve this model");
+        handle.doc.mark_dirty();
+        let before_fp = handle.session.model.state_fingerprint();
+        let before_doc = handle.doc.clone();
+
+        let oversized = dir.path().join("oversized.json");
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&oversized)
+            .unwrap()
+            .set_len(persistence::MAX_MODEL_INPUT_BYTES + 1)
+            .unwrap();
+
+        let err = handle.load_model_from(&oversized).unwrap_err();
+        assert!(err.to_string().contains("model resource limit exceeded"));
+        assert_eq!(handle.session.model.state_fingerprint(), before_fp);
+        assert_eq!(handle.doc.path, before_doc.path);
+        assert_eq!(handle.doc.dirty, before_doc.dirty);
     }
 }

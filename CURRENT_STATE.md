@@ -1,6 +1,6 @@
 # SynTrail-LM — Current Implementation State
 
-Last updated: 2026-09-20 (post integrated-fix-spec, baseline d0ae892)
+Last updated: 2026-09-29 (Issue #10 model-load resource envelope)
 
 ---
 
@@ -11,6 +11,7 @@ Last updated: 2026-09-20 (post integrated-fix-spec, baseline d0ae892)
 | JSON persistence (model.json) | Implemented |
 | STM binary container (Zstd, varint, packed UnitId) | Implemented — v4 |
 | Streaming STM save/load (no large intermediate buffer) | Implemented |
+| Model-load resource envelope (JSON/STM/DB: serialized input 1 GiB; bincode/STM decoded 1 GiB; bounded collections; rejected load preserves active model) | Implemented / Verified |
 | Lossless delta fields (u64 tick-delta) | Implemented |
 | SQLite DB snapshot (blob_data bincode preferred) | Implemented |
 | DB load unified API (blob > json fallback) | Implemented |

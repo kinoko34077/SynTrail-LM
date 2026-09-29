@@ -1,11 +1,17 @@
 use std::fs;
+use syntrail_lm::desktop::chat_state::{
+    ChatLifecycle, CloseRequestDecision, WorkerExit, close_request_decision,
+    lifecycle_after_worker_exit, restart_required_message,
+};
 
 fn gui_source() -> String {
     fs::read_to_string("src/bin/syntrail_gui.rs").expect("read syntrail_gui.rs")
 }
 
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    let start_index = source.find(start).unwrap_or_else(|| panic!("missing section start: {start}"));
+    let start_index = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing section start: {start}"));
     let end_index = source[start_index + start.len()..]
         .find(end)
         .map(|offset| start_index + start.len() + offset)
@@ -14,72 +20,95 @@ fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
+fn lifecycle_behavior_blocks_duplicate_or_crashed_model_actions() {
+    assert!(ChatLifecycle::Idle.can_send());
+    assert!(ChatLifecycle::Idle.can_mutate_model());
+
+    for blocked in [ChatLifecycle::Generating, ChatLifecycle::RestartRequired] {
+        assert!(!blocked.can_send());
+        assert!(!blocked.can_mutate_model());
+    }
+}
+
+#[test]
+fn worker_panic_and_disconnect_require_restart_but_normal_failures_do_not() {
+    assert_eq!(
+        lifecycle_after_worker_exit(WorkerExit::Completed),
+        ChatLifecycle::Idle
+    );
+    assert_eq!(
+        lifecycle_after_worker_exit(WorkerExit::Failed),
+        ChatLifecycle::Idle
+    );
+    for crashed in [WorkerExit::Panicked, WorkerExit::Disconnected] {
+        assert_eq!(
+            lifecycle_after_worker_exit(crashed),
+            ChatLifecycle::RestartRequired
+        );
+        assert!(
+            restart_required_message(crashed)
+                .unwrap()
+                .contains("Restart the app")
+        );
+    }
+}
+
+#[test]
+fn close_decision_is_behavioral_for_generating_and_restart_required_states() {
+    assert_eq!(
+        close_request_decision(ChatLifecycle::Generating, false, false),
+        CloseRequestDecision::Defer
+    );
+    assert_eq!(
+        close_request_decision(ChatLifecycle::RestartRequired, false, false),
+        CloseRequestDecision::Allow
+    );
+    assert_eq!(
+        close_request_decision(ChatLifecycle::RestartRequired, true, false),
+        CloseRequestDecision::Cancel
+    );
+    assert_eq!(
+        close_request_decision(ChatLifecycle::RestartRequired, true, true),
+        CloseRequestDecision::Allow
+    );
+}
+
+#[test]
 fn send_dispatch_does_not_generate_on_the_egui_update_thread() {
     let source = gui_source();
-
-    assert!(source.contains("thread::spawn") || source.contains("std::thread::spawn"),
-        "chat generation must be dispatched to a background worker");
-    assert!(source.contains("try_recv"),
-        "the egui update loop must poll worker completion without blocking");
-    assert!(!source.contains("Action::Send            => self.send_message()"),
-        "Action::Send must not synchronously call the old blocking send_message path");
-}
-
-#[test]
-fn generation_has_an_explicit_in_flight_state_and_duplicate_send_is_disabled() {
-    let source = gui_source();
-
-    assert!(source.contains("Generating"), "UI must expose an explicit generating state");
-    assert!(source.contains("is_generating"), "generation lifecycle must be queryable");
-    assert!(source.contains("add_enabled"), "Send must be disabled while a request is active");
-}
-
-#[test]
-fn model_mutating_actions_are_rejected_while_generation_owns_the_handle() {
-    let source = gui_source();
-
-    assert!(source.contains("Generation in progress"),
-        "New/Open/Save/feedback-style model mutations need a visible busy rejection while generation owns the model");
+    assert!(source.contains("thread::spawn") || source.contains("std::thread::spawn"));
+    assert!(source.contains("try_recv"));
+    assert!(!source.contains("Action::Send            => self.send_message()"));
 }
 
 #[test]
 fn invalid_or_multiple_chat_drop_reports_visible_status() {
     let source = gui_source();
     let drop_block = section(&source, "match route_drop", "let model_path_str");
-
     assert!(drop_block.contains("DropResult::MultipleFiles =>"));
-    assert!(drop_block.contains("Drop rejected: multiple files are not supported in Chat"),
-        "multiple-file D&D must explain why the drop was rejected");
+    assert!(drop_block.contains("Drop rejected: multiple files are not supported in Chat"));
     assert!(drop_block.contains("DropResult::Unsupported(path) =>"));
-    assert!(drop_block.contains("Unsupported dropped file"),
-        "unsupported D&D must identify the rejected file in status");
+    assert!(drop_block.contains("Unsupported dropped file"));
 }
 
 #[test]
 fn completed_turn_commits_the_already_computed_analytics_snapshot_immediately() {
     let source = gui_source();
-    let completion = section(&source, "Ok((turn_id, output)) => {", "Err(error) => {");
-
-    assert!(completion.contains("self.analytics = a;"),
-        "the analytics snapshot already computed for the completed turn must become the visible snapshot immediately");
-    assert!(!source.contains("turns_since_refresh"),
-        "the old stale N-turn display counter must not remain active");
-    assert!(!source.contains("refresh_interval"),
-        "the old N-turn display interval must not remain as a misleading UI control");
+    let completion = section(
+        &source,
+        "GenerationOutcome::Completed(turn_id, output) => {",
+        "GenerationOutcome::Failed(error) => {",
+    );
+    assert!(completion.contains("self.analytics = a;"));
+    assert!(!source.contains("turns_since_refresh"));
+    assert!(!source.contains("refresh_interval"));
 }
 
 #[test]
-fn close_during_generation_is_canceled_and_deferred_until_handle_returns() {
+fn restart_required_state_blocks_deferred_model_actions() {
     let source = gui_source();
-
-    assert!(source.contains("viewport().close_requested()"),
-        "the GUI must observe native close requests before allowing the viewport to exit");
-    assert!(source.contains("ViewportCommand::CancelClose"),
-        "a close request during generation must be canceled");
-    assert!(source.contains("close_requested_during_generation"),
-        "a canceled close must be remembered until the worker returns AppHandle");
-    assert!(source.contains("ViewportCommand::Close"),
-        "the deferred close must continue after the normal dirty-model confirmation");
-    assert!(source.contains("Finishing generation"),
-        "the user must see why closing is temporarily deferred");
+    assert!(
+        source.contains("self.lifecycle().restart_required() && !matches!(action, Action::None)"),
+        "RestartRequired must stop toolbar/native-menu model actions before dispatch"
+    );
 }

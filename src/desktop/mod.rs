@@ -2,6 +2,7 @@
 ///
 /// `drop` and `file_ops` are always compiled (no gui dependency).
 /// `dialogs`, `fonts`, and `platform` require the `gui` feature (rfd/muda/egui).
+pub mod chat_state;
 pub mod drop;
 pub mod file_ops;
 #[cfg(feature = "gui")]

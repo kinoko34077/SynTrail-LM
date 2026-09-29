@@ -9,6 +9,10 @@ use std::thread;
 use std::time::Duration;
 use syntrail_lm::app::{Analytics, AppHandle};
 use syntrail_lm::db::TurnRow;
+use syntrail_lm::desktop::chat_state::{
+    ChatLifecycle, CloseRequestDecision, RESTART_REQUIRED_STATUS, WorkerExit,
+    close_request_decision, lifecycle_after_worker_exit, restart_required_message,
+};
 use syntrail_lm::desktop::dialogs::{confirm_discard_dialog, open_model_dialog, save_model_dialog};
 use syntrail_lm::desktop::drop::{AcceptedKinds, DropResult, route_drop};
 use syntrail_lm::desktop::fonts::setup_fonts;
@@ -64,35 +68,21 @@ enum Action {
     Send,
 }
 
+enum GenerationOutcome {
+    Completed(i64, String),
+    Failed(String),
+    Panicked,
+}
+
 struct GenerationResult {
     handle: AppHandle,
-    result: Result<(i64, String), String>,
+    outcome: GenerationOutcome,
 }
 
 enum ChatRequestState {
     Idle,
     Generating(Receiver<GenerationResult>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CloseRequestDecision {
-    Allow,
-    Defer,
-    Cancel,
-}
-
-fn close_request_decision(
-    is_generating: bool,
-    is_dirty: bool,
-    discard_confirmed: bool,
-) -> CloseRequestDecision {
-    if is_generating {
-        CloseRequestDecision::Defer
-    } else if !is_dirty || discard_confirmed {
-        CloseRequestDecision::Allow
-    } else {
-        CloseRequestDecision::Cancel
-    }
+    RestartRequired,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────
@@ -135,8 +125,24 @@ impl SynTrailApp {
         }
     }
 
+    fn lifecycle(&self) -> ChatLifecycle {
+        match self.request_state {
+            ChatRequestState::Idle => ChatLifecycle::Idle,
+            ChatRequestState::Generating(_) => ChatLifecycle::Generating,
+            ChatRequestState::RestartRequired => ChatLifecycle::RestartRequired,
+        }
+    }
+
     fn is_generating(&self) -> bool {
-        matches!(self.request_state, ChatRequestState::Generating(_))
+        self.lifecycle().is_generating()
+    }
+
+    fn finish_worker_exit(&mut self, exit: WorkerExit) {
+        self.request_state = match lifecycle_after_worker_exit(exit) {
+            ChatLifecycle::Idle => ChatRequestState::Idle,
+            ChatLifecycle::RestartRequired => ChatRequestState::RestartRequired,
+            ChatLifecycle::Generating => unreachable!("worker exit cannot remain generating"),
+        };
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
@@ -152,7 +158,7 @@ impl SynTrailApp {
             confirm_discard_dialog()
         };
 
-        match close_request_decision(is_generating, is_dirty, discard_confirmed) {
+        match close_request_decision(self.lifecycle(), is_dirty, discard_confirmed) {
             CloseRequestDecision::Allow => {}
             CloseRequestDecision::Defer => {
                 self.close_requested_during_generation = true;
@@ -184,7 +190,7 @@ impl SynTrailApp {
         } else {
             false
         };
-        match close_request_decision(false, is_dirty, discard_confirmed) {
+        match close_request_decision(self.lifecycle(), is_dirty, discard_confirmed) {
             CloseRequestDecision::Allow => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -196,6 +202,10 @@ impl SynTrailApp {
     }
 
     fn start_generation(&mut self) {
+        if self.lifecycle().restart_required() {
+            self.status = RESTART_REQUIRED_STATUS.to_string();
+            return;
+        }
         if self.is_generating() {
             self.status = "Generation in progress — wait for the current response.".to_string();
             return;
@@ -222,30 +232,30 @@ impl SynTrailApp {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             // Always return ownership of AppHandle even if generation itself panics.
-            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handle.generate_turn(&raw)
             })) {
-                Ok(Ok(value)) => Ok(value),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(_) => Err("Generation worker panicked".to_string()),
+                Ok(Ok((turn_id, output))) => GenerationOutcome::Completed(turn_id, output),
+                Ok(Err(error)) => GenerationOutcome::Failed(error.to_string()),
+                Err(_) => GenerationOutcome::Panicked,
             };
-            let _ = tx.send(GenerationResult { handle, result });
+            let _ = tx.send(GenerationResult { handle, outcome });
         });
         self.request_state = ChatRequestState::Generating(rx);
     }
 
     fn poll_generation(&mut self, ctx: &egui::Context) {
         let received = match &self.request_state {
-            ChatRequestState::Idle => return,
+            ChatRequestState::Idle | ChatRequestState::RestartRequired => return,
             ChatRequestState::Generating(rx) => rx.try_recv(),
         };
 
         match received {
             Ok(done) => {
                 self.handle = Some(done.handle);
-                self.request_state = ChatRequestState::Idle;
-                match done.result {
-                    Ok((turn_id, output)) => {
+                match done.outcome {
+                    GenerationOutcome::Completed(turn_id, output) => {
+                        self.finish_worker_exit(WorkerExit::Completed);
                         let Some(handle) = self.handle.as_ref() else {
                             self.status = "Generation completed but model handle was not restored."
                                 .to_string();
@@ -261,9 +271,18 @@ impl SynTrailApp {
                         self.feedback_state = FeedbackState::Pending(turn_id);
                         self.analytics = a;
                     }
-                    Err(error) => {
+                    GenerationOutcome::Failed(error) => {
+                        self.finish_worker_exit(WorkerExit::Failed);
                         self.chat_history.pop();
                         self.status = format!("Generation failed: {error}");
+                    }
+                    GenerationOutcome::Panicked => {
+                        self.finish_worker_exit(WorkerExit::Panicked);
+                        self.chat_history.pop();
+                        self.feedback_state = FeedbackState::None;
+                        self.status = restart_required_message(WorkerExit::Panicked)
+                            .expect("panic requires restart message")
+                            .to_string();
                     }
                 }
                 self.continue_deferred_close(ctx);
@@ -273,10 +292,13 @@ impl SynTrailApp {
                 ctx.request_repaint_after(Duration::from_millis(33));
             }
             Err(TryRecvError::Disconnected) => {
-                self.request_state = ChatRequestState::Idle;
+                self.finish_worker_exit(WorkerExit::Disconnected);
                 self.close_requested_during_generation = false;
                 self.chat_history.pop();
-                self.status = "Generation failed: worker disconnected before returning the model handle. Restart the app before continuing.".to_string();
+                self.feedback_state = FeedbackState::None;
+                self.status = restart_required_message(WorkerExit::Disconnected)
+                    .expect("disconnect requires restart message")
+                    .to_string();
                 ctx.request_repaint();
             }
         }
@@ -414,7 +436,8 @@ impl eframe::App for SynTrailApp {
         }
 
         let mut action = Action::None;
-        let is_generating = self.is_generating();
+        let lifecycle = self.lifecycle();
+        let is_generating = lifecycle.is_generating();
 
         // Native menu: attach on first frame, then poll each frame (§88–94)
         #[cfg(all(target_os = "windows", feature = "gui"))]
@@ -448,22 +471,27 @@ impl eframe::App for SynTrailApp {
                 .collect()
         });
         if !dropped.is_empty() {
-            match route_drop(dropped, &AcceptedKinds::chat()) {
-                DropResult::Command(syntrail_lm::desktop::FileCommand::LoadPath(p)) => {
-                    action = Action::LoadPath(p);
-                }
-                DropResult::MultipleFiles => {
-                    self.status = "Drop rejected: multiple files are not supported in Chat. Drop one model file at a time.".to_string();
-                }
-                DropResult::Unsupported(path) => {
-                    self.status = format!(
-                        "Unsupported dropped file: {}. Chat accepts one model file at a time.",
-                        path.display()
-                    );
-                }
-                DropResult::ModelAndDataset { .. } | DropResult::Command(_) => {
-                    self.status = "Drop rejected: Chat accepts one supported model file at a time."
-                        .to_string();
+            if lifecycle.restart_required() {
+                self.status = RESTART_REQUIRED_STATUS.to_string();
+            } else {
+                match route_drop(dropped, &AcceptedKinds::chat()) {
+                    DropResult::Command(syntrail_lm::desktop::FileCommand::LoadPath(p)) => {
+                        action = Action::LoadPath(p);
+                    }
+                    DropResult::MultipleFiles => {
+                        self.status = "Drop rejected: multiple files are not supported in Chat. Drop one model file at a time.".to_string();
+                    }
+                    DropResult::Unsupported(path) => {
+                        self.status = format!(
+                            "Unsupported dropped file: {}. Chat accepts one model file at a time.",
+                            path.display()
+                        );
+                    }
+                    DropResult::ModelAndDataset { .. } | DropResult::Command(_) => {
+                        self.status =
+                            "Drop rejected: Chat accepts one supported model file at a time."
+                                .to_string();
+                    }
                 }
             }
         }
@@ -537,12 +565,12 @@ impl eframe::App for SynTrailApp {
                             .desired_rows(3)
                             .desired_width(avail - 82.0),
                     );
-                    let enter_pressed = !is_generating
+                    let enter_pressed = lifecycle.can_send()
                         && response.has_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                     let send_clicked = ui
                         .add_enabled(
-                            !is_generating,
+                            lifecycle.can_send(),
                             egui::Button::new("Send").min_size(egui::vec2(72.0, 60.0)),
                         )
                         .clicked();
@@ -675,6 +703,11 @@ impl eframe::App for SynTrailApp {
         }
 
         // ── Deferred action dispatch ──────────────────────────────────────
+        if self.lifecycle().restart_required() && !matches!(action, Action::None) {
+            self.status = RESTART_REQUIRED_STATUS.to_string();
+            action = Action::None;
+        }
+
         match action {
             Action::None => {}
             Action::New => self.do_new(),
@@ -710,12 +743,12 @@ impl eframe::App for SynTrailApp {
 
 #[cfg(test)]
 mod close_request_tests {
-    use super::{CloseRequestDecision, close_request_decision};
+    use super::{ChatLifecycle, CloseRequestDecision, close_request_decision};
 
     #[test]
     fn generation_close_is_deferred() {
         assert_eq!(
-            close_request_decision(true, false, false),
+            close_request_decision(ChatLifecycle::Generating, false, false),
             CloseRequestDecision::Defer
         );
     }
@@ -723,11 +756,11 @@ mod close_request_tests {
     #[test]
     fn clean_or_confirmed_dirty_close_is_allowed() {
         assert_eq!(
-            close_request_decision(false, false, false),
+            close_request_decision(ChatLifecycle::Idle, false, false),
             CloseRequestDecision::Allow
         );
         assert_eq!(
-            close_request_decision(false, true, true),
+            close_request_decision(ChatLifecycle::Idle, true, true),
             CloseRequestDecision::Allow
         );
     }
@@ -735,7 +768,7 @@ mod close_request_tests {
     #[test]
     fn declined_dirty_close_is_canceled() {
         assert_eq!(
-            close_request_decision(false, true, false),
+            close_request_decision(ChatLifecycle::Idle, true, false),
             CloseRequestDecision::Cancel
         );
     }

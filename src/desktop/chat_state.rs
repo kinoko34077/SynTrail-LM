@@ -22,7 +22,7 @@ pub enum CloseRequestDecision {
     Cancel,
 }
 
-pub const RESTART_REQUIRED_STATUS: &str = "Generation crashed ? restart the app before continuing.";
+pub const RESTART_REQUIRED_STATUS: &str = "Generation crashed: restart the app before continuing.";
 
 impl ChatLifecycle {
     pub const fn is_generating(self) -> bool {

@@ -261,6 +261,29 @@ mod tests {
     }
 
     #[test]
+    fn issue16_invalid_db_snapshot_preserves_active_model() {
+        let mut s = make_session();
+        let before = s.model.state_fingerprint();
+        let mut value = serde_json::to_value(persistence::to_snapshot(&s.model)).unwrap();
+        let parents = value
+            .get_mut("identity_parent")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("identity_parent array");
+        assert!(parents.len() >= 2, "fixture requires at least two identities");
+        parents[0] = serde_json::json!(1);
+        parents[1] = serde_json::json!(0);
+        let malformed = serde_json::to_string(&value).unwrap();
+        let sid = s
+            .db
+            .insert_snapshot(None, s.model.tick, "issue16-invalid", &malformed, now_secs())
+            .unwrap();
+
+        let err = s.restore_from_db(sid).err().expect("invalid snapshot must fail");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(s.model.state_fingerprint(), before);
+    }
+
+    #[test]
     fn test_auto_snapshot_triggers() {
         let mut s = Session::new_in_memory(Config {
             snapshot_interval_turns: 2,

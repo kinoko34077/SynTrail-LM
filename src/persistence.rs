@@ -9,7 +9,7 @@
 ///
 /// v0.3: adds association edges and avoidance field on prediction edges.
 /// v0.1/v0.2 snapshots can be loaded: missing fields default to 0/empty.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -496,6 +496,399 @@ fn validate_snapshot_limits(
     Ok(())
 }
 
+fn snapshot_semantic_error(detail: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("invalid model snapshot: {}", detail.into()),
+    )
+}
+
+fn validate_unit_ref(
+    unit: &UnitIdDto,
+    primitive_count: usize,
+    chunk_count: usize,
+    label: &str,
+) -> std::io::Result<()> {
+    if unit.is_chunk {
+        if unit.raw as usize >= chunk_count {
+            return Err(snapshot_semantic_error(format!(
+                "{label} references missing Chunk {} (count {chunk_count})",
+                unit.raw
+            )));
+        }
+    } else if unit.raw == 0 || unit.raw as usize > primitive_count {
+        return Err(snapshot_semantic_error(format!(
+            "{label} references missing Primitive {} (count {primitive_count})",
+            unit.raw
+        )));
+    }
+    Ok(())
+}
+
+fn validate_chunk_component(
+    unit: &UnitIdDto,
+    primitive_count: usize,
+    current_chunk: usize,
+    label: &str,
+) -> std::io::Result<()> {
+    if unit.is_chunk {
+        if unit.raw as usize >= current_chunk {
+            return Err(snapshot_semantic_error(format!(
+                "{label} references Chunk {} before it is addressable at Chunk {current_chunk}",
+                unit.raw
+            )));
+        }
+        Ok(())
+    } else {
+        validate_unit_ref(unit, primitive_count, current_chunk, label)
+    }
+}
+
+fn validate_identity_parent(parent: &[u32], identity_count: usize) -> std::io::Result<()> {
+    if parent.is_empty() {
+        return Ok(());
+    }
+    if parent.len() != identity_count {
+        return Err(snapshot_semantic_error(format!(
+            "identity_parent length {} does not match identity count {identity_count}",
+            parent.len()
+        )));
+    }
+    for (index, &next) in parent.iter().enumerate() {
+        if next as usize >= identity_count {
+            return Err(snapshot_semantic_error(format!(
+                "identity_parent[{index}]={next} is out of range for {identity_count} identities"
+            )));
+        }
+    }
+
+    // 0 = unseen, 1 = on the current path, 2 = already proven to reach a self-root.
+    let mut state = vec![0u8; identity_count];
+    for start in 0..identity_count {
+        if state[start] == 2 {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut current = start;
+        loop {
+            match state[current] {
+                0 => {
+                    state[current] = 1;
+                    path.push(current);
+                    let next = parent[current] as usize;
+                    if next == current {
+                        break;
+                    }
+                    current = next;
+                }
+                1 => {
+                    return Err(snapshot_semantic_error(format!(
+                        "identity_parent contains a non-root cycle reachable from identity {start}"
+                    )));
+                }
+                2 => break,
+                _ => unreachable!(),
+            }
+        }
+        for node in path {
+            state[node] = 2;
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_semantics(snapshot: &ModelSnapshot) -> std::io::Result<()> {
+    let primitive_count = snapshot.primitives.len();
+    let chunk_count = snapshot.chunks.len();
+    let identity_count = snapshot.identities.len();
+    let representation_count = snapshot.representation_entries.len();
+    let transform_count = snapshot.transforms.len();
+
+    let mut primitive_scalars = HashSet::with_capacity(primitive_count);
+    for (index, &(id, scalar)) in snapshot.primitives.iter().enumerate() {
+        let expected = index as u32 + 1;
+        if id != expected {
+            return Err(snapshot_semantic_error(format!(
+                "primitive id {id} at index {index} must be contiguous 1-based id {expected}"
+            )));
+        }
+        if char::from_u32(scalar).is_none() {
+            return Err(snapshot_semantic_error(format!(
+                "primitive {id} contains invalid Unicode scalar U+{scalar:04X}"
+            )));
+        }
+        if !primitive_scalars.insert(scalar) {
+            return Err(snapshot_semantic_error(format!(
+                "primitive {id} duplicates Unicode scalar U+{scalar:04X}"
+            )));
+        }
+    }
+
+    let mut chunk_pairs = HashSet::with_capacity(chunk_count);
+    for (index, chunk) in snapshot.chunks.iter().enumerate() {
+        validate_chunk_component(
+            &chunk.left,
+            primitive_count,
+            index,
+            &format!("chunks[{index}].left"),
+        )?;
+        validate_chunk_component(
+            &chunk.right,
+            primitive_count,
+            index,
+            &format!("chunks[{index}].right"),
+        )?;
+        let pair = (
+            chunk.left.is_chunk,
+            chunk.left.raw,
+            chunk.right.is_chunk,
+            chunk.right.raw,
+        );
+        if !chunk_pairs.insert(pair) {
+            return Err(snapshot_semantic_error(format!(
+                "chunks[{index}] duplicates an earlier chunk pair and would change implicit Chunk IDs"
+            )));
+        }
+    }
+
+    for (index, edge) in snapshot.prediction_edges.iter().enumerate() {
+        validate_unit_ref(
+            &edge.context,
+            primitive_count,
+            chunk_count,
+            &format!("prediction_edges[{index}].context"),
+        )?;
+        validate_unit_ref(
+            &edge.next_unit,
+            primitive_count,
+            chunk_count,
+            &format!("prediction_edges[{index}].next_unit"),
+        )?;
+    }
+    for (group_index, (context, entries)) in snapshot.prediction_edge_groups.iter().enumerate() {
+        validate_unit_ref(
+            context,
+            primitive_count,
+            chunk_count,
+            &format!("prediction_edge_groups[{group_index}].context"),
+        )?;
+        for (edge_index, edge) in entries.iter().enumerate() {
+            validate_unit_ref(
+                &edge.next_unit,
+                primitive_count,
+                chunk_count,
+                &format!("prediction_edge_groups[{group_index}].edges[{edge_index}].next_unit"),
+            )?;
+        }
+    }
+
+    for (index, candidate) in snapshot.merge_candidates.iter().enumerate() {
+        validate_unit_ref(
+            &candidate.left,
+            primitive_count,
+            chunk_count,
+            &format!("merge_candidates[{index}].left"),
+        )?;
+        validate_unit_ref(
+            &candidate.right,
+            primitive_count,
+            chunk_count,
+            &format!("merge_candidates[{index}].right"),
+        )?;
+    }
+
+    for (index, edge) in snapshot.association_edges.iter().enumerate() {
+        validate_unit_ref(
+            &edge.source,
+            primitive_count,
+            chunk_count,
+            &format!("association_edges[{index}].source"),
+        )?;
+        validate_unit_ref(
+            &edge.target,
+            primitive_count,
+            chunk_count,
+            &format!("association_edges[{index}].target"),
+        )?;
+    }
+    for (group_index, (source, entries)) in snapshot.association_edge_groups.iter().enumerate() {
+        validate_unit_ref(
+            source,
+            primitive_count,
+            chunk_count,
+            &format!("association_edge_groups[{group_index}].source"),
+        )?;
+        for (edge_index, edge) in entries.iter().enumerate() {
+            validate_unit_ref(
+                &edge.target,
+                primitive_count,
+                chunk_count,
+                &format!("association_edge_groups[{group_index}].edges[{edge_index}].target"),
+            )?;
+        }
+    }
+
+    for (index, view) in snapshot.views.iter().enumerate() {
+        if view.identity as usize >= identity_count {
+            return Err(snapshot_semantic_error(format!(
+                "views[{index}].identity={} is out of range for {identity_count} identities",
+                view.identity
+            )));
+        }
+        for (unit_index, unit) in view.units.iter().enumerate() {
+            validate_unit_ref(
+                unit,
+                primitive_count,
+                chunk_count,
+                &format!("views[{index}].units[{unit_index}]"),
+            )?;
+        }
+    }
+
+    let mut lineage_children = HashSet::new();
+    for (index, (child, left, right)) in snapshot.lineage_entries.iter().enumerate() {
+        if *child as usize >= chunk_count {
+            return Err(snapshot_semantic_error(format!(
+                "lineage_entries[{index}].child={child} is out of range for {chunk_count} chunks"
+            )));
+        }
+        if !lineage_children.insert(*child) {
+            return Err(snapshot_semantic_error(format!(
+                "lineage_entries contains duplicate child Chunk {child}"
+            )));
+        }
+        validate_chunk_component(
+            left,
+            primitive_count,
+            *child as usize,
+            &format!("lineage_entries[{index}].left"),
+        )?;
+        validate_chunk_component(
+            right,
+            primitive_count,
+            *child as usize,
+            &format!("lineage_entries[{index}].right"),
+        )?;
+    }
+
+    validate_identity_parent(&snapshot.identity_parent, identity_count)?;
+
+    for (index, entry) in snapshot.representation_entries.iter().enumerate() {
+        if entry.identity_id as usize >= identity_count {
+            return Err(snapshot_semantic_error(format!(
+                "representation_entries[{index}].identity_id={} is out of range for {identity_count} identities",
+                entry.identity_id
+            )));
+        }
+        for (unit_index, unit) in entry.units.iter().enumerate() {
+            validate_unit_ref(
+                unit,
+                primitive_count,
+                chunk_count,
+                &format!("representation_entries[{index}].units[{unit_index}]"),
+            )?;
+        }
+        if let Some(predecessor) = entry.predecessor_rep_id {
+            let predecessor_index = predecessor as usize;
+            if predecessor_index >= index || predecessor_index >= representation_count {
+                return Err(snapshot_semantic_error(format!(
+                    "representation_entries[{index}].predecessor_rep_id={predecessor} must reference an earlier representation"
+                )));
+            }
+            if snapshot.representation_entries[predecessor_index].identity_id != entry.identity_id {
+                return Err(snapshot_semantic_error(format!(
+                    "representation_entries[{index}] predecessor {predecessor} belongs to a different identity"
+                )));
+            }
+        }
+    }
+
+    let mut transform_pairs = HashSet::with_capacity(transform_count);
+    for (index, transform) in snapshot.transforms.iter().enumerate() {
+        if transform.source as usize >= identity_count || transform.target as usize >= identity_count {
+            return Err(snapshot_semantic_error(format!(
+                "transforms[{index}] endpoint ({}, {}) is out of range for {identity_count} identities",
+                transform.source, transform.target
+            )));
+        }
+        if !transform_pairs.insert((transform.source, transform.target)) {
+            return Err(snapshot_semantic_error(format!(
+                "transforms[{index}] duplicates an earlier source/target pair and would change implicit Transform IDs"
+            )));
+        }
+        match transform.kind_tag {
+            0 | 1 => {}
+            2 => {
+                let source_transform = transform.kind_arg1 as usize;
+                if source_transform >= index {
+                    return Err(snapshot_semantic_error(format!(
+                        "transforms[{index}] inverse reference {} must point to an earlier Transform",
+                        transform.kind_arg1
+                    )));
+                }
+                let original = &snapshot.transforms[source_transform];
+                if transform.source != original.target || transform.target != original.source {
+                    return Err(snapshot_semantic_error(format!(
+                        "transforms[{index}] inverse endpoints do not reverse Transform {}",
+                        transform.kind_arg1
+                    )));
+                }
+            }
+            3 => {
+                let first = transform.kind_arg1 as usize;
+                let second = transform.kind_arg2 as usize;
+                if first >= index || second >= index {
+                    return Err(snapshot_semantic_error(format!(
+                        "transforms[{index}] composition references must point to earlier Transforms"
+                    )));
+                }
+                let f = &snapshot.transforms[first];
+                let g = &snapshot.transforms[second];
+                if f.target != g.source
+                    || transform.source != f.source
+                    || transform.target != g.target
+                {
+                    return Err(snapshot_semantic_error(format!(
+                        "transforms[{index}] composition endpoints are inconsistent with referenced Transforms"
+                    )));
+                }
+            }
+            other => {
+                return Err(snapshot_semantic_error(format!(
+                    "transforms[{index}].kind_tag={other} is unsupported"
+                )));
+            }
+        }
+    }
+
+    for (index, (right, lefts)) in snapshot.merge_right_reuse.iter().enumerate() {
+        validate_unit_ref(
+            right,
+            primitive_count,
+            chunk_count,
+            &format!("merge_right_reuse[{index}].right"),
+        )?;
+        for (left_index, left) in lefts.iter().enumerate() {
+            validate_unit_ref(
+                left,
+                primitive_count,
+                chunk_count,
+                &format!("merge_right_reuse[{index}].lefts[{left_index}]"),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_snapshot(
+    snapshot: &ModelSnapshot,
+    limits: ModelLoadLimits,
+) -> std::io::Result<()> {
+    validate_snapshot_limits(snapshot, limits)?;
+    validate_snapshot_semantics(snapshot)
+}
+
 fn ensure_input_len(input_len: u64, limits: ModelLoadLimits) -> std::io::Result<()> {
     if input_len > limits.input_bytes {
         return Err(resource_limit_error(format!(
@@ -520,7 +913,7 @@ fn decode_json_snapshot_reader<R: std::io::Read>(
     ensure_input_len(input_len, limits)?;
     let snapshot: ModelSnapshot = serde_json::from_reader(reader)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    validate_snapshot_limits(&snapshot, limits)?;
+    validate_snapshot(&snapshot, limits)?;
     Ok(snapshot)
 }
 
@@ -548,7 +941,7 @@ pub(crate) fn decode_legacy_bincode_snapshot_bytes(bytes: &[u8]) -> std::io::Res
                 std::io::Error::new(std::io::ErrorKind::InvalidData, e)
             }
         })?;
-    validate_snapshot_limits(&snapshot, limits)?;
+    validate_snapshot(&snapshot, limits)?;
     Ok(snapshot)
 }
 
@@ -706,7 +1099,7 @@ fn stm_dispatch_version_stream_with_limits<R: std::io::Read>(
             ));
         }
     };
-    validate_snapshot_limits(&snapshot, limits)?;
+    validate_snapshot(&snapshot, limits)?;
     Ok(snapshot)
 }
 
@@ -1162,7 +1555,7 @@ fn stm_read_container_with_limits(
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                 }
             })?;
-        validate_snapshot_limits(&snapshot, limits)?;
+        validate_snapshot(&snapshot, limits)?;
         Ok(snapshot)
     }
 }
@@ -1250,7 +1643,7 @@ fn load_binary_snapshot_with_limits(
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                 }
             })?;
-        validate_snapshot_limits(&snapshot, limits)?;
+        validate_snapshot(&snapshot, limits)?;
         Ok(snapshot)
     }
 }
@@ -1962,6 +2355,105 @@ mod tests {
         let err = validate_snapshot_limits(&snapshot, issue10_tiny_limits()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("primitives"));
+    }
+
+    fn issue16_base_snapshot() -> ModelSnapshot {
+        let mut snapshot = to_snapshot(&ModelState::new());
+        snapshot.primitives = vec![(1, 'a' as u32), (2, 'b' as u32)];
+        snapshot.identities = vec![vec![1], vec![2]];
+        snapshot.identity_parent = vec![0, 1];
+        snapshot
+    }
+
+    fn assert_issue16_semantic_rejected_across_formats(snapshot: &ModelSnapshot) {
+        let json = serde_json::to_vec(snapshot).unwrap();
+        let json_err = decode_json_snapshot_bytes(&json)
+            .err()
+            .expect("JSON semantic corruption must be rejected");
+        assert_eq!(json_err.kind(), std::io::ErrorKind::InvalidData);
+
+        let legacy = bincode::serialize(snapshot).unwrap();
+        let legacy_err = decode_legacy_bincode_snapshot_bytes(&legacy)
+            .err()
+            .expect("legacy bincode semantic corruption must be rejected");
+        assert_eq!(legacy_err.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut stm = std::io::Cursor::new(Vec::new());
+        stm_write_container(&mut stm, snapshot, true).unwrap();
+        let stm_err = stm_read_container(&stm.into_inner())
+            .err()
+            .expect("STM semantic corruption must be rejected");
+        assert_eq!(stm_err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn issue16_rejects_cyclic_and_out_of_range_identity_parents_across_formats() {
+        let mut cyclic = issue16_base_snapshot();
+        cyclic.identity_parent = vec![1, 0];
+        assert_issue16_semantic_rejected_across_formats(&cyclic);
+
+        let mut out_of_range = issue16_base_snapshot();
+        out_of_range.identity_parent = vec![0, 2];
+        assert_issue16_semantic_rejected_across_formats(&out_of_range);
+    }
+
+    #[test]
+    fn issue16_rejects_invalid_view_and_unit_references() {
+        let mut bad_view_identity = issue16_base_snapshot();
+        bad_view_identity.views.push(ViewDto {
+            units: vec![UnitIdDto { is_chunk: false, raw: 1 }],
+            identity: 2,
+        });
+        let bytes = serde_json::to_vec(&bad_view_identity).unwrap();
+        assert_eq!(
+            decode_json_snapshot_bytes(&bytes).err().expect("semantic corruption must be rejected").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut bad_unit = issue16_base_snapshot();
+        bad_unit.views.push(ViewDto {
+            units: vec![UnitIdDto { is_chunk: true, raw: 0 }],
+            identity: 0,
+        });
+        let bytes = serde_json::to_vec(&bad_unit).unwrap();
+        assert_eq!(
+            decode_json_snapshot_bytes(&bytes).err().expect("semantic corruption must be rejected").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn issue16_rejects_invalid_representation_and_transform_references() {
+        let mut bad_rep = issue16_base_snapshot();
+        bad_rep.representation_entries.push(RepresentationEntryDto {
+            identity_id: 0,
+            units: vec![UnitIdDto { is_chunk: false, raw: 1 }],
+            acquired_at: 0,
+            practice_count: 0,
+            confidence: 0.5,
+            predecessor_rep_id: Some(1),
+        });
+        let bytes = serde_json::to_vec(&bad_rep).unwrap();
+        assert_eq!(
+            decode_json_snapshot_bytes(&bytes).err().expect("semantic corruption must be rejected").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut bad_transform = issue16_base_snapshot();
+        bad_transform.transforms.push(TransformEntryDto {
+            source: 0,
+            target: 1,
+            kind_tag: 2,
+            kind_arg1: 9,
+            kind_arg2: 0,
+            value: 0.0,
+            evidence: 0.0,
+        });
+        let bytes = serde_json::to_vec(&bad_transform).unwrap();
+        assert_eq!(
+            decode_json_snapshot_bytes(&bytes).err().expect("semantic corruption must be rejected").kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # SynTrail-LM — Current Implementation State
 
-Last updated: 2026-09-29 (Issue #10 model-load resource envelope)
+Last updated: 2026-10-04 (Issue #16 semantic snapshot validation)
 
 ---
 
@@ -12,6 +12,7 @@ Last updated: 2026-09-29 (Issue #10 model-load resource envelope)
 | STM binary container (Zstd, varint, packed UnitId) | Implemented — v4 |
 | Streaming STM save/load (no large intermediate buffer) | Implemented |
 | Model-load resource envelope (JSON/STM/DB: serialized input 1 GiB; bincode/STM decoded 1 GiB; bounded collections; rejected load preserves active model) | Implemented / Verified |
+| Semantic snapshot validation (JSON, STM v1-v4, legacy bincode, SQLite payloads: Primitive/Chunk/UnitId addressability, View/Lineage/Representation/Transform references, rooted Identity Union-Find; rejected load preserves active model + document state) | Implemented / Verified |
 | Lossless delta fields (u64 tick-delta) | Implemented |
 | SQLite DB snapshot (blob_data bincode preferred) | Implemented |
 | DB load unified API (blob > json fallback) | Implemented |

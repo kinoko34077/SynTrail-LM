@@ -1,8 +1,8 @@
 # 現在の実装状態
 
-最終確認: 2026-09-29 (Issue #10 model-load resource envelope verified)
+最終確認: 2026-10-04 (Issue #16 semantic snapshot validation verified)
 crate version: 0.5.0  
-integration tests: 185 (+ 243 unit tests = 428 total)
+integration tests: 185 (+ 248 unit tests = 433 total)
 
 ---
 
@@ -67,6 +67,7 @@ integration tests: 185 (+ 243 unit tests = 428 total)
 - **Streaming STM save** (Encoder → BufWriter; seek-patch payload_len; no intermediate Vec) ← §9/§10
 - **Streaming STM load** (BufReader → header → Decoder → deserialize_from; no full-file read) ← §11
 - **Model-load resource envelope** (JSON / STM v1-v4 / legacy raw bincode / SQLite snapshot: serialized input 1 GiB; bincode/STM decoded-byte budget 1 GiB; all formatsにcollection limits; SQLite byte-length preflight; rejection preserves active model) ← §12/§13 / Issue #10
+- **Semantic snapshot validation** (JSON / STM v1-v4 / legacy raw bincode / SQLite snapshot: Primitive/Chunk/UnitId addressability, View/Lineage/Representation/Transform references, rooted Identity Union-Find; rejection preserves active model + DocumentState) ← Issue #16
 - **Bulk decompression buffer remains removed** (limits are acceptance budgets; Zstd decode stays streaming) ← §12/§13
 - **Lossless tick delta** (delta fields u32→u64 varint; STM_VERSION 3→4; v3_compat module) ← §14
 

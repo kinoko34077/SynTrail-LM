@@ -301,6 +301,37 @@ mod issue10_tests {
     use std::fs::OpenOptions;
 
     #[test]
+    fn rejected_semantic_load_preserves_active_model_and_document_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("active.stm");
+        let history_path = dir.path().join("history.sqlite");
+        let mut handle =
+            AppHandle::new(model_path.clone(), history_path.to_str().unwrap()).unwrap();
+        handle.session.model.train("preserve this model");
+        handle.doc.mark_dirty();
+        let before_fp = handle.session.model.state_fingerprint();
+        let before_doc = handle.doc.clone();
+
+        let mut value =
+            serde_json::to_value(persistence::to_snapshot(&handle.session.model)).unwrap();
+        let parents = value
+            .get_mut("identity_parent")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("identity_parent array");
+        assert!(parents.len() >= 2, "fixture requires at least two identities");
+        parents[0] = serde_json::json!(1);
+        parents[1] = serde_json::json!(0);
+        let invalid_path = dir.path().join("semantic-invalid.json");
+        std::fs::write(&invalid_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let err = handle.load_model_from(&invalid_path).unwrap_err();
+        assert!(err.to_string().contains("invalid model snapshot"));
+        assert_eq!(handle.session.model.state_fingerprint(), before_fp);
+        assert_eq!(handle.doc.path, before_doc.path);
+        assert_eq!(handle.doc.dirty, before_doc.dirty);
+    }
+
+    #[test]
     fn rejected_oversized_load_preserves_active_model_and_document_state() {
         let dir = tempfile::tempdir().unwrap();
         let model_path = dir.path().join("active.stm");

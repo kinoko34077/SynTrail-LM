@@ -44,6 +44,10 @@ pub fn leb128_decode(bytes: &[u8], pos: usize) -> Option<(u64, usize)> {
     loop {
         let byte = *bytes.get(cur)?;
         cur += 1;
+        // At shift 63, only the low payload bit fits in a u64.
+        if shift == 63 && byte & 0x7E != 0 {
+            return None;
+        }
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
             return Some((value, cur));

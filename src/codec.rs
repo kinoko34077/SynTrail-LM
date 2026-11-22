@@ -191,6 +191,42 @@ mod tests {
         assert_eq!(v, 0);
     }
 
+    #[test]
+    fn vb12_leb128_rejects_oversized_or_continued_tenth_byte() {
+        let mut bytes = vec![0xff; 9];
+        // At bit 63 only the payload's low bit is legal.
+        for invalid in [0x02u8, 0x7e, 0x7f, 0x81] {
+            bytes.push(invalid);
+            assert_eq!(leb128_decode(&bytes, 0), None, "invalid tenth byte {invalid:#04x}");
+            bytes.pop();
+        }
+        // A later byte must not make a continued tenth byte valid.
+        bytes.extend_from_slice(&[0x81, 0x00]);
+        assert_eq!(leb128_decode(&bytes, 0), None);
+        bytes.truncate(9);
+        assert_eq!(leb128_decode(&bytes, 0), None, "truncated tenth byte");
+    }
+
+    #[test]
+    fn vb13_leb128_u64_boundary_and_nonzero_offset() {
+        let mut maximal = vec![0xff; 9];
+        maximal.push(0x01);
+        assert_eq!(leb128_decode(&maximal, 0), Some((u64::MAX, 10)));
+        let mut high_bit = vec![0x80; 9];
+        high_bit.push(0x01);
+        assert_eq!(leb128_decode(&high_bit, 0), Some((1u64 << 63, 10)));
+
+        let prefix = [0x11u8, 0x22, 0x33];
+        let mut framed = prefix.to_vec();
+        framed.extend_from_slice(&maximal);
+        framed.extend_from_slice(&[0x44, 0x55]);
+        assert_eq!(leb128_decode(&framed, prefix.len()), Some((u64::MAX, 13)));
+        assert_eq!(leb128_decode(&framed, framed.len()), None);
+        // Reject overflow at an offset too, regardless of trailing bytes.
+        framed[prefix.len() + 9] = 0x02;
+        assert_eq!(leb128_decode(&framed, prefix.len()), None);
+    }
+
     // ── UnitId round-trips ────────────────────────────────────────────────
 
     #[test]
